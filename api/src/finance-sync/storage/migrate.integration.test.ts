@@ -16,7 +16,7 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql, directory);
     await migrate(sql, directory);
     const rows = await sql`select version from finance_sync_migrations where deployment_id = 'integration-test' order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5]);
   });
 });
 afterAll(async () => { await sql?.end(); });
