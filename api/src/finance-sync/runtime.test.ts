@@ -1,0 +1,35 @@
+import { describe, expect, it } from 'vitest'
+import { runConfiguredSyncCycle, type SyncRuntimeDependencies } from './runtime'
+
+describe('configured sync runtime', () => {
+  it('persists observations, enqueues bridge work, projects it, and advances its cursor only after success', async () => {
+    const calls: string[] = []
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [{ provider: 'plaid', connectionId: 'item-1', deploymentId: 'd', accessToken: 'token', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', accountIds: ['a'], wealthfolioAccountIds: { a: 'wf-a' }, accessGeneration: 1 }],
+      loadCheckpoint: async () => null,
+      runProvider: async (_connection, cursor) => ({ nextCursor: cursor === null ? 'cursor-1' : cursor, observations: [{ deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', providerVersion: 'v1', semanticHash: 'a'.repeat(64), hashSpecificationVersion: 1, domain: 'cash_ledger', observedAt: '2026-07-11T00:00:00.000Z', payload: { accountId: 'a', amount: '12.50', currency: 'USD', date: '2026-07-11' } }] }),
+      persistObservations: async (observations) => { calls.push(`persist:${observations.length}`); return observations },
+      enqueue: async (observations) => { calls.push(`enqueue:${observations.length}`) },
+      projectPending: async () => { calls.push('project'); return { delivered: 1, failed: 0 } },
+      saveCheckpoint: async (_connection, cursor) => { calls.push(`checkpoint:${cursor}`) },
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0 })
+    expect(calls).toEqual(['persist:1', 'enqueue:1', 'project', 'checkpoint:cursor-1'])
+  })
+
+  it('does not advance a cursor when projection fails', async () => {
+    let checkpointed = false
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [{ provider: 'plaid', connectionId: 'item-1', deploymentId: 'd', accessToken: 'token', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', accountIds: ['a'], wealthfolioAccountIds: { a: 'wf-a' }, accessGeneration: 1 }],
+      loadCheckpoint: async () => null,
+      runProvider: async () => ({ nextCursor: 'cursor-1', observations: [] }),
+      persistObservations: async () => [], enqueue: async () => {},
+      projectPending: async () => ({ delivered: 0, failed: 1 }),
+      saveCheckpoint: async () => { checkpointed = true },
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(result.failures).toBe(1)
+    expect(checkpointed).toBe(false)
+  })
+})
