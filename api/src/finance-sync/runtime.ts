@@ -38,9 +38,11 @@ export async function runConfiguredSyncCycle(deploymentId: string, deps: SyncRun
       const projection = await deps.projectPending()
       observations += inserted.length; delivered += projection.delivered; failures += projection.failed
       if (projection.failed === 0) await deps.saveCheckpoint(connection, run.nextCursor)
-    } catch (error) {
+    } catch {
       failures += 1
-      console.error(`Finance Sync connection ${connection.connectionId} failed:`, error)
+      // Provider errors can embed tokens, identifiers, request payloads, and financial data.
+      // Emit only a bounded operational signal; detailed provider evidence is separately redacted.
+      console.error('Finance Sync connection cycle failed')
     }
   }
   return { connections: connections.length, observations, delivered, failures }

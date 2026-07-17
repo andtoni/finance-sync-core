@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { runConfiguredSyncCycle, type SyncRuntimeDependencies } from './runtime'
 
 describe('configured sync runtime', () => {
@@ -16,6 +16,25 @@ describe('configured sync runtime', () => {
     const result = await runConfiguredSyncCycle('d', deps)
     expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0 })
     expect(calls).toEqual(['persist:1', 'enqueue:1', 'project', 'checkpoint:cursor-1'])
+  })
+
+  it('redacts provider failures from operational logs', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [{ provider: 'plaid', connectionId: 'sensitive-connection', deploymentId: 'd', accessToken: 'sensitive-token', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', accountIds: ['sensitive-account'], wealthfolioAccountIds: { 'sensitive-account': 'wf-a' }, accessGeneration: 1 }],
+      loadCheckpoint: async () => null,
+      runProvider: async () => { throw new Error('provider payload sensitive-token sensitive-account') },
+      persistObservations: async () => [], enqueue: async () => {},
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }
+
+    const result = await runConfiguredSyncCycle('d', deps)
+
+    expect(result.failures).toBe(1)
+    expect(log).toHaveBeenCalledWith('Finance Sync connection cycle failed')
+    expect(JSON.stringify(log.mock.calls)).not.toMatch(/sensitive-token|sensitive-account|sensitive-connection|provider payload/)
+    log.mockRestore()
   })
 
   it('does not advance a cursor when projection fails', async () => {

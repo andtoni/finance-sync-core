@@ -5,6 +5,7 @@ import {
   cashObservationToBridge,
   commitObservation,
   commitObservationBatch,
+  bridgeOperationToWire,
   type BridgeTransport,
   type BridgeDisclosureOperation,
   type BridgeReceipt,
@@ -15,7 +16,7 @@ const mockTransport = (overrides: Partial<BridgeTransport> = {}): BridgeTranspor
     subject: op.subject,
     idempotencyKey: op.idempotencyKey,
     accessGeneration: op.accessGeneration,
-    operation: op.kind,
+    operation: 'activity_upsert',
     resourceId: op.resourceId,
     outcome: 'Accepted',
   }),
@@ -23,6 +24,14 @@ const mockTransport = (overrides: Partial<BridgeTransport> = {}): BridgeTranspor
 })
 
 describe('Bridge client', () => {
+  it('requires the persisted local owner to be an issuer-qualified subject', () => {
+    expect(() => cashObservationToBridge({
+      deploymentId: 'g8-test', localOwnerId: 'alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '1.00' },
+      observedAt: '2026-07-11T00:00:00.000Z',
+    }, 1, 'wf-acc-uuid-1')).toThrow('issuer-qualified')
+  })
+
   it('generates deterministic idempotency keys', () => {
     const k1 = idempotencyKey('dep-1', 'hash-a')
     const k2 = idempotencyKey('dep-1', 'hash-a')
@@ -35,14 +44,14 @@ describe('Bridge client', () => {
   it('converts cash observation to bridge operation', () => {
     const op = cashObservationToBridge({
       deploymentId: 'g8-test',
-      localOwnerId: 'alexis',
+      localOwnerId: 'urn:wealthfolio:test#alexis',
       sourceResourceIncarnationId: 'plaid:item-1',
       semanticHash: 'abc123',
       payload: { transactionId: 'txn-1', amount: '-42.50', currency: 'USD', date: '2026-07-11', name: 'AMAZON' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'wf-acc-uuid-1')
     expect(op.kind).toBe('ActivityUpsert')
-    expect(op.subject).toBe('alexis')
+    expect(op.subject).toBe('urn:wealthfolio:test#alexis')
     expect(op.activity?.accountId).toBe('wf-acc-uuid-1')
     expect(op.activity?.amount).toBe('42.50')
     expect(op.activity?.activityType).toBe('WITHDRAWAL')
@@ -51,7 +60,7 @@ describe('Bridge client', () => {
 
   it('handles credit as DEPOSIT', () => {
     const op = cashObservationToBridge({
-      deploymentId: 'g8', localOwnerId: 'alexis', sourceResourceIncarnationId: 'inc-1',
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
       semanticHash: 'aaa',
       payload: { transactionId: 't1', amount: '100.00', currency: 'USD', date: '2026-07-11', name: 'SALARY', transactionType: 'CREDIT' },
       observedAt: '2026-07-11T00:00:00.000Z',
@@ -69,13 +78,38 @@ describe('Bridge client', () => {
     expect(receipt.outcome).toBe('Accepted')
   })
 
+  it('accepts the versioned snake_case wire operation for the requested kind', async () => {
+    const op: BridgeDisclosureOperation = { idempotencyKey: 'wire-1', subject: 'alexis', accessGeneration: 3, kind: 'ActivityUpsert', resourceId: 'r-1' }
+    const receipt = await commitObservation({ commit: async () => ({ subject: 'alexis', idempotencyKey: 'wire-1', accessGeneration: 3, operation: 'activity_upsert', resourceId: 'r-1', outcome: 'Accepted' }) }, op)
+    expect(receipt.operation).toBe('activity_upsert')
+  })
+
+  it.each([
+    ['ActivityUpsert', 'ActivityUpsert'],
+    ['ActivityDelete', 'ActivityDelete'],
+    ['ProjectionFence', 'ProjectionFence'],
+  ] as const)('serializes %s request kind using the receiver enum value', (kind, expected) => {
+    const wire = bridgeOperationToWire({
+      idempotencyKey: 'wire-kind', subject: 'urn:wealthfolio:test#alexis', accessGeneration: 1,
+      kind, resourceId: 'resource-1',
+    })
+    expect(wire.kind).toBe(expected)
+  })
+
+  it('rejects unknown or mismatched wire operations and receipt identity', async () => {
+    const op: BridgeDisclosureOperation = { idempotencyKey: 'wire-2', subject: 'alexis', accessGeneration: 3, kind: 'ActivityDelete', resourceId: 'r-2' }
+    await expect(commitObservation({ commit: async () => ({ subject: 'alexis', idempotencyKey: 'wire-2', accessGeneration: 3, operation: 'activity_upsert', resourceId: 'r-2', outcome: 'Accepted' }) }, op, 1)).rejects.toThrow('operation mismatch')
+    await expect(commitObservation({ commit: async () => ({ subject: 'alexis', idempotencyKey: 'wire-2', accessGeneration: 3, operation: ('unknown' as never), resourceId: 'r-2', outcome: 'Accepted' }) }, op, 1)).rejects.toThrow('operation mismatch')
+    await expect(commitObservation({ commit: async () => ({ subject: 'other', idempotencyKey: 'wire-2', accessGeneration: 3, operation: 'activity_delete', resourceId: 'r-2', outcome: 'Accepted' }) }, op, 1)).rejects.toThrow('subject mismatch')
+  })
+
   it('retries on transport failure', async () => {
     let calls = 0
     const transport: BridgeTransport = {
       commit: async () => {
         calls++
         if (calls < 2) throw new Error('temporary')
-        return { subject: 'a', idempotencyKey: 'k', accessGeneration: 1, operation: 'Upsert', resourceId: 'r', outcome: 'Accepted' }
+        return { subject: 'a', idempotencyKey: 'k', accessGeneration: 1, operation: 'activity_upsert', resourceId: 'r', outcome: 'Accepted' }
       },
     }
     const receipt = await commitObservation(transport, { idempotencyKey: 'k', subject: 'a', accessGeneration: 1, kind: 'ActivityUpsert', resourceId: 'r' })

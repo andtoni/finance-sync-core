@@ -22,6 +22,13 @@ function mockSql(cfg: {
   pendingRows?: Array<{ id: string; connection_id?: string; payload: unknown; attempts?: number }>;
 }) {
   const recordedUpdates: string[] = [];
+  const state = new Map((cfg.pendingRows ?? []).map((row) => [row.id, {
+    ...row,
+    state: "pending",
+    attempts: row.attempts ?? 0,
+    projectionCount: 0,
+  }]));
+  let fetchCount = 0;
   const fn = function (
     strings: TemplateStringsArray | readonly string[],
     ..._values: unknown[]
@@ -39,6 +46,19 @@ function mockSql(cfg: {
     }
     if (/UPDATE.*projection_outbox/i.test(sqlText)) {
       recordedUpdates.push(sqlText);
+      const id = _values.find((value): value is string => typeof value === "string" && state.has(value));
+      const row = id === undefined ? undefined : state.get(id);
+      if (row) {
+        row.attempts += 1;
+        if (/state = 'delivered'/i.test(sqlText)) {
+          row.state = "delivered";
+          row.projectionCount += 1;
+        } else if (/state = 'dead_letter'/i.test(sqlText)) {
+          row.state = "dead_letter";
+        } else {
+          row.state = "pending";
+        }
+      }
     }
     return Promise.resolve([]);
   };
@@ -46,6 +66,9 @@ function mockSql(cfg: {
   return {
     sql: fn as unknown as FinanceSyncSql,
     updates: () => [...recordedUpdates],
+    state: () => [...state.values()],
+    fetchCount: () => fetchCount,
+    countFetch: () => { fetchCount += 1; },
   };
 }
 
@@ -211,6 +234,118 @@ describe("G8 fail-closed startup — createRuntimeDependencies", () => {
 
 // ── G8 projection dead-letter vertical slice ───────────────────────────
 describe("G8 projection dead-letter — projectPending", () => {
+  it("delivers only a complete receipt bound to the operation and authorized subject", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      outcome: "Accepted", operation: "activity_upsert", subject: "owner",
+      idempotencyKey: "k-valid", resourceId: "r-valid", accessGeneration: 1,
+    }), { status: 200 })) as typeof fetch;
+    try {
+      const { sql, updates } = mockSql({ pendingRows: [{ id: "id-valid", connection_id: "conn-1", payload: {
+        idempotencyKey: "k-valid", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r-valid",
+      }, attempts: 0 }] });
+      const deps = createRuntimeDependencies(sql, "dep-1", {
+        FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture",
+      });
+      const result = await deps.projectPending();
+      expect(result.delivered).toBe(1);
+      expect(updates().some((u) => /delivered/i.test(u))).toBe(true);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it.each([
+    ["malformed", {}],
+    ["wrong operation", { operation: "account_delete" }],
+    ["wrong subject", { subject: "urn:other#owner" }],
+    ["wrong idempotency", { idempotencyKey: "other-key" }],
+    ["wrong resource", { resourceId: "other-resource" }],
+    ["wrong generation", { accessGeneration: 2 }],
+    ["rejected", { outcome: "Rejected" }],
+  ] as const)("fails closed for %s with one fetch, one retry, and no projection", async (_name, responsePatch) => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      const response = Object.keys(responsePatch).length === 0
+        ? {}
+        : { outcome: "Accepted", operation: "activity_upsert", subject: "owner", idempotencyKey: "matrix-key", resourceId: "matrix-resource", accessGeneration: 1, ...responsePatch };
+      return new Response(JSON.stringify(response), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const fixture = mockSql({ pendingRows: [{ id: `id-matrix-${_name}`, connection_id: "conn-matrix", payload: { idempotencyKey: "matrix-key", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert" as const, resourceId: "matrix-resource" }, attempts: 0 }] });
+      const deps = createRuntimeDependencies(fixture.sql, "dep-1", { FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture" });
+      const result = await deps.projectPending();
+      expect(fetches).toBe(1);
+      expect(result.delivered).toBe(0);
+      expect(result.failed).toBe(1);
+      expect(fixture.state()[0].state).toBe("pending");
+      expect(fixture.state()[0].projectionCount).toBe(0);
+      expect(fixture.updates().filter((u) => /UPDATE.*projection_outbox/i.test(u))).toHaveLength(1);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it("rejects a malformed successful response and retries instead of delivering", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({}), { status: 200 })) as typeof fetch;
+    try {
+      const { sql, updates } = mockSql({ pendingRows: [{ id: "id-malformed", connection_id: "conn-1", payload: {
+        idempotencyKey: "k-malformed", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r-malformed",
+      }, attempts: 0 }] });
+      const deps = createRuntimeDependencies(sql, "dep-1", {
+        FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture",
+      });
+      const result = await deps.projectPending();
+      expect(result.delivered).toBe(0);
+      expect(result.failed).toBe(1);
+      expect(updates().some((u) => /delivered/i.test(u))).toBe(false);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it("rejects delivery when the configured credential subject differs from the request subject", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      outcome: "Accepted", operation: "activity_upsert", subject: "different-owner",
+      idempotencyKey: "k-cross", resourceId: "r-cross", accessGeneration: 1,
+    }), { status: 200 })) as typeof fetch;
+    try {
+    const { sql, updates } = mockSql({ pendingRows: [{ id: "id-cross", connection_id: "conn-1", payload: {
+      idempotencyKey: "k-cross", subject: "other-owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r-cross",
+    }, attempts: 0 }] });
+    const deps = createRuntimeDependencies(sql, "dep-1", {
+      FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture",
+    });
+    const result = await deps.projectPending();
+    expect(result.delivered).toBe(0);
+    expect(result.failed).toBe(1);
+    expect(updates().some((u) => /delivered/i.test(u))).toBe(false);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it("requires a bridge token and sends authenticated subject-bound delivery", async () => {
+    const seen: Request[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => { seen.push(new Request(input, init)); return new Response(JSON.stringify({ outcome: "Accepted", operation: "activity_upsert", subject: "owner", idempotencyKey: "k-auth", resourceId: "r", accessGeneration: 1 }), { status: 200 }); }) as typeof fetch;
+    try {
+      const { sql } = mockSql({ pendingRows: [{ id: "id-auth", connection_id: "conn-1", payload: { idempotencyKey: "k-auth", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r" }, attempts: 0 }] });
+      const deps = createRuntimeDependencies(sql, "dep-1", { FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture" });
+      await deps.projectPending();
+      expect(seen[0].headers.get("authorization")).toBe("Bearer token-fixture");
+      expect(await seen[0].json()).toMatchObject({ subject: "owner", kind: "ActivityUpsert" });
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  it("sends the canonical snake_case bridge request with PascalCase kind", async () => {
+    const seen: Request[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => { seen.push(new Request(input, init)); return new Response(JSON.stringify({ outcome: "Accepted", operation: "activity_upsert", subject: "owner", idempotencyKey: "k-wire", resourceId: "r", accessGeneration: 1 }), { status: 200 }); }) as typeof fetch;
+    try {
+      const { sql } = mockSql({ pendingRows: [{ id: "id-wire", connection_id: "conn-1", payload: { idempotencyKey: "k-wire", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r", activity: { accountId: "a", activityType: "DEPOSIT", status: "CLEARED", activityDate: "2026-07-16", amount: "1", currency: "USD" } }, attempts: 0 }] });
+      const deps = createRuntimeDependencies(sql, "dep-1", { FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture" });
+      await deps.projectPending();
+      expect(await seen[0].json()).toEqual({ idempotency_key: "k-wire", subject: "owner", access_generation: 1, kind: "ActivityUpsert", resource_id: "r", activity: { account_id: "a", activity_type: "DEPOSIT", status: "CLEARED", activity_date: "2026-07-16", amount: "1", currency: "USD" } });
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
   it("dead-letters an outbox item when attempts reach MAX_PROJECTION_DELIVERY_ATTEMPTS", async () => {
     const pendingId = "00000000-0000-0000-0000-000000000001";
     const pendingPayload = { idempotencyKey: "key-exhausted", subject: "owner", kind: "ActivityUpsert", accessGeneration: 1 };

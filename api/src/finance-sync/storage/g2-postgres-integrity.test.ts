@@ -150,17 +150,18 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
   it("transitions a pending outbox item to dead_letter state after MAX_PROJECTION_DELIVERY_ATTEMPTS failures", async () => {
     sql = postgres(url!, { connect_timeout: 3, prepare: false });
 
-    process.env.FINANCE_SYNC_DEPLOYMENT_ID = DEPLOYMENT_ID;
+    const deadLetterDeploymentId = "g8-dead-letter-test";
+    process.env.FINANCE_SYNC_DEPLOYMENT_ID = deadLetterDeploymentId;
 
     const directory = resolve(import.meta.dirname, "../../../finance-sync-migrations");
     await migrate(sql, directory);
 
-    // Seed identity chain
+    // Seed identity chain in an isolated deployment namespace.
     await sql`
       INSERT INTO provider_principals
         (deployment_id, local_owner_id, provider, provider_principal_id, provider_subject_id)
       VALUES
-        (${DEPLOYMENT_ID}, 'test-owner', 'test-provider',
+        (${deadLetterDeploymentId}, 'test-owner', 'test-provider',
          'a0000000-0000-0000-0000-000000000001', 'test-subject')
     `;
     await sql`
@@ -168,7 +169,7 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
         (deployment_id, local_owner_id, connection_incarnation_id,
          provider_principal_id, provider_connection_id, incarnation)
       VALUES
-        (${DEPLOYMENT_ID}, 'test-owner', 'a0000000-0000-0000-0000-000000000010',
+        (${deadLetterDeploymentId}, 'test-owner', 'a0000000-0000-0000-0000-000000000010',
          'a0000000-0000-0000-0000-000000000001', 'test-conn', 1)
     `;
     await sql`
@@ -176,7 +177,7 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
         (deployment_id, local_owner_id, account_incarnation_id,
          connection_incarnation_id, provider_account_id, incarnation)
       VALUES
-        (${DEPLOYMENT_ID}, 'test-owner', 'a0000000-0000-0000-0000-000000000020',
+        (${deadLetterDeploymentId}, 'test-owner', 'a0000000-0000-0000-0000-000000000020',
          'a0000000-0000-0000-0000-000000000010', 'test-account', 1)
     `;
     await sql`
@@ -184,7 +185,7 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
         (deployment_id, local_owner_id, source_resource_incarnation_id,
          account_incarnation_id, resource_kind, provider_resource_id, incarnation)
       VALUES
-        (${DEPLOYMENT_ID}, 'test-owner', 'a0000000-0000-0000-0000-000000000030',
+        (${deadLetterDeploymentId}, 'test-owner', 'a0000000-0000-0000-0000-000000000030',
          'a0000000-0000-0000-0000-000000000020', 'test_resource', 'test-resource', 1)
     `;
 
@@ -200,12 +201,12 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
       INSERT INTO projection_outbox
         (deployment_id, local_owner_id, connection_id, idempotency_key, payload, attempts)
       VALUES
-        (${DEPLOYMENT_ID}, 'test-owner', 'test-conn', 'dlq-int-key-1',
+        (${deadLetterDeploymentId}, 'test-owner', 'test-conn', 'dlq-int-key-1',
          ${JSON.stringify(outboxPayload)}, 2)
     `;
 
     // Create runtime deps with a bridge URL guaranteed to fail (loopback with no listener)
-    const deps = createRuntimeDependencies(sql, DEPLOYMENT_ID, {
+    const deps = createRuntimeDependencies(sql, deadLetterDeploymentId, {
       FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
     });
 

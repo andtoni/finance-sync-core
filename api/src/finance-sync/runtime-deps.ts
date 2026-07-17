@@ -1,6 +1,6 @@
 import type { FinanceSyncSql } from './storage/pg'
 import { runPlaidSync, type ObservationOutput, type PlaidTransport } from './probes/plaid/plaid-adapter'
-import { cashObservationToBridge, type BridgeDisclosureOperation } from './projection/bridge-client'
+import { bridgeOperationToWire, cashObservationToBridge, validateBridgeReceipt, type BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 
 // G8 resiliency: retry threshold derived from bridge-client.ts commitObservation maxRetries = 3
@@ -18,7 +18,7 @@ export interface SyncCycleAuditEntry {
   readonly count: number
 }
 
-interface RuntimeEnv { readonly FINANCE_SYNC_CONNECTIONS_JSON?: string; readonly FINANCE_SYNC_BRIDGE_URL?: string; readonly FINANCE_SYNC_PLAID_URL?: string; readonly FINANCE_SYNC_PLAID_CLIENT_ID?: string; readonly FINANCE_SYNC_PLAID_SECRET?: string }
+interface RuntimeEnv { readonly FINANCE_SYNC_CONNECTIONS_JSON?: string; readonly FINANCE_SYNC_BRIDGE_URL?: string; readonly FINANCE_SYNC_BRIDGE_TOKEN?: string; readonly FINANCE_SYNC_PLAID_URL?: string; readonly FINANCE_SYNC_PLAID_CLIENT_ID?: string; readonly FINANCE_SYNC_PLAID_SECRET?: string }
 function connections(env: RuntimeEnv, deploymentId: string): readonly RuntimeConnection[] {
   if (!env.FINANCE_SYNC_CONNECTIONS_JSON) return [];
   const value: unknown = JSON.parse(env.FINANCE_SYNC_CONNECTIONS_JSON);
@@ -64,8 +64,10 @@ export function createRuntimeDependencies(sql: FinanceSyncSql, deploymentId: str
       }
       const rows = await sql<{ id: string; connection_id: string; payload: BridgeDisclosureOperation; attempts: number }[]>`SELECT id, connection_id, payload, attempts FROM projection_outbox WHERE deployment_id = ${deploymentId} AND state = 'pending' ORDER BY created_at FOR UPDATE SKIP LOCKED`;
       for (const row of rows) try {
-        const response = await fetch(env.FINANCE_SYNC_BRIDGE_URL, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': row.payload.idempotencyKey }, body: JSON.stringify(row.payload) });
+        if (!env.FINANCE_SYNC_BRIDGE_TOKEN) throw new Error('FINANCE_SYNC_BRIDGE_TOKEN is required for bridge delivery');
+        const response = await fetch(env.FINANCE_SYNC_BRIDGE_URL, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${env.FINANCE_SYNC_BRIDGE_TOKEN}`, 'idempotency-key': row.payload.idempotencyKey }, body: JSON.stringify(bridgeOperationToWire(row.payload)) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        validateBridgeReceipt(row.payload, await response.json());
         await sql`UPDATE projection_outbox SET state = 'delivered', delivered_at = now(), attempts = attempts + 1, last_error = NULL WHERE id = ${row.id}::uuid`;
         delivered++;
         track(row.connection_id, 'delivered')
