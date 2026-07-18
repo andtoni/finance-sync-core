@@ -7,6 +7,13 @@ import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
 import { parseServiceConfig } from './service-config'
 import { financeSyncHealth } from './health'
+import {
+  createPlaidConnectTransport,
+  createSnapTradeConnectTransport,
+  FinanceSyncConnectControl,
+  unavailableProviderSecretStore,
+} from './connect-control'
+import { createFinanceSyncHttpHandler } from './connect-http'
 
 interface CliArgs { help?: boolean; once?: boolean }
 function parseArgs(argv = process.argv): CliArgs { return { help: argv.includes('--help') || argv.includes('-h'), once: argv.includes('--once') } }
@@ -18,7 +25,14 @@ Runs configured read-only providers to canonical observations and a bridge outbo
 FINANCE_SYNC_CONNECTIONS_JSON is optional; without it, the runner performs migrations/readiness only.
 --once runs one complete sync cycle and exits.`); return }
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
-  const deps = createRuntimeDependencies(sql, config.deploymentId); let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
+  const deps = createRuntimeDependencies(sql, config.deploymentId)
+  const connect = new FinanceSyncConnectControl({
+    connections: await deps.loadConnections(config.deploymentId),
+    plaid: createPlaidConnectTransport(process.env),
+    snaptrade: createSnapTradeConnectTransport(process.env),
+    secretStore: unavailableProviderSecretStore,
+  })
+  let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {
     try {
       const result = await runConfiguredSyncCycle(config.deploymentId, deps)
@@ -40,7 +54,12 @@ FINANCE_SYNC_CONNECTIONS_JSON is optional; without it, the runner performs migra
   try {
     console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay(); await cycle()
     if (args.once) { if (!databaseReady || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
-    const server = createServer((request, response) => { if (request.url !== '/health') return void response.writeHead(404).end(); const health = financeSyncHealth(databaseReady, cycleReady, connectionCount); response.writeHead(health.ok ? 200 : 503, { 'content-type': 'application/json' }).end(JSON.stringify(health)) })
+    const handler = createFinanceSyncHttpHandler({
+      controlToken: config.controlToken,
+      connect,
+      health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount); return { status: body.ok ? 200 : 503, body } },
+    })
+    const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })
     console.log('FINANCE_SYNC_HEALTH_LISTENING')
     const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); if (!stopping) schedule() }, config.intervalMs) }; schedule()
