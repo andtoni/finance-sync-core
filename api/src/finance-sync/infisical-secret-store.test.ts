@@ -41,8 +41,8 @@ describe('Infisical ProviderSecretStore', () => {
     await store.storePlaidAccessToken({ subject: 'wealthfolio#owner', itemId: 'item-1', accessToken: 'plaid-access-secret' })
     expect(calls).toHaveLength(2)
     expect(calls[1].init?.method).toBe('PATCH')
-    expect(calls[1].url).toMatch(/\/api\/v4\/secrets\/PLAID_ACCESS_TOKEN_[A-F0-9]{64}$/)
-    expect(JSON.parse(String(calls[1].init?.body))).toMatchObject({ projectId: 'project-id', environment: 'prod', secretValue: 'plaid-access-secret' })
+    expect(calls[1].url).toMatch(/\/api\/v3\/secrets\/raw\/PLAID_ACCESS_TOKEN_[A-F0-9]{64}$/)
+    expect(JSON.parse(String(calls[1].init?.body))).toMatchObject({ workspaceId: 'project-id', environment: 'prod', secretValue: 'plaid-access-secret' })
   })
 
   it('retries transient writes using the prepared token before succeeding', async () => {

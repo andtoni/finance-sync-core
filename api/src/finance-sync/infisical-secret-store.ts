@@ -97,9 +97,9 @@ export function createInfisicalProviderSecretStore(env: Env, fetchImpl: typeof f
       preparedToken = undefined
       if (!accessToken) accessToken = await authenticate()
       const secretName = `PLAID_ACCESS_TOKEN_${createHash('sha256').update(`${input.subject}\0${input.itemId}`).digest('hex').toUpperCase()}`
-      const endpoint = `${config.baseUrl}/api/v4/secrets/${encodeURIComponent(secretName)}`
+      const endpoint = `${config.baseUrl}/api/v3/secrets/raw/${encodeURIComponent(secretName)}`
       const body = JSON.stringify({
-        projectId: config.projectId,
+        workspaceId: config.projectId,
         environment: config.environment,
         secretPath: config.secretPath,
         secretValue: input.accessToken,
