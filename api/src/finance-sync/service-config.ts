@@ -1,3 +1,5 @@
+import { readExclusiveInput } from './secret-input'
+
 export interface FinanceSyncServiceConfig {
   readonly databaseUrl: string
   readonly deploymentId: string
@@ -6,9 +8,7 @@ export interface FinanceSyncServiceConfig {
 }
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
-  const value = env[name]
-  if (!value) throw new Error(`${name} is required`)
-  return value
+  return readExclusiveInput(env, name, true) as string
 }
 
 function positiveInteger(value: string | undefined, fallback: number, name: string): number {

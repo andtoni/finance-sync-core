@@ -231,6 +231,18 @@ export async function runPlaidSync(
         }
 
         if (!page.has_more) {
+          // Plaid can return a removal before or after the posted transaction that
+          // names it as its pending predecessor. Decide suppression only after the
+          // complete item drain so page ordering cannot delete the successor chain.
+          const supersededPendingIds = new Set(observations.flatMap(observation => {
+            const value = observation.payload.pendingTransactionId
+            return typeof value === 'string' && value.length > 0 ? [value] : []
+          }))
+          observations = observations.filter(observation => !(
+            observation.payload.isRemoved === true
+            && typeof observation.payload.transactionId === 'string'
+            && supersededPendingIds.has(observation.payload.transactionId)
+          ))
           return {
             nextCursor: page.next_cursor,
             accounts: [...accountMap.values()],

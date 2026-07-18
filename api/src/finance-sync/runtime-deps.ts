@@ -15,6 +15,7 @@ import {
   type BridgeDisclosureOperation,
 } from './projection/bridge-client'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
+import { readExclusiveInput } from './secret-input'
 
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
 const MAX_PROJECTION_BATCH = 25
@@ -31,6 +32,7 @@ interface RuntimeEnv extends ProviderRuntimeEnv {
   readonly FINANCE_SYNC_BRIDGE_URL?: string
   readonly FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS?: string
   readonly FINANCE_SYNC_BRIDGE_TOKEN?: string
+  readonly FINANCE_SYNC_BRIDGE_TOKEN_FILE?: string
 }
 
 function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: ReadonlySet<string>): URL {
@@ -52,20 +54,19 @@ function bridgeHosts(env: RuntimeEnv): ReadonlySet<string> {
   return new Set(hosts)
 }
 
-function safeDeliveryError(error: unknown): string {
-  if (error instanceof Error && /^bridge (delivery failed: HTTP \d{3}|receipt)/.test(error.message)) return error.message.slice(0, 80)
-  return 'bridge delivery failed'
-}
+export type BridgeReceiptLookup = (operation: BridgeDisclosureOperation) => Promise<unknown | null>
 
 export function createRuntimeDependencies(
   sql: FinanceSyncSql,
   deploymentId: string,
   env: RuntimeEnv = process.env,
   transportFactories?: ProviderTransportFactories,
+  receiptLookup?: BridgeReceiptLookup,
 ): SyncRuntimeDependencies {
   const configured = parseRuntimeConnections(env, deploymentId)
   const factories = transportFactories ?? createProviderTransportFactories(env)
   let bridgeUrl: URL | undefined
+  let bridgeToken: string | undefined
   if (configured.length > 0) {
     // Construct every configured provider transport at startup so endpoint and
     // server-credential errors fail before the service reports readiness.
@@ -76,7 +77,7 @@ export function createRuntimeDependencies(
       else factories.snaptrade(connection)
     }
     bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', bridgeHosts(env))
-    if (!env.FINANCE_SYNC_BRIDGE_TOKEN) throw new Error('FINANCE_SYNC_BRIDGE_TOKEN is required for configured connections')
+    bridgeToken = readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
   }
 
   return {
@@ -134,7 +135,7 @@ export function createRuntimeDependencies(
           RETURNING observation_id
         `
         insertedCount += inserted.length
-        const operation = providerObservationToBridge(connection.provider, enriched, connection.accessGeneration, wealthfolioAccountId)
+        const operation = providerObservationToBridge(connection.provider, enriched, connection.accessGeneration, wealthfolioAccountId, connection.connectionId)
         if (operation) await tx`
           INSERT INTO projection_outbox (
             deployment_id, local_owner_id, connection_id, idempotency_key, payload
@@ -148,7 +149,7 @@ export function createRuntimeDependencies(
       return insertedCount
     }),
     projectPending: async connection => {
-      if (!bridgeUrl || !env.FINANCE_SYNC_BRIDGE_TOKEN) return { delivered: 0, failed: 0 }
+      if (!bridgeUrl || !bridgeToken) return { delivered: 0, failed: 0 }
       return sql.begin(async transaction => {
         const tx = transaction as unknown as FinanceSyncSql
         const unresolvedBefore = await tx<{ count: number }[]>`
@@ -162,52 +163,96 @@ export function createRuntimeDependencies(
 
         let delivered = 0
         let deliveryFailures = 0
-        const rows = await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number }[]>`
-          SELECT id, payload, attempts
+        const rows = await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
+          SELECT id, payload, attempts, state
           FROM projection_outbox
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
-            AND state = 'pending'
+            AND state IN ('pending', 'uncertain')
           ORDER BY created_at
           LIMIT ${MAX_PROJECTION_BATCH}
           FOR UPDATE SKIP LOCKED
         `
         for (const row of rows) {
+          const markDelivered = async () => {
+            await tx`
+              UPDATE projection_outbox
+              SET state = 'delivered', delivered_at = now(), attempts = attempts + 1,
+                  last_error = NULL, dead_lettered_at = NULL, dead_letter_reason = NULL
+              WHERE id = ${row.id}::uuid
+            `
+            delivered++
+          }
+          const recoverReceipt = async (): Promise<boolean> => {
+            if (!receiptLookup) return false
+            try {
+              const recovered = await receiptLookup(row.payload)
+              if (recovered === null) return false
+              validateBridgeReceipt(row.payload, recovered)
+              await markDelivered()
+              return true
+            } catch {
+              return false
+            }
+          }
+
+          // Never replay an uncertain commit before attempting receipt recovery.
+          if (row.state === 'uncertain' && await recoverReceipt()) continue
+
+          let response: Response
           try {
-            const response = await fetch(bridgeUrl, {
+            response = await fetch(bridgeUrl, {
               method: 'POST',
               redirect: 'error',
               headers: {
                 'content-type': 'application/json',
-                authorization: `Bearer ${env.FINANCE_SYNC_BRIDGE_TOKEN}`,
+                authorization: `Bearer ${bridgeToken}`,
                 'idempotency-key': row.payload.idempotencyKey,
               },
               body: JSON.stringify(bridgeOperationToWire(row.payload)),
             })
-            if (!response.ok) throw new Error(`bridge delivery failed: HTTP ${response.status}`)
-            validateBridgeReceipt(row.payload, await response.json())
+          } catch {
+            if (await recoverReceipt()) continue
             await tx`
               UPDATE projection_outbox
-              SET state = 'delivered', delivered_at = now(), attempts = attempts + 1, last_error = NULL
+              SET attempts = attempts + 1, last_error = 'BRIDGE_RESPONSE_UNCERTAIN', state = 'uncertain'
               WHERE id = ${row.id}::uuid
             `
-            delivered++
-          } catch (error) {
-            const reason = safeDeliveryError(error)
+            deliveryFailures++
+            continue
+          }
+
+          if (!response.ok) {
             const nextAttempts = row.attempts + 1
             if (nextAttempts >= MAX_PROJECTION_DELIVERY_ATTEMPTS) {
               await tx`
                 UPDATE projection_outbox
-                SET attempts = ${nextAttempts}, last_error = ${reason}, state = 'dead_letter',
-                    dead_lettered_at = now(), dead_letter_reason = ${reason}
+                SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED', state = 'dead_letter',
+                    dead_lettered_at = now(), dead_letter_reason = 'BRIDGE_HTTP_REJECTED'
                 WHERE id = ${row.id}::uuid
               `
             } else {
               await tx`
-                UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = ${reason}
+                UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED'
                 WHERE id = ${row.id}::uuid
               `
             }
+            deliveryFailures++
+            continue
+          }
+
+          try {
+            validateBridgeReceipt(row.payload, await response.json())
+            await markDelivered()
+          } catch {
+            if (await recoverReceipt()) continue
+            // A successful HTTP commit with a lost/invalid receipt is uncertain,
+            // not terminal. It can only be resolved by a bound receipt lookup.
+            await tx`
+              UPDATE projection_outbox
+              SET attempts = attempts + 1, last_error = 'BRIDGE_RECEIPT_UNCERTAIN', state = 'uncertain'
+              WHERE id = ${row.id}::uuid
+            `
             deliveryFailures++
           }
         }
@@ -216,7 +261,7 @@ export function createRuntimeDependencies(
           FROM projection_outbox
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
-            AND state IN ('pending', 'dead_letter')
+            AND state IN ('pending', 'uncertain', 'dead_letter')
         `
         return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
       })

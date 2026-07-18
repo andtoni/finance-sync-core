@@ -74,12 +74,16 @@ export interface MercurySyncResult {
   readonly accountsFetched: number
   readonly pagesFetched: number
   readonly transactionsObserved: number
+  readonly quarantinedTransactions: number
   readonly paginationComplete: boolean
+  /** Provider-observed high-water mark with a safety overlap, never wall clock. */
+  readonly nextSince: string | null
 }
 
 const HASH_SPEC_VERSION = 1
 const PAGE_LIMIT = 500
 const MAX_PAGES_PER_ACCOUNT = 50
+const CHECKPOINT_OVERLAP_MS = 24 * 60 * 60 * 1000
 
 function sha256(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex')
@@ -117,6 +121,8 @@ export async function runMercurySync(
   let accountsFetched = 0
   let pagesFetched = 0
   let transactionsObserved = 0
+  let quarantinedTransactions = 0
+  let latestProviderTimestamp: number | null = null
   let paginationComplete = true
 
   let allAccounts: MercuryAccount[]
@@ -125,7 +131,7 @@ export async function runMercurySync(
     allAccounts = [...accountPage.accounts]
     accountsFetched = allAccounts.length
   } catch {
-    return { accounts: [], observations, accountsFetched: 0, pagesFetched: 0, transactionsObserved: 0, paginationComplete: false }
+    return { accounts: [], observations, accountsFetched: 0, pagesFetched: 0, transactionsObserved: 0, quarantinedTransactions: 0, paginationComplete: false, nextSince: null }
   }
 
   if (config.accountIds && config.accountIds.length > 0) {
@@ -186,13 +192,20 @@ export async function runMercurySync(
       for (const txn of txns) {
         const status = ledgerStatus(txn.status)
         if (status === null) {
+          // Cancellation/reversal and unknown lifecycle states cannot be safely
+          // represented as a posted ledger fact. Quarantine the row and fail the
+          // snapshot closed so its checkpoint is never promoted.
           transactionsObserved++
+          quarantinedTransactions++
+          paginationComplete = false
           continue
         }
 
         const currency = txn.currency ?? account.currency ?? 'USD'
         const domain = mercuryResourceKind(account.type)
         const effectiveDate = txn.postedAt ?? txn.createdAt
+        const providerTimestamp = effectiveDate === null ? Number.NaN : Date.parse(effectiveDate)
+        if (Number.isFinite(providerTimestamp)) latestProviderTimestamp = Math.max(latestProviderTimestamp ?? providerTimestamp, providerTimestamp)
 
         const payload = {
           transactionId: txn.id,
@@ -243,6 +256,10 @@ export async function runMercurySync(
     accountsFetched,
     pagesFetched,
     transactionsObserved,
+    quarantinedTransactions,
     paginationComplete,
+    nextSince: latestProviderTimestamp === null
+      ? null
+      : new Date(latestProviderTimestamp - CHECKPOINT_OVERLAP_MS).toISOString(),
   }
 }

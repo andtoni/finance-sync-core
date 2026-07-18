@@ -5,6 +5,7 @@ import { runMercurySync, type MercuryTransport } from './probes/mercury/mercury-
 import { runSnapTradeSync, type SnapTradeTransport } from './probes/snaptrade/snaptrade-adapter'
 import type { ProviderName } from './probes/provider-registry'
 import type { RuntimeConnection, ProviderRun } from './runtime'
+import { readExclusiveInput } from './secret-input'
 
 const PROVIDERS = new Set<ProviderName>(['investec', 'mercury', 'plaid', 'snaptrade'])
 const HOSTS: Record<ProviderName, ReadonlySet<string>> = {
@@ -16,11 +17,16 @@ const HOSTS: Record<ProviderName, ReadonlySet<string>> = {
 
 export interface ProviderRuntimeEnv {
   readonly FINANCE_SYNC_CONNECTIONS_JSON?: string
+  readonly FINANCE_SYNC_CONNECTIONS_JSON_FILE?: string
+  readonly FINANCE_SYNC_PROVIDER_SECRETS_JSON?: string
+  readonly FINANCE_SYNC_PROVIDER_SECRETS_JSON_FILE?: string
   readonly FINANCE_SYNC_INVESTEC_URL?: string
   readonly FINANCE_SYNC_MERCURY_URL?: string
   readonly FINANCE_SYNC_PLAID_URL?: string
   readonly FINANCE_SYNC_PLAID_CLIENT_ID?: string
+  readonly FINANCE_SYNC_PLAID_CLIENT_ID_FILE?: string
   readonly FINANCE_SYNC_PLAID_SECRET?: string
+  readonly FINANCE_SYNC_PLAID_SECRET_FILE?: string
   readonly FINANCE_SYNC_SNAPTRADE_URL?: string
 }
 
@@ -63,16 +69,36 @@ function optionalPositive(c: Record<string, unknown>, name: string): number | un
 
 /** Strict server-side connection parser. Unknown providers and incomplete mappings fail closed. */
 export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: string): readonly RuntimeConnection[] {
-  if (!env.FINANCE_SYNC_CONNECTIONS_JSON) return []
+  const inputs = env as Readonly<Record<string, string | undefined>>
+  const metadataJson = readExclusiveInput(inputs, 'FINANCE_SYNC_CONNECTIONS_JSON')
+  if (!metadataJson) return []
   let parsed: unknown
-  try { parsed = JSON.parse(env.FINANCE_SYNC_CONNECTIONS_JSON) } catch { throw new Error('FINANCE_SYNC_CONNECTIONS_JSON is invalid JSON') }
+  try { parsed = JSON.parse(metadataJson) } catch { throw new Error('FINANCE_SYNC_CONNECTIONS_JSON is invalid JSON') }
   if (!Array.isArray(parsed)) throw new Error('FINANCE_SYNC_CONNECTIONS_JSON must be an array')
+  for (const value of parsed) {
+    const metadata = record(value, 'invalid Finance Sync connection')
+    for (const forbidden of ['accessToken', 'clientSecret', 'apiKey', 'apiToken', 'consumerKey', 'userSecret']) {
+      if (forbidden in metadata) throw new Error('provider secret material must not appear in connection metadata')
+    }
+    if (typeof metadata.provider !== 'string' || !PROVIDERS.has(metadata.provider as ProviderName)) {
+      throw new Error('unsupported runtime provider')
+    }
+  }
+  let secretValue: unknown
+  const secretsJson = readExclusiveInput(inputs, 'FINANCE_SYNC_PROVIDER_SECRETS_JSON', parsed.length > 0)
+  try { secretValue = JSON.parse(secretsJson ?? '{}') } catch { throw new Error('FINANCE_SYNC_PROVIDER_SECRETS_JSON is invalid JSON') }
+  const secrets = record(secretValue, 'FINANCE_SYNC_PROVIDER_SECRETS_JSON must be an object')
   const ids = new Set<string>()
   return parsed.map(value => {
-    const c = record(value, 'invalid Finance Sync connection')
+    const metadata = record(value, 'invalid Finance Sync connection')
+    for (const forbidden of ['accessToken', 'clientSecret', 'apiKey', 'apiToken', 'consumerKey', 'userSecret']) {
+      if (forbidden in metadata) throw new Error('provider secret material must not appear in connection metadata')
+    }
+    const connectionId = string(metadata, 'connectionId')
+    const secretMaterial = record(secrets[connectionId], 'provider secret material is required for every connection')
+    const c = { ...metadata, ...secretMaterial }
     const provider = c.provider
     if (typeof provider !== 'string' || !PROVIDERS.has(provider as ProviderName)) throw new Error('unsupported runtime provider')
-    const connectionId = string(c, 'connectionId')
     if (ids.has(connectionId)) throw new Error('connectionId must be unique')
     ids.add(connectionId)
     const configuredDeployment = string(c, 'deploymentId')
@@ -118,8 +144,23 @@ function endpoint(raw: string | undefined, fallback: string, provider: ProviderN
   return url
 }
 async function json(response: Response, provider: ProviderName): Promise<unknown> {
-  if (!response.ok) throw new Error(`${provider} request failed: HTTP ${response.status}`)
-  try { return await response.json() } catch { throw new Error(`${provider} returned invalid JSON`) }
+  let value: unknown
+  try { value = await response.json() } catch {
+    if (!response.ok) throw new Error(`${provider} request failed: HTTP ${response.status}`)
+    throw new Error(`${provider} returned invalid JSON`)
+  }
+  if (!response.ok) {
+    const error = new Error(`${provider} request failed: HTTP ${response.status}`) as Error & { code?: string }
+    // Preserve only the Plaid control-flow code required by the documented
+    // Transactions Sync restart protocol; never propagate arbitrary API text.
+    if (provider === 'plaid'
+      && typeof (value as { error_code?: unknown } | null)?.error_code === 'string'
+      && (value as { error_code: string }).error_code === 'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION') {
+      error.code = 'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION'
+    }
+    throw error
+  }
+  return value
 }
 function canonicalJson(value: unknown): string {
   if (value === null || value === undefined) return 'null'
@@ -138,8 +179,9 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
     plaid(connection) {
       const base = endpoint(env.FINANCE_SYNC_PLAID_URL, 'https://production.plaid.com', 'plaid')
       if (base.pathname !== '/') throw new Error('Plaid endpoint must be an origin URL')
-      const clientId = env.FINANCE_SYNC_PLAID_CLIENT_ID, secret = env.FINANCE_SYNC_PLAID_SECRET
-      if (!clientId || !secret) throw new Error('Plaid server credentials are required')
+      const inputs = env as Readonly<Record<string, string | undefined>>
+      const clientId = readExclusiveInput(inputs, 'FINANCE_SYNC_PLAID_CLIENT_ID', true)
+      const secret = readExclusiveInput(inputs, 'FINANCE_SYNC_PLAID_SECRET', true)
       const request = async (path: string, body: Record<string, unknown>) => json(await fetch(new URL(path, base), {
         method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ client_id: clientId, secret, access_token: connection.accessToken, ...body }),
@@ -256,10 +298,11 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
       return { observations: run.observations, nextCursor: null }
     }
     case 'mercury': {
-      const startedAt = new Date().toISOString()
       const run = await runMercurySync({ ...connection, since: cursor ?? connection.since }, factories.mercury(connection))
       if (!run.paginationComplete) throw new Error('Mercury pagination did not complete')
-      return { observations: run.observations, nextCursor: startedAt }
+      // Advance only to a provider-observed timestamp with an overlap; when no
+      // transaction confirms a boundary, retain the previous cursor.
+      return { observations: run.observations, nextCursor: run.nextSince ?? cursor }
     }
     case 'snaptrade': {
       const end = connection.activitiesEndDate ?? new Date().toISOString().slice(0, 10)

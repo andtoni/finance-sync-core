@@ -15,10 +15,12 @@ const CONNECTION: RuntimeConnection = {
   wealthfolioAccountIds: { 'acc-1': 'wf-acc-1' },
   accessGeneration: 1,
 }
+const { accessToken: CONNECTION_ACCESS_TOKEN, ...CONNECTION_METADATA } = CONNECTION
 
 function env(overrides: Record<string, string | undefined> = {}) {
   return {
-    FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([CONNECTION]),
+    FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([CONNECTION_METADATA]),
+    FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'item-1': { accessToken: CONNECTION_ACCESS_TOKEN } }),
     FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com',
     FINANCE_SYNC_PLAID_CLIENT_ID: 'client-test',
     FINANCE_SYNC_PLAID_SECRET: 'secret-test',
@@ -56,7 +58,7 @@ function receipt(op: BridgeDisclosureOperation) {
 }
 
 function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attempts: number }) {
-  let state = 'pending'
+  let state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' = 'pending'
   let attempts = row.attempts
   const queries: string[] = []
   const sql = (async (strings: TemplateStringsArray, ..._values: unknown[]) => {
@@ -68,10 +70,13 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
         : Number(state === 'pending' || state === 'dead_letter')
       return [{ count }]
     }
-    if (/SELECT\s+id,\s*payload,\s*attempts/i.test(text)) return state === 'pending' ? [row] : []
+    if (/SELECT\s+id,\s*payload,\s*attempts/i.test(text)) {
+      return state === 'pending' || state === 'uncertain' ? [{ ...row, attempts, state }] : []
+    }
     if (/UPDATE\s+projection_outbox/i.test(text)) {
       attempts += 1
       if (/state = 'delivered'/i.test(text)) state = 'delivered'
+      if (/state = 'uncertain'/i.test(text)) state = 'uncertain'
       if (/state = 'dead_letter'/i.test(text)) state = 'dead_letter'
     }
     return []
@@ -96,11 +101,11 @@ describe('createRuntimeDependencies startup validation', () => {
   })
 
   it('rejects non-qualified subjects and incomplete account mappings', () => {
-    const badSubject = { ...CONNECTION, localOwnerId: 'owner' }
+    const badSubject = { ...CONNECTION_METADATA, localOwnerId: 'owner' }
     expect(() => createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', env({
       FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([badSubject]),
     }))).toThrow('issuer-qualified')
-    const badMapping = { ...CONNECTION, wealthfolioAccountIds: {} }
+    const badMapping = { ...CONNECTION_METADATA, wealthfolioAccountIds: {} }
     expect(() => createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', env({
       FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([badMapping]),
     }))).toThrow('every provider account')
@@ -132,16 +137,17 @@ describe('projectPending transaction and receipt contract', () => {
     }
   })
 
-  it('retries an invalid receipt and permanently reports a dead letter', async () => {
+  it('fences a successful commit with an invalid receipt as uncertain', async () => {
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000011', payload: operation, attempts: 2 })
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async () => new Response(JSON.stringify({ outcome: 'Accepted' }), { status: 200 })) as typeof fetch
     try {
       const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
       await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
-      expect(fixture.state()).toBe('dead_letter')
+      expect(fixture.state()).toBe('uncertain')
       expect(fixture.attempts()).toBe(3)
       await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('uncertain')
     } finally {
       globalThis.fetch = originalFetch
     }

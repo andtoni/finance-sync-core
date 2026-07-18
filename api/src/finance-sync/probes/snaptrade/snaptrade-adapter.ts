@@ -80,7 +80,7 @@ export interface SnapTradeTransport {
   /** Fetch all brokerage accounts with their positions (holdings). */
   fetchAccounts(): Promise<readonly SnapTradeRawAccount[]>
 
-  /** Fetch activities for a date range. Returns array directly or wrapped in { data: [...] }. */
+  /** Fetch the documented bounded activity date range. */
   fetchActivities(startDate: string, endDate: string): Promise<readonly SnapTradeRawActivity[] | { readonly data: readonly SnapTradeRawActivity[] }>
 }
 
@@ -95,6 +95,7 @@ export interface SnapTradeSyncConfig {
   /** ISO date string for the start of the activity window. */
   readonly activitiesStartDate?: string
   readonly activitiesEndDate?: string
+  readonly maxActivityRows?: number
 }
 
 export interface ObservationOutput {
@@ -117,6 +118,7 @@ export interface SnapTradeSyncResult {
   readonly accountsFetched: number
   readonly holdingsObserved: number
   readonly activitiesObserved: number
+  readonly activityPasses: number
   readonly complete: boolean
 }
 
@@ -160,6 +162,8 @@ export interface SnapTradeNormalizedActivity {
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 const HASH_SPEC_VERSION = 1
+const DEFAULT_MAX_ACTIVITY_ROWS = 10_000
+const ACTIVITY_STABILITY_PASSES = 2
 
 function sha256(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex')
@@ -416,7 +420,7 @@ export async function runSnapTradeSync(
     rawAccounts = await transport.fetchAccounts()
     accountsFetched = rawAccounts.length
   } catch {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0, complete: false }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: false }
   }
 
   // Filter to configured account IDs if provided
@@ -427,7 +431,7 @@ export async function runSnapTradeSync(
 
   // Short-circuit: no accounts, nothing to sync
   if (rawAccounts.length === 0) {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0, complete: true }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: true }
   }
 
   // 2. Process each account
@@ -507,11 +511,27 @@ export async function runSnapTradeSync(
   const startDate = config.activitiesStartDate ?? new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)
   const endDate = config.activitiesEndDate ?? new Date().toISOString().slice(0, 10)
 
+  let activityPasses = 0
   try {
-    const actPayload = await transport.fetchActivities(startDate, endDate)
-    const normActivities = normalizeActivities(actPayload)
+    // The documented user-level endpoint has a bounded date window but no
+    // cursor parameter. Require two identical bounded snapshots instead of
+    // guessing undocumented pagination fields or accepting a moving partial run.
+    const maxRows = config.maxActivityRows ?? DEFAULT_MAX_ACTIVITY_ROWS
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error('invalid activity bound')
+    let stableActivities: SnapTradeNormalizedActivity[] | null = null
+    let stableSignature: string | null = null
+    for (let pass = 0; pass < ACTIVITY_STABILITY_PASSES; pass++) {
+      const actPayload = await transport.fetchActivities(startDate, endDate)
+      activityPasses++
+      const normalized = normalizeActivities(actPayload)
+      if (normalized.length > maxRows) throw new Error('activity bound exceeded')
+      const signature = sha256(JSON.stringify([...normalized].sort((a, b) => a.id.localeCompare(b.id))))
+      if (stableSignature !== null && signature !== stableSignature) throw new Error('activity snapshot unstable')
+      stableActivities = normalized
+      stableSignature = signature
+    }
 
-    for (const a of normActivities) {
+    for (const a of stableActivities ?? []) {
       activities.push(a)
       activitiesObserved++
 
@@ -557,6 +577,7 @@ export async function runSnapTradeSync(
     accountsFetched,
     holdingsObserved,
     activitiesObserved,
+    activityPasses,
     complete,
   }
 }

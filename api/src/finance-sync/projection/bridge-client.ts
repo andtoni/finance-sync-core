@@ -131,8 +131,15 @@ export type ObservationToBridge = (observation: {
   readonly observedAt: string
 }) => BridgeDisclosureOperation
 
-export function idempotencyKey(deploymentId: string, semanticHash: string): string {
-  return createHash('sha256').update(`${deploymentId}:${semanticHash}`, 'utf8').digest('hex').slice(0, 40)
+export function idempotencyKey(
+  deploymentId: string,
+  semanticHash: string,
+  scope: readonly string[] = [],
+): string {
+  const encoder = new TextEncoder()
+  const fields = [deploymentId, ...scope, semanticHash]
+  const framed = fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')
+  return createHash('sha256').update(framed, 'utf8').digest('hex').slice(0, 40)
 }
 
 export function cashObservationToBridge(
@@ -146,6 +153,7 @@ export function cashObservationToBridge(
   },
   accessGeneration: number,
   accountId: string,
+  connectionId = observation.sourceResourceIncarnationId,
 ): BridgeDisclosureOperation {
   const p = observation.payload as Record<string, unknown>
   const subject = assertIssuerQualifiedSubject(observation.localOwnerId)
@@ -160,7 +168,13 @@ export function cashObservationToBridge(
   const common = {
     deploymentId: observation.deploymentId,
     accountId,
-    idempotencyKey: idempotencyKey(observation.deploymentId, observation.semanticHash),
+    idempotencyKey: idempotencyKey(observation.deploymentId, observation.semanticHash, [
+      observation.localOwnerId,
+      connectionId,
+      observation.sourceResourceIncarnationId,
+      accountId,
+      resourceId,
+    ]),
     subject,
     accessGeneration,
   }
@@ -200,20 +214,21 @@ export function providerObservationToBridge(
   },
   accessGeneration: number,
   accountId: string,
+  connectionId = observation.sourceResourceIncarnationId,
 ): BridgeDisclosureOperation | null {
   const payload = observation.payload
   const hasTransactionIdentity = typeof payload.transactionId === 'string'
     || typeof payload.transaction_id === 'string'
     || typeof payload.sourceId === 'string'
   if (!hasTransactionIdentity) return null // balances, holdings and securities remain canonical facts only
-  if (payload.isRemoved === true) return cashObservationToBridge(observation, accessGeneration, accountId)
+  if (payload.isRemoved === true) return cashObservationToBridge(observation, accessGeneration, accountId, connectionId)
 
   const amount = Number(payload.amount)
   if (!Number.isFinite(amount) || amount === 0) throw new Error('invalid provider amount')
-  if (provider === 'plaid') return cashObservationToBridge(observation, accessGeneration, accountId)
+  if (provider === 'plaid') return cashObservationToBridge(observation, accessGeneration, accountId, connectionId)
   if (provider === 'investec' || provider === 'mercury') {
     // Direct-bank adapters use ledger signs (negative money-out); Plaid uses the inverse.
-    return cashObservationToBridge({ ...observation, payload: { ...payload, amount: -amount } }, accessGeneration, accountId)
+    return cashObservationToBridge({ ...observation, payload: { ...payload, amount: -amount } }, accessGeneration, accountId, connectionId)
   }
   if (observation.domain !== 'brokerage_activity') return null
   const activityTypes: Readonly<Record<string, string>> = {
@@ -222,7 +237,7 @@ export function providerObservationToBridge(
   }
   const activityType = activityTypes[String(payload.type)]
   if (!activityType) throw new Error('unsupported brokerage activity type')
-  const base = cashObservationToBridge({ ...observation, payload: { ...payload, amount: -Math.abs(amount) } }, accessGeneration, accountId)
+  const base = cashObservationToBridge({ ...observation, payload: { ...payload, amount: -Math.abs(amount) } }, accessGeneration, accountId, connectionId)
   if (!base.activity) throw new Error('brokerage activity projection failed')
   return { ...base, activity: { ...base.activity, activityType, amount: String(Math.abs(amount)), status: 'POSTED' } }
 }
