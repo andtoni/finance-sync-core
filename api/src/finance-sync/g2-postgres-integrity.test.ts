@@ -8,20 +8,19 @@ const suite = url ? describe : describe.skip
 let _sql: postgres.Sql<Record<string, never>>
 function sql() { return _sql }
 const deploymentId = 'g2-pg-test'
-const adminUrl = url?.replace('/finance_sync_test', '')
 
 suite('G2 PostgreSQL integrity', () => {
   beforeAll(async () => {
-    // Reset database for clean state
-    const admin = postgres(adminUrl! + '/template1', { connect_timeout: 5, prepare: false })
-    await admin`DROP DATABASE IF EXISTS finance_sync_test`
-    await admin`CREATE DATABASE finance_sync_test`
-    await admin.end()
-
+    // Use deployment-scoped fixtures so this suite can share a disposable database
+    // with the other PostgreSQL integration suites without dropping it underneath them.
     const pg = postgres(url!, { connect_timeout: 5, prepare: false })
     const directory = resolve(import.meta.dirname ?? process.cwd(), '../../finance-sync-migrations')
     process.env.FINANCE_SYNC_DEPLOYMENT_ID = deploymentId
     await migrate(pg, directory)
+    await pg`DELETE FROM projection_outbox WHERE deployment_id = ${deploymentId}`
+    await pg`DELETE FROM authority_epochs WHERE deployment_id = ${deploymentId}`
+    await pg`DELETE FROM raw_observations WHERE deployment_id = ${deploymentId}`
+    await pg`DELETE FROM provider_principals WHERE deployment_id = ${deploymentId}`
     await pg`DELETE FROM finance_sync_migrations WHERE deployment_id = ${deploymentId}`
     _sql = pg
 

@@ -207,9 +207,11 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
     `;
 
     const connection = { provider: 'plaid' as const, connectionId: 'test-conn', deploymentId: deadLetterDeploymentId, accessToken: 'test', localOwnerId: 'urn:test#owner', sourceResourceIncarnationId: 'a0000000-0000-0000-0000-000000000030', accountIds: ['test-account'], wealthfolioAccountIds: { 'test-account': 'test-account' }, accessGeneration: 1 };
+    const { accessToken: _accessToken, ...connectionMetadata } = connection;
     // Fully configured, allowlisted HTTPS endpoint guaranteed to refuse the connection.
     const deps = createRuntimeDependencies(sql, deadLetterDeploymentId, {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connection]),
+      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connectionMetadata]),
+      FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'test-conn': { accessToken: connection.accessToken } }),
       FINANCE_SYNC_PLAID_URL: "https://sandbox.plaid.com",
       FINANCE_SYNC_PLAID_CLIENT_ID: "test-client",
       FINANCE_SYNC_PLAID_SECRET: "test-secret",
@@ -218,7 +220,14 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
       FINANCE_SYNC_BRIDGE_TOKEN: "test-token",
     });
 
-    const result = await deps.projectPending(connection);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response('{"error":"rejected"}', { status: 400 })) as typeof fetch;
+    let result;
+    try {
+      result = await deps.projectPending(connection);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
 
     expect(result.delivered).toBe(0);
     expect(result.failed).toBe(1);

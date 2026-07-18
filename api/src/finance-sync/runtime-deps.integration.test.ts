@@ -17,8 +17,10 @@ const connection: RuntimeConnection = {
   sourceResourceIncarnationId: sourceId, accountIds: ['provider-account'],
   wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, accessGeneration: 1,
 }
+const { accessToken: _accessToken, ...connectionMetadata } = connection
 const runtimeEnv = {
-  FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connection]),
+  FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connectionMetadata]),
+  FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ [connection.connectionId]: { accessToken: connection.accessToken } }),
   FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com', FINANCE_SYNC_PLAID_CLIENT_ID: 'test', FINANCE_SYNC_PLAID_SECRET: 'test',
   FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge', FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test', FINANCE_SYNC_BRIDGE_TOKEN: 'test',
 }
