@@ -1,16 +1,25 @@
 import type { FinanceSyncSql } from './storage/pg'
-import { runPlaidSync, type ObservationOutput, type PlaidTransport } from './probes/plaid/plaid-adapter'
-import { bridgeOperationToWire, cashObservationToBridge, validateBridgeReceipt, type BridgeDisclosureOperation } from './projection/bridge-client'
+import type { ObservationOutput } from './probes/plaid/plaid-adapter'
+import {
+  createProviderTransportFactories,
+  parseRuntimeConnections,
+  runRuntimeProvider,
+  type ProviderRuntimeEnv,
+  type ProviderTransportFactories,
+} from './provider-runtime'
+import {
+  assertIssuerQualifiedSubject,
+  bridgeOperationToWire,
+  providerObservationToBridge,
+  validateBridgeReceipt,
+  type BridgeDisclosureOperation,
+} from './projection/bridge-client'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 
-// G8 resiliency: retry threshold derived from bridge-client.ts commitObservation maxRetries = 3
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
+const MAX_PROJECTION_BATCH = 25
+const PLAID_HOSTS = new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com'])
 
-/**
- * Structured, redacted audit entry for sync-cycle projection outcomes.
- * Contains only metadata essential for observability — never tokens, payloads,
- * account identifiers, or financial amounts.
- */
 export interface SyncCycleAuditEntry {
   readonly deploymentId: string
   readonly connectionId: string
@@ -18,80 +27,207 @@ export interface SyncCycleAuditEntry {
   readonly count: number
 }
 
-interface RuntimeEnv { readonly FINANCE_SYNC_CONNECTIONS_JSON?: string; readonly FINANCE_SYNC_BRIDGE_URL?: string; readonly FINANCE_SYNC_BRIDGE_TOKEN?: string; readonly FINANCE_SYNC_PLAID_URL?: string; readonly FINANCE_SYNC_PLAID_CLIENT_ID?: string; readonly FINANCE_SYNC_PLAID_SECRET?: string }
-function connections(env: RuntimeEnv, deploymentId: string): readonly RuntimeConnection[] {
-  if (!env.FINANCE_SYNC_CONNECTIONS_JSON) return [];
-  const value: unknown = JSON.parse(env.FINANCE_SYNC_CONNECTIONS_JSON);
-  if (!Array.isArray(value)) throw new Error('FINANCE_SYNC_CONNECTIONS_JSON must be an array');
-  return value.map(item => {
-    if (!item || typeof item !== 'object') throw new Error('invalid Finance Sync connection');
-    const c = item as Record<string, unknown>;
-    if (c.provider !== 'plaid') throw new Error(`unsupported runtime provider: ${String(c.provider)}`);
-    for (const n of ['connectionId','accessToken','localOwnerId','sourceResourceIncarnationId','deploymentId'])
-      if (typeof c[n] !== 'string' || !c[n]) throw new Error(`connection ${n} is required`);
-    if (!Array.isArray(c.accountIds) || !c.accountIds.every(x => typeof x === 'string')) throw new Error('connection accountIds is required');
-    if (!c.wealthfolioAccountIds || typeof c.wealthfolioAccountIds !== 'object') throw new Error('connection wealthfolioAccountIds is required');
-    if (!Number.isSafeInteger(c.accessGeneration) || (c.accessGeneration as number) < 1) throw new Error('connection accessGeneration must be positive');
-    // G8 cross-deployment fail-closed: each connection's deploymentId must match the runtime's deploymentId
-    if (c.deploymentId !== deploymentId) throw new Error(`connection deploymentId mismatch`);
-    return c as unknown as RuntimeConnection
-  })
+interface RuntimeEnv extends ProviderRuntimeEnv {
+  readonly FINANCE_SYNC_BRIDGE_URL?: string
+  readonly FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS?: string
+  readonly FINANCE_SYNC_BRIDGE_TOKEN?: string
 }
-function plaidTransport(env: RuntimeEnv): PlaidTransport { const url = env.FINANCE_SYNC_PLAID_URL, clientId = env.FINANCE_SYNC_PLAID_CLIENT_ID, secret = env.FINANCE_SYNC_PLAID_SECRET; if (!url || !clientId || !secret) throw new Error('Plaid endpoint and credentials are required for configured connections'); return { async syncTransactions(access_token, cursor) { const response = await fetch(`${url.replace(/\/$/, '')}/transactions/sync`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client_id: clientId, secret, access_token, cursor: cursor ?? undefined }) }); if (!response.ok) throw new Error(`Plaid sync failed: HTTP ${response.status}`); return await response.json() as Awaited<ReturnType<PlaidTransport['syncTransactions']>> } } }
-export function createRuntimeDependencies(sql: FinanceSyncSql, deploymentId: string, env: RuntimeEnv = process.env): SyncRuntimeDependencies {
-  const configured = connections(env, deploymentId)
-  // G8 fail-closed startup: validate provider credentials eagerly when connections are configured,
-  // before the first sync cycle or DB mutation.
-  if (configured.length > 0) {
-    plaidTransport(env)
-    if (!env.FINANCE_SYNC_BRIDGE_URL) throw new Error('FINANCE_SYNC_BRIDGE_URL is required for configured connections')
+
+function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: ReadonlySet<string>): URL {
+  if (!raw) throw new Error(`${name} is required for configured connections`)
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    throw new Error(`${name} must be a valid URL`)
   }
+  if (url.protocol !== 'https:' || url.username || url.password) throw new Error(`${name} must be an HTTPS URL without credentials`)
+  if (!allowedHosts.has(url.hostname.toLowerCase())) throw new Error(`${name} host is not allowed`)
+  return url
+}
+
+function bridgeHosts(env: RuntimeEnv): ReadonlySet<string> {
+  const hosts = env.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS?.split(',').map(value => value.trim().toLowerCase()).filter(Boolean) ?? []
+  if (hosts.length === 0) throw new Error('FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS is required for configured connections')
+  return new Set(hosts)
+}
+
+function safeDeliveryError(error: unknown): string {
+  if (error instanceof Error && /^bridge (delivery failed: HTTP \d{3}|receipt)/.test(error.message)) return error.message.slice(0, 80)
+  return 'bridge delivery failed'
+}
+
+export function createRuntimeDependencies(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  env: RuntimeEnv = process.env,
+  transportFactories?: ProviderTransportFactories,
+): SyncRuntimeDependencies {
+  const configured = parseRuntimeConnections(env, deploymentId)
+  const factories = transportFactories ?? createProviderTransportFactories(env)
+  let bridgeUrl: URL | undefined
+  if (configured.length > 0) {
+    // Construct every configured provider transport at startup so endpoint and
+    // server-credential errors fail before the service reports readiness.
+    for (const connection of configured) {
+      if (connection.provider === 'plaid') factories.plaid(connection)
+      else if (connection.provider === 'investec') factories.investec(connection)
+      else if (connection.provider === 'mercury') factories.mercury(connection)
+      else factories.snaptrade(connection)
+    }
+    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', bridgeHosts(env))
+    if (!env.FINANCE_SYNC_BRIDGE_TOKEN) throw new Error('FINANCE_SYNC_BRIDGE_TOKEN is required for configured connections')
+  }
+
   return {
     loadConnections: async () => configured,
-    loadCheckpoint: async c => (await sql<{ cursor: string | null }[]>`SELECT cursor FROM sync_checkpoints WHERE deployment_id = ${deploymentId} AND connection_id = ${c.connectionId}`)[0]?.cursor ?? null,
-    runProvider: async (c, cursor) => ({ ...await runPlaidSync({ deploymentId, accessToken: c.accessToken, localOwnerId: c.localOwnerId, sourceResourceIncarnationId: c.sourceResourceIncarnationId, accountIds: c.accountIds, initialCursor: cursor ?? undefined }, plaidTransport(env)) }),
-    persistObservations: async observations => { const inserted: ObservationOutput[] = []; for (const o of observations) { const rows = await sql`INSERT INTO raw_observations (deployment_id, local_owner_id, observation_id, source_resource_incarnation_id, provider_version, semantic_hash, hash_specification_version, payload, observed_at) VALUES (${o.deploymentId}, ${o.localOwnerId}, gen_random_uuid(), ${o.sourceResourceIncarnationId}::uuid, ${o.providerVersion}, ${o.semanticHash}, ${o.hashSpecificationVersion}, ${sql.json(o.payload as any)}, ${o.observedAt}) ON CONFLICT DO NOTHING RETURNING observation_id`; if (rows.length) inserted.push(o) }; return inserted },
-    enqueue: async observations => { for (const o of observations) { const accountId = o.payload.accountId; if (o.domain !== 'cash_ledger' || typeof accountId !== 'string') continue; const c = connections(env, deploymentId).find(x => x.localOwnerId === o.localOwnerId && x.sourceResourceIncarnationId === o.sourceResourceIncarnationId); const account = c?.wealthfolioAccountIds[accountId]; if (!c || !account) continue; const op = cashObservationToBridge(o, c.accessGeneration, account); await sql`INSERT INTO projection_outbox (deployment_id, local_owner_id, connection_id, idempotency_key, payload) VALUES (${o.deploymentId}, ${o.localOwnerId}, ${c.connectionId}, ${op.idempotencyKey}, ${sql.json(op as any)}) ON CONFLICT (deployment_id, idempotency_key) DO NOTHING` } },
-    projectPending: async () => {
-      if (!env.FINANCE_SYNC_BRIDGE_URL) return { delivered: 0, failed: 0, syncCycleAudit: [] };
-      let delivered = 0, failed = 0;
-      // Track per-connection-per-outcome counts for structured audit
-      const auditMap = new Map<string, { delivered: number; retry: number; dead_letter: number }>();
-      function track(connId: string, outcome: 'delivered' | 'retry' | 'dead_letter') {
-        let entry = auditMap.get(connId);
-        if (!entry) { entry = { delivered: 0, retry: 0, dead_letter: 0 }; auditMap.set(connId, entry); }
-        entry[outcome]++
-      }
-      const rows = await sql<{ id: string; connection_id: string; payload: BridgeDisclosureOperation; attempts: number }[]>`SELECT id, connection_id, payload, attempts FROM projection_outbox WHERE deployment_id = ${deploymentId} AND state = 'pending' ORDER BY created_at FOR UPDATE SKIP LOCKED`;
-      for (const row of rows) try {
-        if (!env.FINANCE_SYNC_BRIDGE_TOKEN) throw new Error('FINANCE_SYNC_BRIDGE_TOKEN is required for bridge delivery');
-        const response = await fetch(env.FINANCE_SYNC_BRIDGE_URL, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${env.FINANCE_SYNC_BRIDGE_TOKEN}`, 'idempotency-key': row.payload.idempotencyKey }, body: JSON.stringify(bridgeOperationToWire(row.payload)) });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        validateBridgeReceipt(row.payload, await response.json());
-        await sql`UPDATE projection_outbox SET state = 'delivered', delivered_at = now(), attempts = attempts + 1, last_error = NULL WHERE id = ${row.id}::uuid`;
-        delivered++;
-        track(row.connection_id, 'delivered')
-      } catch (error) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        const nextAttempts = row.attempts + 1;
-        if (nextAttempts >= MAX_PROJECTION_DELIVERY_ATTEMPTS) {
-          await sql`UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = ${errMsg}, state = 'dead_letter', dead_lettered_at = now(), dead_letter_reason = ${errMsg} WHERE id = ${row.id}::uuid`;
-          track(row.connection_id, 'dead_letter')
-        } else {
-          await sql`UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = ${errMsg} WHERE id = ${row.id}::uuid`;
-          track(row.connection_id, 'retry')
+    loadCheckpoint: async connection => (
+      await sql<{ cursor: string | null }[]>`
+        SELECT cursor FROM sync_checkpoints
+        WHERE deployment_id = ${deploymentId} AND connection_id = ${connection.connectionId}
+      `
+    )[0]?.cursor ?? null,
+    runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
+    persistAndEnqueue: async (connection, observations) => sql.begin(async transaction => {
+      const tx = transaction as unknown as FinanceSyncSql
+      let insertedCount = 0
+      for (const observation of observations) {
+        if (observation.deploymentId !== deploymentId
+          || observation.localOwnerId !== connection.localOwnerId
+          || observation.sourceResourceIncarnationId !== connection.sourceResourceIncarnationId) {
+          throw new Error('observation authority mismatch')
         }
-        failed++
-      };
-      // Build redacted audit entries aggregated per connection per outcome
-      const syncCycleAudit: SyncCycleAuditEntry[] = [];
-      for (const [connectionId, counts] of auditMap) {
-        for (const outcome of ['delivered', 'retry', 'dead_letter'] as const) {
-          if (counts[outcome] > 0) syncCycleAudit.push({ deploymentId, connectionId, outcome, count: counts[outcome] })
+        let accountId = typeof observation.payload.accountId === 'string' ? observation.payload.accountId : undefined
+        if (observation.payload.isRemoved === true && !accountId) {
+          const transactionId = observation.payload.transactionId
+          if (typeof transactionId !== 'string' || !transactionId) throw new Error('removed transaction identity is required')
+          const prior = await tx<{ account_id: string }[]>`
+            SELECT payload->>'accountId' AS account_id
+            FROM raw_observations
+            WHERE deployment_id = ${deploymentId}
+              AND local_owner_id = ${connection.localOwnerId}
+              AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+              AND provider_version = ${`${connection.provider}:txn:${transactionId}`}
+              AND payload ? 'accountId'
+            ORDER BY recorded_at DESC
+            LIMIT 1
+          `
+          accountId = prior[0]?.account_id
         }
+        if (!accountId || !connection.accountIds.includes(accountId)) throw new Error('provider account is outside the admitted connection scope')
+        const wealthfolioAccountId = connection.wealthfolioAccountIds[accountId]
+        if (!wealthfolioAccountId) throw new Error('provider account has no Wealthfolio mapping')
+        const enriched: ObservationOutput = observation.payload.accountId === accountId
+          ? observation
+          : { ...observation, payload: Object.freeze({ ...observation.payload, accountId }) }
+        const inserted = await tx`
+          INSERT INTO raw_observations (
+            deployment_id, local_owner_id, observation_id, source_resource_incarnation_id,
+            provider_version, semantic_hash, hash_specification_version, payload, observed_at
+          ) VALUES (
+            ${enriched.deploymentId}, ${enriched.localOwnerId}, gen_random_uuid(),
+            ${enriched.sourceResourceIncarnationId}::uuid, ${enriched.providerVersion},
+            ${enriched.semanticHash}, ${enriched.hashSpecificationVersion},
+            ${tx.json(enriched.payload as never)}, ${enriched.observedAt}
+          )
+          ON CONFLICT DO NOTHING
+          RETURNING observation_id
+        `
+        insertedCount += inserted.length
+        const operation = providerObservationToBridge(connection.provider, enriched, connection.accessGeneration, wealthfolioAccountId)
+        if (operation) await tx`
+          INSERT INTO projection_outbox (
+            deployment_id, local_owner_id, connection_id, idempotency_key, payload
+          ) VALUES (
+            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId},
+            ${operation.idempotencyKey}, ${tx.json(operation as never)}
+          )
+          ON CONFLICT (deployment_id, idempotency_key) DO NOTHING
+        `
       }
-      return { delivered, failed, syncCycleAudit }
+      return insertedCount
+    }),
+    projectPending: async connection => {
+      if (!bridgeUrl || !env.FINANCE_SYNC_BRIDGE_TOKEN) return { delivered: 0, failed: 0 }
+      return sql.begin(async transaction => {
+        const tx = transaction as unknown as FinanceSyncSql
+        const unresolvedBefore = await tx<{ count: number }[]>`
+          SELECT count(*)::integer AS count
+          FROM projection_outbox
+          WHERE deployment_id = ${deploymentId}
+            AND connection_id = ${connection.connectionId}
+            AND state = 'dead_letter'
+        `
+        if ((unresolvedBefore[0]?.count ?? 0) > 0) return { delivered: 0, failed: unresolvedBefore[0].count }
+
+        let delivered = 0
+        let deliveryFailures = 0
+        const rows = await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number }[]>`
+          SELECT id, payload, attempts
+          FROM projection_outbox
+          WHERE deployment_id = ${deploymentId}
+            AND connection_id = ${connection.connectionId}
+            AND state = 'pending'
+          ORDER BY created_at
+          LIMIT ${MAX_PROJECTION_BATCH}
+          FOR UPDATE SKIP LOCKED
+        `
+        for (const row of rows) {
+          try {
+            const response = await fetch(bridgeUrl, {
+              method: 'POST',
+              redirect: 'error',
+              headers: {
+                'content-type': 'application/json',
+                authorization: `Bearer ${env.FINANCE_SYNC_BRIDGE_TOKEN}`,
+                'idempotency-key': row.payload.idempotencyKey,
+              },
+              body: JSON.stringify(bridgeOperationToWire(row.payload)),
+            })
+            if (!response.ok) throw new Error(`bridge delivery failed: HTTP ${response.status}`)
+            validateBridgeReceipt(row.payload, await response.json())
+            await tx`
+              UPDATE projection_outbox
+              SET state = 'delivered', delivered_at = now(), attempts = attempts + 1, last_error = NULL
+              WHERE id = ${row.id}::uuid
+            `
+            delivered++
+          } catch (error) {
+            const reason = safeDeliveryError(error)
+            const nextAttempts = row.attempts + 1
+            if (nextAttempts >= MAX_PROJECTION_DELIVERY_ATTEMPTS) {
+              await tx`
+                UPDATE projection_outbox
+                SET attempts = ${nextAttempts}, last_error = ${reason}, state = 'dead_letter',
+                    dead_lettered_at = now(), dead_letter_reason = ${reason}
+                WHERE id = ${row.id}::uuid
+              `
+            } else {
+              await tx`
+                UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = ${reason}
+                WHERE id = ${row.id}::uuid
+              `
+            }
+            deliveryFailures++
+          }
+        }
+        const unresolvedAfter = await tx<{ count: number }[]>`
+          SELECT count(*)::integer AS count
+          FROM projection_outbox
+          WHERE deployment_id = ${deploymentId}
+            AND connection_id = ${connection.connectionId}
+            AND state IN ('pending', 'dead_letter')
+        `
+        return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
+      })
     },
-    saveCheckpoint: async (c, cursor) => { await sql`INSERT INTO sync_checkpoints (deployment_id, connection_id, provider, cursor) VALUES (${deploymentId}, ${c.connectionId}, ${c.provider}, ${cursor}) ON CONFLICT (deployment_id, connection_id) DO UPDATE SET cursor = EXCLUDED.cursor, provider = EXCLUDED.provider, updated_at = now()` },
+    saveCheckpoint: async (connection, cursor) => {
+      await sql`
+        INSERT INTO sync_checkpoints (deployment_id, connection_id, provider, cursor)
+        VALUES (${deploymentId}, ${connection.connectionId}, ${connection.provider}, ${cursor})
+        ON CONFLICT (deployment_id, connection_id) DO UPDATE
+        SET cursor = EXCLUDED.cursor, provider = EXCLUDED.provider, updated_at = now()
+      `
+    },
   }
 }

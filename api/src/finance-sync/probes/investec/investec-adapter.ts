@@ -34,6 +34,7 @@ export interface InvestecAdapterConfig {
   readonly fromDate: string
   readonly toDate: string
   readonly eligibleProductNames: readonly string[]
+  readonly accountIds?: readonly string[]
   readonly maxPages?: number
 }
 
@@ -59,6 +60,7 @@ function redact(value: string): string {
 
 export async function runInvestecAdapter(config: InvestecAdapterConfig, transport: InvestecTransport): Promise<InvestecAdapterResult> {
   const eligibleSet = new Set(config.eligibleProductNames)
+  const admittedAccounts = config.accountIds ? new Set(config.accountIds) : undefined
   const allAccounts = await transport.listAccounts()
   const accounts: { accountRef: string; eligible: boolean; currency: string; displayName: string }[] = []
   const observations: ObservationOutput[] = []
@@ -68,6 +70,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
   let nextCursor: string | null = null
 
   for (const account of allAccounts) {
+    if (admittedAccounts && !admittedAccounts.has(account.accountId)) continue
     if (!account.productName || !eligibleSet.has(account.productName)) continue
     const accountRef = redact(account.accountId)
     const balance = await transport.getBalance(account.accountId)

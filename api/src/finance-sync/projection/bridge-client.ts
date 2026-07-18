@@ -29,6 +29,9 @@ export interface BridgeActivityPayload {
 }
 
 export interface BridgeDisclosureOperation {
+  /** Local receipt-binding context; omitted from the HTTP request body. */
+  readonly deploymentId: string
+  readonly accountId: string
   readonly idempotencyKey: string
   readonly subject: string
   readonly accessGeneration: number
@@ -39,16 +42,21 @@ export interface BridgeDisclosureOperation {
 }
 
 export interface BridgeReceipt {
+  readonly deploymentId: string
+  readonly accountId: string
   readonly subject: string
   readonly idempotencyKey: string
   readonly accessGeneration: number
   readonly operation: BridgeWireOperation
   readonly resourceId: string
+  readonly lifecycleSuccessorId: string | null
   readonly outcome: 'Accepted' | 'Revoked'
+  readonly bindingVersion: 1
+  readonly receiptBinding: string
 }
 
 export interface BridgeTransport {
-  commit(op: BridgeDisclosureOperation): Promise<BridgeReceipt>
+  commit(op: BridgeDisclosureOperation): Promise<unknown>
 }
 
 export function assertIssuerQualifiedSubject(value: string): string {
@@ -56,6 +64,11 @@ export function assertIssuerQualifiedSubject(value: string): string {
   const separator = subject.indexOf('#')
   if (separator <= 0 || separator === subject.length - 1) throw new Error('issuer-qualified subject required')
   return subject
+}
+
+function receiptBinding(fields: readonly string[]): string {
+  const encoder = new TextEncoder()
+  return `v1;${fields.map(field => `${encoder.encode(field).byteLength}:${field}`).join('')}`
 }
 
 export function validateBridgeReceipt(operation: BridgeDisclosureOperation, value: unknown): BridgeReceipt {
@@ -67,6 +80,22 @@ export function validateBridgeReceipt(operation: BridgeDisclosureOperation, valu
   if (receipt.idempotencyKey !== operation.idempotencyKey || receipt.resourceId !== operation.resourceId || receipt.accessGeneration !== operation.accessGeneration) {
     throw new Error('Bridge receipt mismatch')
   }
+  const successor = operation.lifecycleSuccessorId ?? null
+  if (receipt.deploymentId !== operation.deploymentId || receipt.accountId !== operation.accountId || receipt.lifecycleSuccessorId !== successor || receipt.bindingVersion !== 1) {
+    throw new Error('Bridge receipt binding identity mismatch')
+  }
+  const expected = receiptBinding([
+    operation.deploymentId,
+    operation.subject,
+    operation.idempotencyKey,
+    String(operation.accessGeneration),
+    WIRE_OPERATION[operation.kind],
+    operation.resourceId,
+    operation.accountId,
+    successor ?? '<null>',
+    'accepted',
+  ])
+  if (receipt.receiptBinding !== expected) throw new Error('Bridge receipt binding mismatch')
   return receipt as unknown as BridgeReceipt
 }
 
@@ -120,24 +149,82 @@ export function cashObservationToBridge(
 ): BridgeDisclosureOperation {
   const p = observation.payload as Record<string, unknown>
   const subject = assertIssuerQualifiedSubject(observation.localOwnerId)
-  return {
+  const transactionId = String(p.transactionId ?? p.transaction_id ?? p.sourceId ?? observation.semanticHash)
+  const resourceId = `${observation.deploymentId}:${observation.sourceResourceIncarnationId}:${transactionId}`
+  const pendingTransactionId = typeof p.pendingTransactionId === 'string' && p.pendingTransactionId.length > 0
+    ? p.pendingTransactionId
+    : undefined
+  const pendingResourceId = pendingTransactionId === undefined
+    ? undefined
+    : `${observation.deploymentId}:${observation.sourceResourceIncarnationId}:${pendingTransactionId}`
+  const common = {
+    deploymentId: observation.deploymentId,
+    accountId,
     idempotencyKey: idempotencyKey(observation.deploymentId, observation.semanticHash),
     subject,
     accessGeneration,
+  }
+  if (p.isRemoved === true) {
+    return { ...common, kind: 'ActivityDelete', resourceId }
+  }
+  const plaidAmount = Number(p.amount)
+  if (!Number.isFinite(plaidAmount) || plaidAmount === 0) throw new Error('invalid provider amount')
+  if (typeof p.currency !== 'string' || p.currency.length === 0) throw new Error('invalid provider currency')
+  return {
+    ...common,
     kind: 'ActivityUpsert',
-    resourceId: `${observation.deploymentId}:${observation.sourceResourceIncarnationId}:${p.transactionId ?? p.transaction_id ?? observation.semanticHash}`,
+    resourceId: pendingResourceId ?? resourceId,
+    ...(pendingResourceId === undefined ? {} : { lifecycleSuccessorId: resourceId }),
     activity: {
       accountId,
-      activityType: (p.isRemoved as boolean) ? 'REMOVAL' : String(p.amount ?? '0').startsWith('-') ? 'WITHDRAWAL' : 'DEPOSIT',
-      status: (p.isRemoved as boolean) ? 'VOID' : 'CLEARED',
+      // Plaid uses positive for money leaving the account and negative for money entering it.
+      activityType: plaidAmount > 0 ? 'WITHDRAWAL' : 'DEPOSIT',
+      status: p.pending === true ? 'PENDING' : 'POSTED',
       activityDate: (p.date as string) ?? observation.observedAt.slice(0, 10),
-      amount: String(p.amount ?? '0').replace(/^-/, ''),
-      currency: (p.currency as string) ?? 'USD',
-      notes: [p.name as string, p.description as string].filter(Boolean).join(' | ') || undefined,
-      activityTypeOverride: (p.transactionType as string) === 'CREDIT' ? 'DEPOSIT' : (p.transactionType as string) === 'DEBIT' ? 'WITHDRAWAL' : undefined,
-      needsReview: (p.pending as boolean) ?? false,
+      amount: String(Math.abs(plaidAmount)),
+      currency: p.currency,
     },
   }
+}
+
+export function providerObservationToBridge(
+  provider: 'investec' | 'mercury' | 'plaid' | 'snaptrade',
+  observation: {
+    readonly deploymentId: string
+    readonly localOwnerId: string
+    readonly sourceResourceIncarnationId: string
+    readonly semanticHash: string
+    readonly domain: string
+    readonly payload: Readonly<Record<string, unknown>>
+    readonly observedAt: string
+  },
+  accessGeneration: number,
+  accountId: string,
+): BridgeDisclosureOperation | null {
+  const payload = observation.payload
+  const hasTransactionIdentity = typeof payload.transactionId === 'string'
+    || typeof payload.transaction_id === 'string'
+    || typeof payload.sourceId === 'string'
+  if (!hasTransactionIdentity) return null // balances, holdings and securities remain canonical facts only
+  if (payload.isRemoved === true) return cashObservationToBridge(observation, accessGeneration, accountId)
+
+  const amount = Number(payload.amount)
+  if (!Number.isFinite(amount) || amount === 0) throw new Error('invalid provider amount')
+  if (provider === 'plaid') return cashObservationToBridge(observation, accessGeneration, accountId)
+  if (provider === 'investec' || provider === 'mercury') {
+    // Direct-bank adapters use ledger signs (negative money-out); Plaid uses the inverse.
+    return cashObservationToBridge({ ...observation, payload: { ...payload, amount: -amount } }, accessGeneration, accountId)
+  }
+  if (observation.domain !== 'brokerage_activity') return null
+  const activityTypes: Readonly<Record<string, string>> = {
+    buy: 'BUY', sell: 'SELL', dividend: 'DIVIDEND', contribution: 'DEPOSIT',
+    withdrawal: 'WITHDRAWAL', transfer: 'TRANSFER', fee: 'FEE', interest: 'INTEREST',
+  }
+  const activityType = activityTypes[String(payload.type)]
+  if (!activityType) throw new Error('unsupported brokerage activity type')
+  const base = cashObservationToBridge({ ...observation, payload: { ...payload, amount: -Math.abs(amount) } }, accessGeneration, accountId)
+  if (!base.activity) throw new Error('brokerage activity projection failed')
+  return { ...base, activity: { ...base.activity, activityType, amount: String(Math.abs(amount)), status: 'POSTED' } }
 }
 
 export async function commitObservation(

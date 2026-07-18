@@ -117,6 +117,7 @@ export interface SnapTradeSyncResult {
   readonly accountsFetched: number
   readonly holdingsObserved: number
   readonly activitiesObserved: number
+  readonly complete: boolean
 }
 
 export interface SnapTradeNormalizedAccount {
@@ -407,6 +408,7 @@ export async function runSnapTradeSync(
   let accountsFetched = 0
   let holdingsObserved = 0
   let activitiesObserved = 0
+  let complete = true
 
   // 1. Fetch accounts with positions
   let rawAccounts: readonly SnapTradeRawAccount[]
@@ -414,7 +416,7 @@ export async function runSnapTradeSync(
     rawAccounts = await transport.fetchAccounts()
     accountsFetched = rawAccounts.length
   } catch {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0 }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0, complete: false }
   }
 
   // Filter to configured account IDs if provided
@@ -425,7 +427,7 @@ export async function runSnapTradeSync(
 
   // Short-circuit: no accounts, nothing to sync
   if (rawAccounts.length === 0) {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0 }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0, complete: true }
   }
 
   // 2. Process each account
@@ -543,7 +545,8 @@ export async function runSnapTradeSync(
       })
     }
   } catch {
-    // Activities fetch failure is tolerated — accounts/holdings data still returned
+    // Never promote the restart cursor for a partial provider snapshot.
+    complete = false
   }
 
   return {
@@ -554,5 +557,6 @@ export async function runSnapTradeSync(
     accountsFetched,
     holdingsObserved,
     activitiesObserved,
+    complete,
   }
 }

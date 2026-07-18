@@ -44,4 +44,4 @@ FINANCE_SYNC_CONNECTIONS_JSON is optional; without it, the runner performs migra
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); await sql.end() }
 }
-main().catch(error => { console.error('Finance Sync runner failed:', error); process.exit(1) })
+main().catch(() => { console.error('Finance Sync runner failed'); process.exit(1) })

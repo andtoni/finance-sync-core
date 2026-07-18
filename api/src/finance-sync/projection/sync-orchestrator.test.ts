@@ -27,14 +27,25 @@ describe('Sync orchestrator', () => {
         },
       },
       bridgeTransport: {
-        commit: async (op) => ({
-          subject: op.subject,
-          idempotencyKey: op.idempotencyKey,
-          accessGeneration: op.accessGeneration,
-          operation: op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : 'projection_fence',
-          resourceId: op.resourceId,
-          outcome: 'Accepted',
-        }),
+        commit: async (op) => {
+          const operation = op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : 'projection_fence'
+          const successor = op.lifecycleSuccessorId ?? null
+          const fields = [op.deploymentId, op.subject, op.idempotencyKey, String(op.accessGeneration), operation, op.resourceId, op.accountId, successor ?? '<null>', 'accepted']
+          const encoder = new TextEncoder()
+          return {
+            deploymentId: op.deploymentId,
+            accountId: op.accountId,
+            subject: op.subject,
+            idempotencyKey: op.idempotencyKey,
+            accessGeneration: op.accessGeneration,
+            operation,
+            resourceId: op.resourceId,
+            lifecycleSuccessorId: successor,
+            outcome: 'Accepted',
+            bindingVersion: 1,
+            receiptBinding: `v1;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`,
+          }
+        },
       },
     }
 

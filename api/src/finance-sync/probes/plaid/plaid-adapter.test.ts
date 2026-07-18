@@ -57,6 +57,23 @@ describe('Plaid adapter G4', () => {
     expect(result.observations[1].payload.transactionId).toBe('txn-2')
   })
 
+  it('normalizes the real Plaid wire currency when sync pages omit accounts', async () => {
+    const transport = mockTransport({
+      getAccounts: async () => [{ account_id: 'acc-1', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 100, iso_currency_code: 'USD' } }],
+      syncTransactions: async () => ({
+        added: [{ transaction_id: 'txn-wire', account_id: 'acc-1', amount: 25, date: '2026-07-10', name: 'SHOP', iso_currency_code: 'USD' }],
+        modified: [], removed: [], next_cursor: 'wire-cursor', has_more: false,
+      }),
+    })
+    const result = await runPlaidSync({
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-1'],
+    }, transport)
+    expect(result.observations).toHaveLength(1)
+    expect(result.observations[0].payload).toMatchObject({ currency: 'USD', accountId: 'acc-1' })
+    expect(result.accounts).toHaveLength(1)
+  })
+
   it('handles empty page gracefully', async () => {
     const transport = mockTransport({
       syncTransactions: async () => ({

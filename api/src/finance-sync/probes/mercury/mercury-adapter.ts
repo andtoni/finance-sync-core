@@ -74,6 +74,7 @@ export interface MercurySyncResult {
   readonly accountsFetched: number
   readonly pagesFetched: number
   readonly transactionsObserved: number
+  readonly paginationComplete: boolean
 }
 
 const HASH_SPEC_VERSION = 1
@@ -116,6 +117,7 @@ export async function runMercurySync(
   let accountsFetched = 0
   let pagesFetched = 0
   let transactionsObserved = 0
+  let paginationComplete = true
 
   let allAccounts: MercuryAccount[]
   try {
@@ -123,7 +125,7 @@ export async function runMercurySync(
     allAccounts = [...accountPage.accounts]
     accountsFetched = allAccounts.length
   } catch {
-    return { accounts: [], observations, accountsFetched: 0, pagesFetched: 0, transactionsObserved: 0 }
+    return { accounts: [], observations, accountsFetched: 0, pagesFetched: 0, transactionsObserved: 0, paginationComplete: false }
   }
 
   if (config.accountIds && config.accountIds.length > 0) {
@@ -174,6 +176,7 @@ export async function runMercurySync(
         page = await transport.fetchTransactions(account.id, offset, PAGE_LIMIT, config.since)
       } catch {
         accountFailed = true
+        paginationComplete = false
         break
       }
 
@@ -231,6 +234,7 @@ export async function runMercurySync(
 
       accountPage++
     }
+    if (accountPage >= maxPages) paginationComplete = false
   }
 
   return {
@@ -239,5 +243,6 @@ export async function runMercurySync(
     accountsFetched,
     pagesFetched,
     transactionsObserved,
+    paginationComplete,
   }
 }

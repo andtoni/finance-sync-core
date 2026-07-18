@@ -1,5 +1,4 @@
-
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   idempotencyKey,
   cashObservationToBridge,
@@ -11,20 +10,48 @@ import {
   type BridgeReceipt,
 } from './bridge-client'
 
-const mockTransport = (overrides: Partial<BridgeTransport> = {}): BridgeTransport => ({
-  commit: async (op) => ({
-    subject: op.subject,
-    idempotencyKey: op.idempotencyKey,
-    accessGeneration: op.accessGeneration,
-    operation: 'activity_upsert',
-    resourceId: op.resourceId,
-    outcome: 'Accepted',
-  }),
+const wireOperation = { ActivityUpsert: 'activity_upsert', ActivityDelete: 'activity_delete', ProjectionFence: 'projection_fence' } as const
+const baseOperation = (overrides: Partial<BridgeDisclosureOperation> = {}): BridgeDisclosureOperation => ({
+  deploymentId: 'dep-1',
+  accountId: 'account-1',
+  idempotencyKey: 'key-1',
+  subject: 'urn:wealthfolio:test#alexis',
+  accessGeneration: 1,
+  kind: 'ActivityUpsert',
+  resourceId: 'resource-1',
   ...overrides,
 })
 
+function binding(fields: readonly string[]): string {
+  const encoder = new TextEncoder()
+  return `v1;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
+}
+
+function boundReceipt(op: BridgeDisclosureOperation, overrides: Partial<BridgeReceipt> = {}): BridgeReceipt {
+  const successor = op.lifecycleSuccessorId ?? null
+  return {
+    deploymentId: op.deploymentId,
+    accountId: op.accountId,
+    subject: op.subject,
+    idempotencyKey: op.idempotencyKey,
+    accessGeneration: op.accessGeneration,
+    operation: wireOperation[op.kind],
+    resourceId: op.resourceId,
+    lifecycleSuccessorId: successor,
+    outcome: 'Accepted',
+    bindingVersion: 1,
+    receiptBinding: binding([
+      op.deploymentId, op.subject, op.idempotencyKey, String(op.accessGeneration), wireOperation[op.kind],
+      op.resourceId, op.accountId, successor ?? '<null>', 'accepted',
+    ]),
+    ...overrides,
+  }
+}
+
+const mockTransport = (): BridgeTransport => ({ commit: async op => boundReceipt(op) })
+
 describe('Bridge client', () => {
-  it('requires the persisted local owner to be an issuer-qualified subject', () => {
+  it('requires an issuer-qualified subject', () => {
     expect(() => cashObservationToBridge({
       deploymentId: 'g8-test', localOwnerId: 'alexis', sourceResourceIncarnationId: 'inc-1',
       semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '1.00' },
@@ -32,108 +59,87 @@ describe('Bridge client', () => {
     }, 1, 'wf-acc-uuid-1')).toThrow('issuer-qualified')
   })
 
-  it('generates deterministic idempotency keys', () => {
-    const k1 = idempotencyKey('dep-1', 'hash-a')
-    const k2 = idempotencyKey('dep-1', 'hash-a')
-    const k3 = idempotencyKey('dep-2', 'hash-a')
-    expect(k1).toBe(k2)
-    expect(k1).not.toBe(k3)
-    expect(k1.length).toBe(40)
+  it('generates deterministic deployment-scoped idempotency keys', () => {
+    expect(idempotencyKey('dep-1', 'hash-a')).toBe(idempotencyKey('dep-1', 'hash-a'))
+    expect(idempotencyKey('dep-1', 'hash-a')).not.toBe(idempotencyKey('dep-2', 'hash-a'))
+    expect(idempotencyKey('dep-1', 'hash-a')).toHaveLength(40)
   })
 
-  it('converts cash observation to bridge operation', () => {
+  it('normalizes Plaid positive spending to withdrawal', () => {
     const op = cashObservationToBridge({
-      deploymentId: 'g8-test',
-      localOwnerId: 'urn:wealthfolio:test#alexis',
-      sourceResourceIncarnationId: 'plaid:item-1',
-      semanticHash: 'abc123',
-      payload: { transactionId: 'txn-1', amount: '-42.50', currency: 'USD', date: '2026-07-11', name: 'AMAZON' },
+      deploymentId: 'g8-test', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'plaid:item-1',
+      semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '42.50', currency: 'USD', date: '2026-07-11', name: 'AMAZON' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'wf-acc-uuid-1')
-    expect(op.kind).toBe('ActivityUpsert')
-    expect(op.subject).toBe('urn:wealthfolio:test#alexis')
-    expect(op.activity?.accountId).toBe('wf-acc-uuid-1')
-    expect(op.activity?.amount).toBe('42.50')
-    expect(op.activity?.activityType).toBe('WITHDRAWAL')
-    expect(op.idempotencyKey.length).toBe(40)
+    expect(op.activity).toMatchObject({ accountId: 'wf-acc-uuid-1', amount: '42.5', activityType: 'WITHDRAWAL', status: 'POSTED' })
   })
 
-  it('handles credit as DEPOSIT', () => {
+  it('normalizes Plaid negative income to deposit', () => {
     const op = cashObservationToBridge({
       deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
-      semanticHash: 'aaa',
-      payload: { transactionId: 't1', amount: '100.00', currency: 'USD', date: '2026-07-11', name: 'SALARY', transactionType: 'CREDIT' },
+      semanticHash: 'aaa', payload: { transactionId: 't1', amount: '-100.00', currency: 'USD', date: '2026-07-11', name: 'SALARY' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'acc-1')
-    expect(op.activity?.activityTypeOverride).toBe('DEPOSIT')
+    expect(op.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '100' })
   })
 
-  it('commits single observation via transport', async () => {
-    const transport = mockTransport()
-    const op: BridgeDisclosureOperation = {
-      idempotencyKey: 'key-1', subject: 'alexis', accessGeneration: 1,
-      kind: 'ActivityUpsert', resourceId: 'r-1',
+  it.each(['0', '-0'])('fails closed for a zero Plaid amount (%s)', amount => {
+    expect(() => cashObservationToBridge({
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'zero', payload: { transactionId: 't0', amount, currency: 'USD', date: '2026-07-11' },
+      observedAt: '2026-07-11T00:00:00.000Z',
+    }, 1, 'acc-1')).toThrow('invalid provider amount')
+  })
+
+  it('projects removals as deletes and posted successors as lifecycle migrations', () => {
+    const base = {
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'aaa', observedAt: '2026-07-11T00:00:00.000Z',
     }
-    const receipt = await commitObservation(transport, op)
-    expect(receipt.outcome).toBe('Accepted')
+    const removed = cashObservationToBridge({ ...base, payload: { transactionId: 'old', accountId: 'p1', isRemoved: true } }, 1, 'wf-1')
+    expect(removed).toMatchObject({ kind: 'ActivityDelete', resourceId: 'g8:inc-1:old', accountId: 'wf-1' })
+    const posted = cashObservationToBridge({ ...base, payload: { transactionId: 'posted', pendingTransactionId: 'pending', amount: '1', currency: 'USD', date: '2026-07-11' } }, 1, 'wf-1')
+    expect(posted).toMatchObject({ resourceId: 'g8:inc-1:pending', lifecycleSuccessorId: 'g8:inc-1:posted' })
   })
 
-  it('accepts the versioned snake_case wire operation for the requested kind', async () => {
-    const op: BridgeDisclosureOperation = { idempotencyKey: 'wire-1', subject: 'alexis', accessGeneration: 3, kind: 'ActivityUpsert', resourceId: 'r-1' }
-    const receipt = await commitObservation({ commit: async () => ({ subject: 'alexis', idempotencyKey: 'wire-1', accessGeneration: 3, operation: 'activity_upsert', resourceId: 'r-1', outcome: 'Accepted' }) }, op)
-    expect(receipt.operation).toBe('activity_upsert')
+  it('validates the complete canonical receipt binding', async () => {
+    const op = baseOperation()
+    await expect(commitObservation(mockTransport(), op)).resolves.toEqual(boundReceipt(op))
+    for (const receipt of [
+      boundReceipt(op, { accountId: 'wrong' }),
+      boundReceipt(op, { lifecycleSuccessorId: 'wrong' }),
+      boundReceipt(op, { receiptBinding: 'v1;invalid' }),
+    ]) {
+      await expect(commitObservation({ commit: async () => receipt }, op, 1)).rejects.toThrow(/binding/i)
+    }
   })
 
   it.each([
     ['ActivityUpsert', 'ActivityUpsert'],
     ['ActivityDelete', 'ActivityDelete'],
     ['ProjectionFence', 'ProjectionFence'],
-  ] as const)('serializes %s request kind using the receiver enum value', (kind, expected) => {
-    const wire = bridgeOperationToWire({
-      idempotencyKey: 'wire-kind', subject: 'urn:wealthfolio:test#alexis', accessGeneration: 1,
-      kind, resourceId: 'resource-1',
-    })
-    expect(wire.kind).toBe(expected)
+  ] as const)('serializes %s using the receiver enum value', (kind, expected) => {
+    expect(bridgeOperationToWire(baseOperation({ kind })).kind).toBe(expected)
   })
 
-  it('rejects unknown or mismatched wire operations and receipt identity', async () => {
-    const op: BridgeDisclosureOperation = { idempotencyKey: 'wire-2', subject: 'alexis', accessGeneration: 3, kind: 'ActivityDelete', resourceId: 'r-2' }
-    await expect(commitObservation({ commit: async () => ({ subject: 'alexis', idempotencyKey: 'wire-2', accessGeneration: 3, operation: 'activity_upsert', resourceId: 'r-2', outcome: 'Accepted' }) }, op, 1)).rejects.toThrow('operation mismatch')
-    await expect(commitObservation({ commit: async () => ({ subject: 'alexis', idempotencyKey: 'wire-2', accessGeneration: 3, operation: ('unknown' as never), resourceId: 'r-2', outcome: 'Accepted' }) }, op, 1)).rejects.toThrow('operation mismatch')
-    await expect(commitObservation({ commit: async () => ({ subject: 'other', idempotencyKey: 'wire-2', accessGeneration: 3, operation: 'activity_delete', resourceId: 'r-2', outcome: 'Accepted' }) }, op, 1)).rejects.toThrow('subject mismatch')
+  it('rejects mismatched operation and subject', async () => {
+    const op = baseOperation({ kind: 'ActivityDelete' })
+    await expect(commitObservation({ commit: async () => boundReceipt(op, { operation: 'activity_upsert' }) }, op, 1)).rejects.toThrow('operation mismatch')
+    await expect(commitObservation({ commit: async () => boundReceipt(op, { subject: 'other' }) }, op, 1)).rejects.toThrow('subject mismatch')
   })
 
-  it('retries on transport failure', async () => {
+  it('retries transport failures', async () => {
     let calls = 0
-    const transport: BridgeTransport = {
-      commit: async () => {
-        calls++
-        if (calls < 2) throw new Error('temporary')
-        return { subject: 'a', idempotencyKey: 'k', accessGeneration: 1, operation: 'activity_upsert', resourceId: 'r', outcome: 'Accepted' }
-      },
-    }
-    const receipt = await commitObservation(transport, { idempotencyKey: 'k', subject: 'a', accessGeneration: 1, kind: 'ActivityUpsert', resourceId: 'r' })
+    const op = baseOperation()
+    const transport: BridgeTransport = { commit: async () => { if (++calls < 2) throw new Error('temporary'); return boundReceipt(op) } }
+    await expect(commitObservation(transport, op)).resolves.toEqual(boundReceipt(op))
     expect(calls).toBe(2)
-    expect(receipt.outcome).toBe('Accepted')
   })
 
-  it('exhausts retries and throws', async () => {
-    const transport: BridgeTransport = {
-      commit: async () => { throw new Error('always fails') },
-    }
-    await expect(commitObservation(transport, { idempotencyKey: 'k', subject: 'a', accessGeneration: 1, kind: 'ActivityUpsert', resourceId: 'r' }, 2))
-      .rejects.toThrow('always fails')
-  })
-
-  it('batches multiple observations', async () => {
-    const transport = mockTransport()
-    const ops = [
-      { idempotencyKey: 'k1', subject: 'alexis', accessGeneration: 1, kind: 'ActivityUpsert' as const, resourceId: 'r1' },
-      { idempotencyKey: 'k2', subject: 'alexis', accessGeneration: 1, kind: 'ActivityUpsert' as const, resourceId: 'r2' },
-    ]
-    const receipts = await commitObservationBatch(transport, ops)
-    expect(receipts.length).toBe(2)
-    expect(receipts[0].outcome).toBe('Accepted')
-    expect(receipts[1].outcome).toBe('Accepted')
+  it('exhausts retries and batches sequentially', async () => {
+    const failing: BridgeTransport = { commit: async () => { throw new Error('always fails') } }
+    await expect(commitObservation(failing, baseOperation(), 2)).rejects.toThrow('always fails')
+    const receipts = await commitObservationBatch(mockTransport(), [baseOperation(), baseOperation({ idempotencyKey: 'key-2' })])
+    expect(receipts).toHaveLength(2)
   })
 })

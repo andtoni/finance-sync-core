@@ -15,8 +15,12 @@ suite("PostgreSQL migrations (integration)", () => {
     const directory = resolve(import.meta.dirname, "../../../finance-sync-migrations");
     await migrate(sql, directory);
     await migrate(sql, directory);
-    const rows = await sql`select version from finance_sync_migrations where deployment_id = 'integration-test' order by version`;
+    const rows = await sql`select version from finance_sync_schema_migrations order by version`;
     expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5]);
+
+    await sql`insert into finance_sync_migrations (deployment_id, version, name, checksum) values ('conflicting-legacy', 1, 'identity', ${'0'.repeat(64)})`;
+    await expect(migrate(sql, directory)).rejects.toThrow(/checksum conflict/i);
+    await sql`delete from finance_sync_migrations where deployment_id = 'conflicting-legacy'`;
   });
 });
 afterAll(async () => { await sql?.end(); });

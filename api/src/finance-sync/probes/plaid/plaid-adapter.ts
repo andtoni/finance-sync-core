@@ -22,7 +22,9 @@ export interface PlaidTransaction {
   readonly name: string
   readonly merchant_name?: string
   readonly pending?: boolean
-  readonly currency?: string
+  readonly pending_transaction_id?: string | null
+  readonly iso_currency_code?: string | null
+  readonly unofficial_currency_code?: string | null
 }
 
 export interface PlaidAccount {
@@ -40,13 +42,14 @@ export interface PlaidSyncPage {
   readonly added: readonly PlaidTransaction[]
   readonly modified: readonly PlaidTransaction[]
   readonly removed: readonly { transaction_id: string }[]
-  readonly accounts: readonly PlaidAccount[]
+  readonly accounts?: readonly PlaidAccount[]
   readonly next_cursor: string | null
   readonly has_more: boolean
 }
 
 export interface PlaidTransport {
   syncTransactions(accessToken: string, cursor?: string): Promise<PlaidSyncPage>
+  getAccounts?(accessToken: string): Promise<readonly PlaidAccount[]>
 }
 
 export interface PlaidSyncConfig {
@@ -96,29 +99,35 @@ export async function runPlaidSync(
   transport: PlaidTransport,
 ): Promise<PlaidSyncResult> {
   const accountMap = new Map<string, PlaidAccount>()
-  const observations: ObservationOutput[] = []
+  let observations: ObservationOutput[] = []
   let mutationRestarts = 0
   let pagesStaged = 0
 
   for (let attempt = 0; attempt < 3; attempt++) {
     let cursor = config.initialCursor
     pagesStaged = 0
+    observations = []
+    accountMap.clear()
 
     try {
+      for (const account of await transport.getAccounts?.(config.accessToken) ?? []) {
+        if (config.accountIds.includes(account.account_id)) accountMap.set(account.account_id, account)
+      }
       for (let pageNum = 0; pageNum < (config.maxPages ?? MAX_PAGES); pageNum++) {
         const page = await transport.syncTransactions(config.accessToken, cursor)
 
         pagesStaged++
 
         // Collect account metadata
-        for (const acct of page.accounts) {
-          if (!accountMap.has(acct.account_id)) accountMap.set(acct.account_id, acct)
+        for (const acct of page.accounts ?? []) {
+          if (config.accountIds.includes(acct.account_id) && !accountMap.has(acct.account_id)) accountMap.set(acct.account_id, acct)
         }
 
         // Build observations from added transactions
         for (const txn of page.added) {
+          if (!config.accountIds.includes(txn.account_id)) continue
           const acct = accountMap.get(txn.account_id)
-          const currency = txn.currency ?? acct?.balances.iso_currency_code
+          const currency = txn.iso_currency_code ?? txn.unofficial_currency_code ?? acct?.balances.iso_currency_code
 
           if (!currency) continue // quarantine: no currency
 
@@ -132,6 +141,7 @@ export async function runPlaidSync(
             name: txn.name,
             merchantName: txn.merchant_name ?? null,
             pending: txn.pending ?? false,
+            pendingTransactionId: txn.pending_transaction_id ?? null,
             plaidAccountName: acct?.name ?? null,
             plaidAccountType: acct?.type ?? null,
             accountCurrency: currency,
@@ -158,8 +168,9 @@ export async function runPlaidSync(
 
         // Modified transactions: produce revision observations
         for (const txn of page.modified) {
+          if (!config.accountIds.includes(txn.account_id)) continue
           const acct = accountMap.get(txn.account_id)
-          const currency = txn.currency ?? acct?.balances.iso_currency_code
+          const currency = txn.iso_currency_code ?? txn.unofficial_currency_code ?? acct?.balances.iso_currency_code
           if (!currency) continue
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
@@ -172,6 +183,7 @@ export async function runPlaidSync(
             name: txn.name,
             merchantName: txn.merchant_name ?? null,
             pending: txn.pending ?? false,
+            pendingTransactionId: txn.pending_transaction_id ?? null,
             isModified: true,
           }
           const semanticPayload = [
