@@ -25,6 +25,7 @@ function env(overrides: Record<string, string | undefined> = {}) {
     FINANCE_SYNC_PLAID_CLIENT_ID: 'client-test',
     FINANCE_SYNC_PLAID_SECRET: 'secret-test',
     FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge',
+    FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts',
     FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test',
     FINANCE_SYNC_BRIDGE_TOKEN: 'token-test',
     ...overrides,

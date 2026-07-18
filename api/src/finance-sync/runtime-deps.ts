@@ -31,6 +31,7 @@ export interface SyncCycleAuditEntry {
 interface RuntimeEnv extends ProviderRuntimeEnv {
   readonly FINANCE_SYNC_BRIDGE_URL?: string
   readonly FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS?: string
+  readonly FINANCE_SYNC_BRIDGE_RECEIPT_URL?: string
   readonly FINANCE_SYNC_BRIDGE_TOKEN?: string
   readonly FINANCE_SYNC_BRIDGE_TOKEN_FILE?: string
 }
@@ -66,6 +67,7 @@ export function createRuntimeDependencies(
   const configured = parseRuntimeConnections(env, deploymentId)
   const factories = transportFactories ?? createProviderTransportFactories(env)
   let bridgeUrl: URL | undefined
+  let bridgeReceiptUrl: URL | undefined
   let bridgeToken: string | undefined
   if (configured.length > 0) {
     // Construct every configured provider transport at startup so endpoint and
@@ -76,7 +78,9 @@ export function createRuntimeDependencies(
       else if (connection.provider === 'mercury') factories.mercury(connection)
       else factories.snaptrade(connection)
     }
-    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', bridgeHosts(env))
+    const allowedBridgeHosts = bridgeHosts(env)
+    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts)
+    bridgeReceiptUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts)
     bridgeToken = readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
   }
 
@@ -184,9 +188,18 @@ export function createRuntimeDependencies(
             delivered++
           }
           const recoverReceipt = async (): Promise<boolean> => {
-            if (!receiptLookup) return false
             try {
-              const recovered = await receiptLookup(row.payload)
+              const lookup = receiptLookup ?? (async (operation: BridgeDisclosureOperation): Promise<unknown | null> => {
+                if (!bridgeReceiptUrl || !bridgeToken) return null
+                const base = bridgeReceiptUrl.toString().replace(/\/+$/, '')
+                const response = await fetch(`${base}/${encodeURIComponent(operation.subject)}/${encodeURIComponent(operation.idempotencyKey)}`, {
+                  method: 'GET', redirect: 'error', headers: { authorization: `Bearer ${bridgeToken}` },
+                })
+                if (response.status === 404) return null
+                if (!response.ok) throw new Error('bridge receipt lookup failed')
+                return response.json()
+              })
+              const recovered = await lookup(row.payload)
               if (recovered === null) return false
               validateBridgeReceipt(row.payload, recovered)
               await markDelivered()

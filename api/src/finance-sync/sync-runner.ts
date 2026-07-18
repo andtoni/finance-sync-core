@@ -14,6 +14,7 @@ import {
   unavailableProviderSecretStore,
 } from './connect-control'
 import { createFinanceSyncHttpHandler } from './connect-http'
+import { PostgresConnectSessionStore } from './connect-session-store'
 
 interface CliArgs { help?: boolean; once?: boolean }
 function parseArgs(argv = process.argv): CliArgs { return { help: argv.includes('--help') || argv.includes('-h'), once: argv.includes('--once') } }
@@ -27,10 +28,12 @@ FINANCE_SYNC_CONNECTIONS_JSON is optional; without it, the runner performs migra
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
   const deps = createRuntimeDependencies(sql, config.deploymentId)
   const connect = new FinanceSyncConnectControl({
+    deploymentId: config.deploymentId,
     connections: await deps.loadConnections(config.deploymentId),
     plaid: createPlaidConnectTransport(process.env),
     snaptrade: createSnapTradeConnectTransport(process.env),
     secretStore: unavailableProviderSecretStore,
+    sessionStore: new PostgresConnectSessionStore(sql),
   })
   let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {

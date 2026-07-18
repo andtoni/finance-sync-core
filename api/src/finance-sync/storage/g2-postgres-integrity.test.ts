@@ -216,6 +216,7 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
       FINANCE_SYNC_PLAID_CLIENT_ID: "test-client",
       FINANCE_SYNC_PLAID_SECRET: "test-secret",
       FINANCE_SYNC_BRIDGE_URL: "https://127.0.0.1:1",
+      FINANCE_SYNC_BRIDGE_RECEIPT_URL: "https://127.0.0.1:1/receipts",
       FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: "127.0.0.1",
       FINANCE_SYNC_BRIDGE_TOKEN: "test-token",
     });

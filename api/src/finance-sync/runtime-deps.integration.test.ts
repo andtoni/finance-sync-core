@@ -22,7 +22,7 @@ const runtimeEnv = {
   FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connectionMetadata]),
   FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ [connection.connectionId]: { accessToken: connection.accessToken } }),
   FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com', FINANCE_SYNC_PLAID_CLIENT_ID: 'test', FINANCE_SYNC_PLAID_SECRET: 'test',
-  FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge', FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test', FINANCE_SYNC_BRIDGE_TOKEN: 'test',
+  FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge', FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts', FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test', FINANCE_SYNC_BRIDGE_TOKEN: 'test',
 }
 let sql: ReturnType<typeof postgres>
 
@@ -65,14 +65,17 @@ suite('runtime dependencies with PostgreSQL', () => {
     expect(recovered).toEqual({ observations: 1, outbox: 1 })
   })
 
-  it('recovers removal account identity and enqueues a delete projection', async () => {
+  it('recovers removal account identity but suppresses unresolved visible deletion', async () => {
     const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
     const original = observation('removed', { transactionId: 'removed', accountId: 'provider-account', amount: '2', currency: 'USD', date: '2026-07-17' })
     await deps.persistAndEnqueue(connection, [original])
     const removed = { ...observation('removed-tombstone', { transactionId: 'removed', isRemoved: true }), providerVersion: 'plaid:removed:removed' }
     await expect(deps.persistAndEnqueue(connection, [removed])).resolves.toBe(1)
-    const [row] = await sql`SELECT payload FROM projection_outbox WHERE deployment_id=${deploymentId} AND payload->>'kind'='ActivityDelete'`
-    expect(row.payload).toMatchObject({ accountId: 'wealthfolio-account', kind: 'ActivityDelete' })
+    const [counts] = await sql`SELECT
+      count(*) FILTER (WHERE payload->>'kind'='ActivityDelete')::int deletes,
+      (SELECT count(*)::int FROM raw_observations WHERE deployment_id=${deploymentId} AND payload->>'isRemoved'='true') removals
+      FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    expect(counts).toEqual({ deletes: 0, removals: 1 })
   })
 
   it('concurrent workers claim each row once and a batch tail remains blocking', async () => {

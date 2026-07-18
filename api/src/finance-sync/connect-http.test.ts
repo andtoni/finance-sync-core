@@ -10,12 +10,14 @@ let base: string
 
 beforeEach(async () => {
   const connect = new FinanceSyncConnectControl({
+    deploymentId: 'deployment-1',
     connections: [],
     plaid: {
       createLinkToken: async () => ({ linkToken: 'link-token' }),
       exchangePublicToken: async () => ({ accessToken: 'durable-secret', itemId: 'item-1' }),
     },
-    secretStore: { storePlaidAccessToken: async () => undefined },
+    secretStore: { available: true, storePlaidAccessToken: async () => undefined },
+    sessionStore: { create: async () => 'continuation-token', consume: async () => true },
   })
   const handler = createFinanceSyncHttpHandler({ controlToken, connect, health: () => ({ status: 200, body: { ok: true } }) })
   server = createServer((request, response) => { void handler(request, response) })
@@ -41,7 +43,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
 
     const started = await fetch(`${base}/control/v1/provider-connections/plaid/start`, { method: 'POST', headers: headers() })
     expect(started.status).toBe(200)
-    expect(await started.json()).toMatchObject({ provider: 'plaid', status: 'link_ready', message: 'Plaid Link is ready.', linkToken: 'link-token' })
+    expect(await started.json()).toMatchObject({ provider: 'plaid', status: 'link_ready', message: 'Plaid Link is ready.', linkToken: 'link-token', continuationToken: 'continuation-token' })
   })
 
   it('requires bounded JSON for Plaid completion and returns only a redacted typed response', async () => {
@@ -56,7 +58,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(await oversized.json()).toEqual({ error: 'request_failed' })
 
     const complete = await fetch(`${base}/control/v1/provider-connections/plaid/complete`, {
-      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ publicToken: 'public-token' }),
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ publicToken: 'public-token', continuationToken: 'continuation-token' }),
     })
     expect(complete.status).toBe(200)
     const payload = await complete.json()
@@ -69,7 +71,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(query.status).toBe(400)
     const body = await fetch(`${base}/control/v1/provider-connections/plaid/complete`, {
       method: 'POST', headers: { authorization: `Bearer ${controlToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ subject, publicToken: 'public-token' }),
+      body: JSON.stringify({ subject, publicToken: 'public-token', continuationToken: 'continuation-token' }),
     })
     expect(body.status).toBe(400)
   })

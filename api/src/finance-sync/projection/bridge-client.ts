@@ -221,7 +221,9 @@ export function providerObservationToBridge(
     || typeof payload.transaction_id === 'string'
     || typeof payload.sourceId === 'string'
   if (!hasTransactionIdentity) return null // balances, holdings and securities remain canonical facts only
-  if (payload.isRemoved === true) return cashObservationToBridge(observation, accessGeneration, accountId, connectionId)
+  // Provider removals remain immutable canonical evidence until a separate
+  // resolution/grace policy proves the visible activity should be deleted.
+  if (payload.isRemoved === true) return null
 
   const amount = Number(payload.amount)
   if (!Number.isFinite(amount) || amount === 0) throw new Error('invalid provider amount')

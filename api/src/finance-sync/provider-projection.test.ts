@@ -20,10 +20,10 @@ describe('provider-aware correction and removal projection', () => {
     expect(providerObservationToBridge('snaptrade', observation({ accountId: 'a', symbol: 'VTI', units: '1' }, 'holding'), 1, 'wf-a')).toBeNull()
   })
 
-  it('projects removals as deletes and corrections onto the same resource identity', () => {
+  it('retains unresolved removals as canonical evidence without visible deletion', () => {
     const removed = providerObservationToBridge('plaid', observation({ transactionId: 't-1', isRemoved: true }), 1, 'wf-a')
     const corrected = providerObservationToBridge('plaid', observation({ transactionId: 't-1', amount: 5, currency: 'USD', date: '2026-07-18' }), 1, 'wf-a')
-    expect(removed).toMatchObject({ kind: 'ActivityDelete', resourceId: corrected?.resourceId })
+    expect(removed).toBeNull()
     expect(corrected?.kind).toBe('ActivityUpsert')
   })
 })

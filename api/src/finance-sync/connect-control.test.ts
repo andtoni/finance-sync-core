@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   CONNECT_PROVIDERS,
   ConnectControlError,
+  createSnapTradeConnectTransport,
   FinanceSyncConnectControl,
   type ConnectControlDependencies,
 } from './connect-control'
@@ -23,13 +24,18 @@ function connection(provider: 'investec' | 'mercury' | 'snaptrade', localOwnerId
 
 function dependencies(overrides: Partial<ConnectControlDependencies> = {}): ConnectControlDependencies {
   return {
+    deploymentId: 'deployment-1',
     connections: [],
     plaid: {
       createLinkToken: vi.fn(async () => ({ linkToken: 'link-token' })),
       exchangePublicToken: vi.fn(async () => ({ accessToken: 'access-secret', itemId: 'item-1' })),
     },
-    snaptrade: { createRedirectUri: vi.fn(async () => ({ redirectUri: 'https://snaptrade.example/redirect' })) },
-    secretStore: { storePlaidAccessToken: vi.fn(async () => undefined) },
+    snaptrade: { createRedirectUri: vi.fn(async () => ({ redirectUri: 'https://app.snaptrade.com/snapTrade/redeemToken?token=short-lived' })) },
+    secretStore: { available: true, storePlaidAccessToken: vi.fn(async () => undefined) },
+    sessionStore: {
+      create: vi.fn(async () => 'continuation-token'),
+      consume: vi.fn(async () => true),
+    },
     ...overrides,
   }
 }
@@ -60,22 +66,47 @@ describe('Finance Sync Connect control plane', () => {
   it('creates real provider handoff values only through injected transports', async () => {
     const deps = dependencies({ connections: [connection('snaptrade')] })
     const control = new FinanceSyncConnectControl(deps)
-    await expect(control.start(subjectA, 'plaid')).resolves.toMatchObject({ linkToken: 'link-token' })
-    await expect(control.start(subjectA, 'snaptrade')).resolves.toMatchObject({ redirectUrl: 'https://snaptrade.example/redirect' })
+    await expect(control.start(subjectA, 'plaid')).resolves.toMatchObject({ linkToken: 'link-token', continuationToken: 'continuation-token' })
+    await expect(control.start(subjectA, 'snaptrade')).resolves.toMatchObject({ redirectUrl: 'https://app.snaptrade.com/snapTrade/redeemToken?token=short-lived' })
     expect(deps.plaid?.createLinkToken).toHaveBeenCalledWith(subjectA)
     expect(deps.snaptrade?.createRedirectUri).toHaveBeenCalledWith(expect.objectContaining({ localOwnerId: subjectA }))
+  })
+
+  it('forces SnapTrade portal authorization to read-only and validates the official redirect', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input))
+      expect(url.searchParams.get('connectionType')).toBe('read')
+      return new Response(JSON.stringify({ redirectURI: 'https://app.snaptrade.com/snapTrade/redeemToken?token=short-lived' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const transport = createSnapTradeConnectTransport({}, fetchImpl)
+    const snaptrade = connection('snaptrade') as Extract<RuntimeConnection, { provider: 'snaptrade' }>
+    await expect(transport.createRedirectUri(snaptrade)).resolves.toEqual({
+      redirectUri: 'https://app.snaptrade.com/snapTrade/redeemToken?token=short-lived',
+    })
   })
 
   it('hands exchanged Plaid access tokens only to ProviderSecretStore and never returns or logs them', async () => {
     const deps = dependencies()
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
-    const result = await new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token')
+    const result = await new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token')
+    expect(deps.sessionStore.consume).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', token: 'continuation-token' })
     expect(deps.plaid?.exchangePublicToken).toHaveBeenCalledWith('public-token')
     expect(deps.secretStore.storePlaidAccessToken).toHaveBeenCalledWith({ subject: subjectA, itemId: 'item-1', accessToken: 'access-secret' })
     expect(JSON.stringify(result)).not.toContain('access-secret')
     expect(error).not.toHaveBeenCalled(); expect(log).not.toHaveBeenCalled()
     error.mockRestore(); log.mockRestore()
+  })
+
+  it('fails before consuming or exchanging when the durable secret store is unavailable', async () => {
+    const deps = dependencies({
+      secretStore: { available: false, storePlaidAccessToken: vi.fn(async () => undefined) },
+    })
+    await expect(
+      new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token'),
+    ).rejects.toMatchObject({ status: 503 })
+    expect(deps.sessionStore.consume).not.toHaveBeenCalled()
+    expect(deps.plaid?.exchangePublicToken).not.toHaveBeenCalled()
   })
 
   it('fails disconnect closed for every allowlisted provider', async () => {

@@ -67,8 +67,10 @@ export function createFinanceSyncHttpHandler(input: {
       }
       if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/complete') {
         const body = await jsonBody(request)
-        if (typeof body.publicToken !== 'string' || !body.publicToken) throw new ConnectControlError(400, 'publicToken is required')
-        return send(response, 200, await input.connect.completePlaid(rawSubject, body.publicToken))
+        if (typeof body.publicToken !== 'string' || !body.publicToken || typeof body.continuationToken !== 'string' || !body.continuationToken) {
+          throw new ConnectControlError(400, 'completion tokens are required')
+        }
+        return send(response, 200, await input.connect.completePlaid(rawSubject, body.publicToken, body.continuationToken))
       }
       return send(response, 404, { error: 'not_found' })
     } catch (error) {

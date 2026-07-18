@@ -9,6 +9,7 @@ export const CONNECT_PROVIDERS = ['investec', 'mercury', 'plaid', 'snaptrade'] a
 export type ConnectProvider = (typeof CONNECT_PROVIDERS)[number]
 
 export interface ProviderSecretStore {
+  readonly available: boolean
   storePlaidAccessToken(input: {
     readonly subject: string
     readonly itemId: string
@@ -25,16 +26,23 @@ export interface SnapTradeConnectTransport {
   createRedirectUri(connection: SnapTradeRuntimeConnection): Promise<{ readonly redirectUri: string }>
 }
 
+export interface ConnectSessionStore {
+  create(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid' }): Promise<string>
+  consume(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string }): Promise<boolean>
+}
+
 export interface ConnectControlDependencies {
+  readonly deploymentId: string
   readonly connections: readonly RuntimeConnection[]
   readonly plaid?: PlaidConnectTransport
   readonly snaptrade?: SnapTradeConnectTransport
   readonly secretStore: ProviderSecretStore
+  readonly sessionStore: ConnectSessionStore
 }
 
 export interface ProviderConnectStatus {
   readonly provider: ConnectProvider
-  readonly status: 'configured' | 'not_configured'
+  readonly status: 'available' | 'configured' | 'not_configured'
   readonly message: string
 }
 
@@ -73,11 +81,12 @@ export class FinanceSyncConnectControl {
 
   private providerStatus(selected: ConnectProvider, connections: readonly RuntimeConnection[]): ProviderConnectStatus {
     const configured = this.isConfigured(selected, connections)
-    return { provider: selected, status: configured ? 'configured' : 'not_configured', message: configured ? 'Provider is configured.' : 'Provider is not configured.' }
+    if (configured) return { provider: selected, status: 'configured', message: 'Provider is configured.' }
+    if (selected === 'plaid' && this.deps.plaid) return { provider: selected, status: 'available', message: 'Provider is available to connect.' }
+    return { provider: selected, status: 'not_configured', message: 'Provider is not configured.' }
   }
 
   private isConfigured(selected: ConnectProvider, connections: readonly RuntimeConnection[]): boolean {
-    if (selected === 'plaid') return this.deps.plaid !== undefined || connections.some(connection => connection.provider === selected)
     return connections.some(connection => connection.provider === selected)
   }
 
@@ -93,7 +102,8 @@ export class FinanceSyncConnectControl {
       if (!this.deps.plaid) throw new ConnectControlError(503, 'provider is unavailable')
       const result = await this.deps.plaid.createLinkToken(boundSubject)
       if (!result.linkToken) throw new ConnectControlError(502, 'provider returned an invalid response')
-      return { provider: selected, status: 'link_ready', message: 'Plaid Link is ready.', linkToken: result.linkToken }
+      const continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid' })
+      return { provider: selected, status: 'link_ready', message: 'Plaid Link is ready.', linkToken: result.linkToken, continuationToken }
     }
     const connection = connections.find((item): item is SnapTradeRuntimeConnection => item.provider === 'snaptrade')
     if (!connection || !this.deps.snaptrade) throw new ConnectControlError(409, 'provider is not configured')
@@ -102,10 +112,12 @@ export class FinanceSyncConnectControl {
     return { provider: selected, status: 'link_ready', message: 'SnapTrade redirect is ready.', redirectUrl: result.redirectUri }
   }
 
-  async completePlaid(rawSubject: string, publicToken: string): Promise<Record<string, string>> {
+  async completePlaid(rawSubject: string, publicToken: string, continuationToken: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
-    if (!publicToken) throw new ConnectControlError(400, 'public token is required')
-    if (!this.deps.plaid) throw new ConnectControlError(503, 'provider is unavailable')
+    if (!publicToken || !continuationToken) throw new ConnectControlError(400, 'completion tokens are required')
+    if (!this.deps.plaid || !this.deps.secretStore.available) throw new ConnectControlError(503, 'provider is unavailable')
+    const consumed = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken })
+    if (!consumed) throw new ConnectControlError(409, 'link session is invalid or already used')
     const exchanged = await this.deps.plaid.exchangePublicToken(publicToken)
     if (!exchanged.accessToken || !exchanged.itemId) throw new ConnectControlError(502, 'provider returned an invalid response')
     await this.deps.secretStore.storePlaidAccessToken({ subject: boundSubject, itemId: exchanged.itemId, accessToken: exchanged.accessToken })
@@ -161,7 +173,7 @@ export function createPlaidConnectTransport(env: ProviderRuntimeEnv = process.en
     async createLinkToken(boundSubject) {
       const value = await post('/link/token/create', {
         user: { client_user_id: boundSubject }, client_name: 'Finance Sync', products: ['transactions'],
-        required_if_supported_products: ['liabilities', 'investments'], country_codes: ['US'], language: 'en',
+        country_codes: ['US'], language: 'en',
       })
       if (typeof value.link_token !== 'string' || !value.link_token) throw new ConnectControlError(502, 'provider returned an invalid response')
       return { linkToken: value.link_token }
@@ -188,7 +200,7 @@ export function createSnapTradeConnectTransport(env: ProviderRuntimeEnv = proces
   return {
     async createRedirectUri(connection) {
       const params = {
-        clientId: connection.clientId, timestamp: String(Math.floor(Date.now() / 1000)),
+        clientId: connection.clientId, connectionType: 'read', timestamp: String(Math.floor(Date.now() / 1000)),
         userId: connection.userId, userSecret: connection.userSecret,
       }
       const query = new URLSearchParams(Object.fromEntries(Object.entries(params).sort(([a], [b]) => a.localeCompare(b)))).toString()
@@ -199,13 +211,19 @@ export function createSnapTradeConnectTransport(env: ProviderRuntimeEnv = proces
       }))
       const redirectUri = value.redirectURI ?? value.redirect_uri
       if (typeof redirectUri !== 'string' || !redirectUri) throw new ConnectControlError(502, 'provider returned an invalid response')
-      return { redirectUri }
+      let redirect: URL
+      try { redirect = new URL(redirectUri) } catch { throw new ConnectControlError(502, 'provider returned an invalid response') }
+      if (redirect.protocol !== 'https:' || redirect.hostname.toLowerCase() !== 'app.snaptrade.com' || redirect.pathname !== '/snapTrade/redeemToken' || redirect.username || redirect.password) {
+        throw new ConnectControlError(502, 'provider returned an invalid response')
+      }
+      return { redirectUri: redirect.toString() }
     },
   }
 }
 
 /** Production remains fail-closed until the exact Infisical write scope is approved. */
 export const unavailableProviderSecretStore: ProviderSecretStore = {
+  available: false,
   async storePlaidAccessToken() { throw new ConnectControlError(503, 'provider secret store is unavailable') },
 }
 
