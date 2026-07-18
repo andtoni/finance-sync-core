@@ -10,6 +10,8 @@ export type ConnectProvider = (typeof CONNECT_PROVIDERS)[number]
 
 export interface ProviderSecretStore {
   readonly available: boolean
+  /** Authenticate and prove the durable sink is reachable before consuming a public token. */
+  prepare?(): Promise<void>
   storePlaidAccessToken(input: {
     readonly subject: string
     readonly itemId: string
@@ -116,6 +118,7 @@ export class FinanceSyncConnectControl {
     const boundSubject = subject(rawSubject)
     if (!publicToken || !continuationToken) throw new ConnectControlError(400, 'completion tokens are required')
     if (!this.deps.plaid || !this.deps.secretStore.available) throw new ConnectControlError(503, 'provider is unavailable')
+    await this.deps.secretStore.prepare?.()
     const consumed = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken })
     if (!consumed) throw new ConnectControlError(409, 'link session is invalid or already used')
     const exchanged = await this.deps.plaid.exchangePublicToken(publicToken)

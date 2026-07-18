@@ -98,6 +98,27 @@ describe('Finance Sync Connect control plane', () => {
     error.mockRestore(); log.mockRestore()
   })
 
+  it('proves the durable sink writable before consuming or exchanging', async () => {
+    const order: string[] = []
+    const deps = dependencies({
+      secretStore: {
+        available: true,
+        prepare: vi.fn(async () => { order.push('prepare') }),
+        storePlaidAccessToken: vi.fn(async () => { order.push('store') }),
+      },
+      sessionStore: {
+        create: vi.fn(async () => 'continuation-token'),
+        consume: vi.fn(async () => { order.push('consume'); return true }),
+      },
+      plaid: {
+        createLinkToken: vi.fn(async () => ({ linkToken: 'link-token' })),
+        exchangePublicToken: vi.fn(async () => { order.push('exchange'); return { accessToken: 'access-secret', itemId: 'item-1' } }),
+      },
+    })
+    await new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token')
+    expect(order).toEqual(['prepare', 'consume', 'exchange', 'store'])
+  })
+
   it('fails before consuming or exchanging when the durable secret store is unavailable', async () => {
     const deps = dependencies({
       secretStore: { available: false, storePlaidAccessToken: vi.fn(async () => undefined) },
