@@ -102,9 +102,13 @@ describe('Finance Sync Connect control plane', () => {
     const deps = dependencies({
       secretStore: { available: false, storePlaidAccessToken: vi.fn(async () => undefined) },
     })
+    const control = new FinanceSyncConnectControl(deps)
+    expect(control.status(subjectA, 'plaid')).toMatchObject({ status: 'not_configured' })
+    await expect(control.start(subjectA, 'plaid')).rejects.toMatchObject({ status: 503 })
     await expect(
-      new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token'),
+      control.completePlaid(subjectA, 'public-token', 'continuation-token'),
     ).rejects.toMatchObject({ status: 503 })
+    expect(deps.plaid?.createLinkToken).not.toHaveBeenCalled()
     expect(deps.sessionStore.consume).not.toHaveBeenCalled()
     expect(deps.plaid?.exchangePublicToken).not.toHaveBeenCalled()
   })

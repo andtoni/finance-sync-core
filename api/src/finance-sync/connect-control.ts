@@ -82,7 +82,7 @@ export class FinanceSyncConnectControl {
   private providerStatus(selected: ConnectProvider, connections: readonly RuntimeConnection[]): ProviderConnectStatus {
     const configured = this.isConfigured(selected, connections)
     if (configured) return { provider: selected, status: 'configured', message: 'Provider is configured.' }
-    if (selected === 'plaid' && this.deps.plaid) return { provider: selected, status: 'available', message: 'Provider is available to connect.' }
+    if (selected === 'plaid' && this.deps.plaid && this.deps.secretStore.available) return { provider: selected, status: 'available', message: 'Provider is available to connect.' }
     return { provider: selected, status: 'not_configured', message: 'Provider is not configured.' }
   }
 
@@ -99,7 +99,7 @@ export class FinanceSyncConnectControl {
       return { provider: selected, status: 'configured', message: 'Provider is configured.' }
     }
     if (selected === 'plaid') {
-      if (!this.deps.plaid) throw new ConnectControlError(503, 'provider is unavailable')
+      if (!this.deps.plaid || !this.deps.secretStore.available) throw new ConnectControlError(503, 'provider is unavailable')
       const result = await this.deps.plaid.createLinkToken(boundSubject)
       if (!result.linkToken) throw new ConnectControlError(502, 'provider returned an invalid response')
       const continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid' })
