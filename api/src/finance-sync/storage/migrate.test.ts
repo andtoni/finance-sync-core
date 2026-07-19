@@ -8,8 +8,17 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
+  });
+
+  it("defines generation-bound admissions, checkpoint/outbox identities, and rotation supersession", () => {
+    const sql = readFileSync(resolve(root, "0009_provider_generation_fences.sql"), "utf8");
+    expect(sql).toMatch(/provider_account_admissions[\s\S]*provider_generation/i);
+    expect(sql).toMatch(/PRIMARY KEY \(deployment_id, connection_id, provider_generation\)/i);
+    expect(sql).toMatch(/UNIQUE \(deployment_id, connection_id, provider_generation, idempotency_key\)/i);
+    expect(sql).toMatch(/state = 'dead_letter'[\s\S]*PROVIDER_GENERATION_SUPERSEDED/i);
+    expect(sql).toMatch(/provider_generation = OLD\.provider_generation/i);
   });
 
   it("rejects checksum drift", () => {

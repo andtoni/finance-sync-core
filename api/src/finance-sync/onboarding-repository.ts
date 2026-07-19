@@ -87,8 +87,9 @@ export class PostgresOnboardingRepository {
     const mappingDigest = assetMappingDigest(input.assetMappings)
     return await this.sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
-      const existing = await tx<{ wealthfolioAccountId: string; revokedAt: string | null }[]>`
-        SELECT paa.wealthfolio_account_id AS "wealthfolioAccountId", paa.revoked_at::text AS "revokedAt"
+      const existing = await tx<{ wealthfolioAccountId: string; providerGeneration: number; revokedAt: string | null }[]>`
+        SELECT paa.wealthfolio_account_id AS "wealthfolioAccountId",
+          paa.provider_generation AS "providerGeneration", paa.revoked_at::text AS "revokedAt"
         FROM provider_account_admissions paa
         JOIN provider_connections pc
           ON pc.deployment_id = paa.deployment_id AND pc.local_owner_id = paa.local_owner_id
@@ -104,17 +105,17 @@ export class PostgresOnboardingRepository {
       if (input.baselineKind === 'relink' && (existing.length !== 1
         || existing[0]?.wealthfolioAccountId !== input.wealthfolioAccountId
         || existing[0]?.revokedAt === null
-        || input.priorProviderGeneration !== input.providerGeneration - 1)) {
+        || existing[0]?.providerGeneration !== input.priorProviderGeneration)) {
         throw new Error('relink baseline does not match a revoked admission')
       }
       const admitted = await tx`
         INSERT INTO provider_account_admissions (
           deployment_id, local_owner_id, connection_id, provider_account_id,
-          wealthfolio_account_id, receiver_access_generation, asset_mappings, asset_mapping_digest,
+          wealthfolio_account_id, provider_generation, receiver_access_generation, asset_mappings, asset_mapping_digest,
           baseline_state, baseline_verified_at, baseline_fingerprint
         )
         SELECT dpa.deployment_id, dpa.local_owner_id, dpa.connection_id, dpa.provider_account_id,
-          ${input.wealthfolioAccountId}, ${input.receiverAccessGeneration}, ${tx.json(input.assetMappings as never)},
+          ${input.wealthfolioAccountId}, ${input.providerGeneration}, ${input.receiverAccessGeneration}, ${tx.json(input.assetMappings as never)},
           ${mappingDigest}, 'verified', now(), ${input.databaseStateDigest}
         FROM discovered_provider_accounts dpa
         JOIN provider_connections pc
@@ -129,7 +130,8 @@ export class PostgresOnboardingRepository {
           AND (SELECT COALESCE(jsonb_agg(asset->>'providerAssetId' ORDER BY asset->>'providerAssetId'), '[]'::jsonb)
             FROM jsonb_array_elements(dpa.assets) asset) = ${tx.json([...mappingIds].sort() as never)}
         ON CONFLICT (deployment_id, local_owner_id, connection_id, provider_account_id)
-        DO UPDATE SET receiver_access_generation = EXCLUDED.receiver_access_generation,
+        DO UPDATE SET provider_generation = EXCLUDED.provider_generation,
+          receiver_access_generation = EXCLUDED.receiver_access_generation,
           asset_mappings = EXCLUDED.asset_mappings,
           asset_mapping_digest = EXCLUDED.asset_mapping_digest,
           baseline_state = 'verified', baseline_verified_at = now(),
@@ -162,13 +164,14 @@ export class PostgresOnboardingRepository {
 
   private async status(sql: FinanceSyncSql, subject: string, provider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata | null> {
     const rows = await sql<AdmissionMetadata[]>`
-      SELECT paa.wealthfolio_account_id AS "wealthfolioAccountId", pc.provider_generation AS "providerGeneration",
+      SELECT paa.wealthfolio_account_id AS "wealthfolioAccountId", paa.provider_generation AS "providerGeneration",
         paa.receiver_access_generation AS "receiverAccessGeneration", paa.baseline_state AS "baselineStatus",
         paa.baseline_fingerprint AS "baselineDigest", paa.asset_mapping_digest AS "assetMappingDigest"
       FROM provider_account_admissions paa JOIN provider_connections pc
         ON pc.deployment_id = paa.deployment_id AND pc.local_owner_id = paa.local_owner_id AND pc.connection_id = paa.connection_id
       WHERE paa.deployment_id = ${this.deploymentId} AND paa.local_owner_id = ${subject} AND pc.provider = ${provider}
         AND paa.connection_id = ${connectionId}::uuid AND paa.provider_account_id = ${providerAccountId} AND paa.revoked_at IS NULL
+        AND paa.provider_generation = pc.provider_generation
     `
     return rows[0] ?? null
   }
