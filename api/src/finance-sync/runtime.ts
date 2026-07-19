@@ -9,7 +9,10 @@ interface RuntimeConnectionBase {
   readonly sourceResourceIncarnationId: string
   readonly accountIds: readonly string[]
   readonly wealthfolioAccountIds: Readonly<Record<string, string>>
-  readonly accessGeneration: number
+  /** Provider credential/connection epoch used for ingestion fencing and provenance. */
+  readonly providerGeneration: number
+  /** Wealthfolio grant epoch used only for receiver bridge authorization. */
+  readonly receiverAccessGeneration: number
 }
 
 export interface PlaidRuntimeConnection extends RuntimeConnectionBase {
@@ -42,6 +45,7 @@ export interface SnapTradeRuntimeConnection extends RuntimeConnectionBase {
   readonly consumerKey: string
   readonly userId: string
   readonly userSecret: string
+  readonly assetMappings: Readonly<Record<string, string>>
   readonly activitiesStartDate?: string
   readonly activitiesEndDate?: string
 }

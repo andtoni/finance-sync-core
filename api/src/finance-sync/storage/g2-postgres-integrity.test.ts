@@ -206,7 +206,7 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
          ${JSON.stringify(outboxPayload)}, 2)
     `;
 
-    const connection = { provider: 'plaid' as const, connectionId: 'test-conn', deploymentId: deadLetterDeploymentId, accessToken: 'test', localOwnerId: 'urn:test#owner', sourceResourceIncarnationId: 'a0000000-0000-0000-0000-000000000030', accountIds: ['test-account'], wealthfolioAccountIds: { 'test-account': 'test-account' }, accessGeneration: 1 };
+    const connection = { provider: 'plaid' as const, connectionId: 'test-conn', deploymentId: deadLetterDeploymentId, accessToken: 'test', localOwnerId: 'urn:test#owner', sourceResourceIncarnationId: 'a0000000-0000-0000-0000-000000000030', accountIds: ['test-account'], wealthfolioAccountIds: { 'test-account': 'test-account' }, providerGeneration: 1, receiverAccessGeneration: 1 };
     const { accessToken: _accessToken, ...connectionMetadata } = connection;
     // Fully configured, allowlisted HTTPS endpoint guaranteed to refuse the connection.
     const deps = createRuntimeDependencies(sql, deadLetterDeploymentId, {

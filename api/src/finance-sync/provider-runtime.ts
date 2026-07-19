@@ -20,14 +20,18 @@ export interface ProviderRuntimeEnv {
   readonly FINANCE_SYNC_CONNECTIONS_JSON_FILE?: string
   readonly FINANCE_SYNC_PROVIDER_SECRETS_JSON?: string
   readonly FINANCE_SYNC_PROVIDER_SECRETS_JSON_FILE?: string
+  readonly FINANCE_SYNC_PROVIDER_OWNER_SUBJECT?: string
   readonly FINANCE_SYNC_INVESTEC_URL?: string
+  readonly FINANCE_SYNC_INVESTEC_SECRET_REFERENCE?: string
   readonly FINANCE_SYNC_MERCURY_URL?: string
+  readonly FINANCE_SYNC_MERCURY_SECRET_REFERENCE?: string
   readonly FINANCE_SYNC_PLAID_URL?: string
   readonly FINANCE_SYNC_PLAID_CLIENT_ID?: string
   readonly FINANCE_SYNC_PLAID_CLIENT_ID_FILE?: string
   readonly FINANCE_SYNC_PLAID_SECRET?: string
   readonly FINANCE_SYNC_PLAID_SECRET_FILE?: string
   readonly FINANCE_SYNC_SNAPTRADE_URL?: string
+  readonly FINANCE_SYNC_SNAPTRADE_SECRET_REFERENCE?: string
 }
 
 export interface ProviderTransportFactories {
@@ -112,12 +116,15 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
       if (typeof mapped !== 'string' || mapped.length === 0) throw new Error('every provider account requires a Wealthfolio account mapping')
       wealthfolioAccountIds[accountId] = mapped
     }
-    const accessGeneration = c.accessGeneration
-    if (!Number.isSafeInteger(accessGeneration) || (accessGeneration as number) < 1) throw new Error('connection accessGeneration must be positive')
+    const providerGeneration = c.providerGeneration
+    const receiverAccessGeneration = c.receiverAccessGeneration
+    if (!Number.isSafeInteger(providerGeneration) || (providerGeneration as number) < 1) throw new Error('connection providerGeneration must be positive')
+    if (!Number.isSafeInteger(receiverAccessGeneration) || (receiverAccessGeneration as number) < 1) throw new Error('connection receiverAccessGeneration must be positive')
     const common = {
       provider: provider as ProviderName, connectionId, deploymentId, localOwnerId,
       sourceResourceIncarnationId: string(c, 'sourceResourceIncarnationId'), accountIds,
-      wealthfolioAccountIds: Object.freeze(wealthfolioAccountIds), accessGeneration: accessGeneration as number,
+      wealthfolioAccountIds: Object.freeze(wealthfolioAccountIds), providerGeneration: providerGeneration as number,
+      receiverAccessGeneration: receiverAccessGeneration as number,
     }
     switch (provider) {
       case 'plaid': return { ...common, provider, accessToken: string(c, 'accessToken'), maxPages: optionalPositive(c, 'maxPages') }
@@ -127,9 +134,18 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
         maxPages: optionalPositive(c, 'maxPages'),
       }
       case 'mercury': return { ...common, provider, apiToken: string(c, 'apiToken'), since: optionalString(c, 'since'), maxPagesPerAccount: optionalPositive(c, 'maxPagesPerAccount') }
-      case 'snaptrade': return {
-        ...common, provider, clientId: string(c, 'clientId'), consumerKey: string(c, 'consumerKey'), userId: string(c, 'userId'),
-        userSecret: string(c, 'userSecret'), activitiesStartDate: optionalString(c, 'activitiesStartDate'), activitiesEndDate: optionalString(c, 'activitiesEndDate'),
+      case 'snaptrade': {
+        const rawAssetMappings = record(c.assetMappings, 'connection assetMappings is required')
+        const assetMappings: Record<string, string> = {}
+        for (const [providerAssetId, wealthfolioAssetId] of Object.entries(rawAssetMappings)) {
+          if (!providerAssetId || typeof wealthfolioAssetId !== 'string' || !wealthfolioAssetId) throw new Error('invalid SnapTrade asset mapping')
+          assetMappings[providerAssetId] = wealthfolioAssetId
+        }
+        return {
+          ...common, provider, clientId: string(c, 'clientId'), consumerKey: string(c, 'consumerKey'), userId: string(c, 'userId'),
+          userSecret: string(c, 'userSecret'), assetMappings: Object.freeze(assetMappings),
+          activitiesStartDate: optionalString(c, 'activitiesStartDate'), activitiesEndDate: optionalString(c, 'activitiesEndDate'),
+        }
       }
       default: throw new Error('unsupported runtime provider')
     }
@@ -192,6 +208,10 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
           const value = record(await request('/accounts/get', {}), 'invalid Plaid accounts response')
           if (!Array.isArray(value.accounts)) throw new Error('invalid Plaid accounts response')
           return value.accounts as Awaited<ReturnType<NonNullable<PlaidTransport['getAccounts']>>>
+        },
+        async getLiabilities() {
+          const value = record(await request('/liabilities/get', {}), 'invalid Plaid liabilities response')
+          return record(value.liabilities, 'invalid Plaid liabilities response') as Awaited<ReturnType<NonNullable<PlaidTransport['getLiabilities']>>>
         },
       }
     },

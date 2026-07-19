@@ -13,7 +13,7 @@ const CONNECTION: RuntimeConnection = {
   sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
   accountIds: ['acc-1'],
   wealthfolioAccountIds: { 'acc-1': 'wf-acc-1' },
-  accessGeneration: 1,
+  providerGeneration: 1, receiverAccessGeneration: 1,
 }
 const { accessToken: CONNECTION_ACCESS_TOKEN, ...CONNECTION_METADATA } = CONNECTION
 
@@ -34,12 +34,13 @@ function env(overrides: Record<string, string | undefined> = {}) {
 
 function binding(fields: readonly string[]): string {
   const encoder = new TextEncoder()
-  return `v1;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
+  return `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
 }
 
 function receipt(op: BridgeDisclosureOperation) {
-  const operation = op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : 'projection_fence'
+  const operation = op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : op.kind === 'CurrentStateUpsert' ? 'current_state_upsert' : 'projection_fence'
   const successor = op.lifecycleSuccessorId ?? null
+  const semanticHash = op.kind === 'CurrentStateUpsert' ? op.semanticHash ?? null : null
   return {
     deploymentId: op.deploymentId,
     accountId: op.accountId,
@@ -50,10 +51,12 @@ function receipt(op: BridgeDisclosureOperation) {
     resourceId: op.resourceId,
     lifecycleSuccessorId: successor,
     outcome: 'Accepted',
-    bindingVersion: 1,
+    bindingVersion: 3,
+    semanticHash,
     receiptBinding: binding([
       op.deploymentId, op.subject, op.idempotencyKey, String(op.accessGeneration), operation,
-      op.resourceId, op.accountId, successor ?? '<null>', 'accepted',
+      op.resourceId, op.accountId, successor === null ? '0' : '1', successor ?? '', 'accepted',
+      semanticHash === null ? '0' : '1', semanticHash ?? '',
     ]),
   }
 }
@@ -62,8 +65,13 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
   let state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' = 'pending'
   let attempts = row.attempts
   const queries: string[] = []
-  const sql = (async (strings: TemplateStringsArray, ..._values: unknown[]) => {
+  const enqueued: BridgeDisclosureOperation[] = []
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const text = strings.join('?')
+    if (/INSERT\s+INTO\s+projection_outbox/i.test(text)) {
+      const payload = values.find(value => value !== null && typeof value === 'object' && 'kind' in value) as BridgeDisclosureOperation | undefined
+      if (payload) enqueued.push(payload)
+    }
     queries.push(text)
     if (/count\(\*\)/i.test(text)) {
       const count = /state\s*=\s*'dead_letter'/i.test(text)
@@ -84,7 +92,7 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
   }) as unknown as FinanceSyncSql
   ;(sql as unknown as { begin: (fn: (tx: FinanceSyncSql) => Promise<unknown>) => Promise<unknown> }).begin = fn => fn(sql)
   ;(sql as unknown as { json: (value: unknown) => unknown }).json = value => value
-  return { sql, state: () => state, attempts: () => attempts, queries }
+  return { sql, state: () => state, attempts: () => attempts, queries, enqueued }
 }
 
 describe('createRuntimeDependencies startup validation', () => {
@@ -110,6 +118,32 @@ describe('createRuntimeDependencies startup validation', () => {
     expect(() => createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', env({
       FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([badMapping]),
     }))).toThrow('every provider account')
+  })
+})
+
+describe('persistAndEnqueue current-state contract', () => {
+  it('enqueues transaction activity unchanged plus one atomic complete current-state payload', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000099', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 })
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+    const common = {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      hashSpecificationVersion: 1, observedAt: '2026-07-18T00:00:00.000Z',
+    } as const
+    await deps.persistAndEnqueue(CONNECTION, [
+      { ...common, providerVersion: 'plaid:txn:t-1', semanticHash: 'a'.repeat(64), domain: 'cash_ledger', payload: { transactionId: 't-1', accountId: 'acc-1', amount: '5', currency: 'USD', date: '2026-07-18' } },
+      { ...common, providerVersion: 'plaid:balance:acc-1', semanticHash: 'b'.repeat(64), domain: 'cash_ledger', payload: { accountId: 'acc-1', currentBalance: '95', currency: 'USD', asOfDate: '2026-07-18' } },
+    ])
+    expect(fixture.enqueued.map(operation => operation.kind)).toEqual(['ActivityUpsert', 'CurrentStateUpsert'])
+    expect(fixture.enqueued[1].currentState).toEqual({
+      accountId: 'wf-acc-1', providerConnectionId: 'item-1', providerIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerGeneration: 1, observedAt: '2026-07-18T00:00:00.000Z', revision: 1784332800000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '95', liabilityBalance: '0', positions: [],
+    })
+    expect(fixture.enqueued[1].semanticHash).toMatch(/^[a-f0-9]{64}$/)
   })
 })
 

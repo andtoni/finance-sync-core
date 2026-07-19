@@ -1,16 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { parseRuntimeConnections, runRuntimeProvider, type ProviderTransportFactories } from './provider-runtime'
+import { createProviderTransportFactories, parseRuntimeConnections, runRuntimeProvider, type ProviderTransportFactories } from './provider-runtime'
 
 const common = {
   connectionId: 'connection-1', deploymentId: 'dep-1', localOwnerId: 'urn:test#owner',
   sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
-  accountIds: ['account-1'], wealthfolioAccountIds: { 'account-1': 'wf-account-1' }, accessGeneration: 1,
+  accountIds: ['account-1'], wealthfolioAccountIds: { 'account-1': 'wf-account-1' },
+  providerGeneration: 1, receiverAccessGeneration: 1,
 }
 const configurations = [
   { ...common, provider: 'plaid' },
   { ...common, connectionId: 'connection-2', provider: 'investec', clientId: 'id', eligibleProductNames: ['Private Bank'], fromDate: '2026-01-01', toDate: '2026-07-18' },
   { ...common, connectionId: 'connection-3', provider: 'mercury', since: '2026-01-01' },
-  { ...common, connectionId: 'connection-4', provider: 'snaptrade', clientId: 'id', userId: 'user', activitiesStartDate: '2026-01-01', activitiesEndDate: '2026-07-18' },
+  { ...common, connectionId: 'connection-4', provider: 'snaptrade', clientId: 'id', userId: 'user', assetMappings: {}, activitiesStartDate: '2026-01-01', activitiesEndDate: '2026-07-18' },
 ]
 const providerSecrets = {
   'connection-1': { accessToken: 'server-token' },
@@ -65,6 +66,31 @@ describe('four-provider runtime configuration', () => {
     expect(() => parseRuntimeConnections(runtimeEnv([{ ...configurations[0], wealthfolioAccountIds: {} }]), 'dep-1')).toThrow('every provider account')
   })
 
+  it('uses both Plaid transactions and liabilities runtime requests', async () => {
+    const requests: string[] = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const path = new URL(input instanceof Request ? input.url : input).pathname
+      requests.push(path)
+      if (path === '/transactions/sync') return new Response(JSON.stringify({ added: [], modified: [], removed: [], next_cursor: 'next', has_more: false }))
+      if (path === '/liabilities/get') return new Response(JSON.stringify({ liabilities: { credit: [] } }))
+      throw new Error(`unexpected path ${path}`)
+    }) as typeof fetch
+    try {
+      const [connection] = parseRuntimeConnections(runtimeEnv([configurations[0]]), 'dep-1')
+      if (connection.provider !== 'plaid') throw new Error('expected Plaid fixture')
+      const transport = createProviderTransportFactories({
+        FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com',
+        FINANCE_SYNC_PLAID_CLIENT_ID: 'client', FINANCE_SYNC_PLAID_SECRET: 'secret',
+      }).plaid(connection)
+      await transport.syncTransactions(connection.accessToken)
+      await transport.getLiabilities?.(connection.accessToken)
+      expect(requests).toEqual(['/transactions/sync', '/liabilities/get'])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('dispatches every provider through injected read-only transports with bounded restart cursors', async () => {
     const parsed = parseRuntimeConnections(runtimeEnv(), 'dep-1')
     const results = await Promise.all(parsed.map(connection => runRuntimeProvider(connection, null, factories())))
@@ -72,7 +98,8 @@ describe('four-provider runtime configuration', () => {
     expect(results[1].nextCursor).toBeNull()
     expect(results[2].nextCursor).toBeNull()
     expect(results[3].nextCursor).toBe('2026-07-18')
-    expect(results[1].observations).toEqual([])
+    expect(results[1].observations).toHaveLength(1)
+    expect(results[1].observations[0]).toMatchObject({ domain: 'balance', providerVersion: 'investec:balance:account-1' })
     expect(results[2].observations[0].payload).toMatchObject({ accountId: 'account-1', currency: 'USD' })
     expect(results[3].observations[0].payload).toMatchObject({ accountId: 'account-1', currency: 'USD' })
   })

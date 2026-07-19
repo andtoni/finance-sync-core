@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { createInfisicalProviderSecretStore } from './infisical-secret-store'
+import { createInfisicalPlaidTokenWriter, createInfisicalProviderSecretReader, createInfisicalProviderSecretStore } from './infisical-secret-store'
 
 function env() {
   const root = mkdtempSync(join(tmpdir(), 'finance-sync-infisical-'))
@@ -26,6 +26,15 @@ describe('Infisical ProviderSecretStore', () => {
       FINANCE_SYNC_INFISICAL_SECRET_PATH: '/finance-sync/provider-connections',
     }).available).toBe(false)
     expect(() => createInfisicalProviderSecretStore({ FINANCE_SYNC_INFISICAL_BASE_URL: 'https://secrets.example.test' })).toThrow('incomplete')
+  })
+
+  it('uses independent read and Plaid-write identities and fails closed when either is absent', async () => {
+    const legacy = env()
+    const scoped = (scope: 'READER' | 'PLAID_WRITER') => Object.fromEntries(Object.entries(legacy).map(([name, value]) => [name.replace('FINANCE_SYNC_INFISICAL_', `FINANCE_SYNC_INFISICAL_${scope}_`), value]))
+    expect(createInfisicalProviderSecretReader({}).available).toBe(false)
+    expect(createInfisicalPlaidTokenWriter(scoped('READER')).available).toBe(false)
+    expect(createInfisicalProviderSecretReader(scoped('READER')).available).toBe(true)
+    expect(createInfisicalPlaidTokenWriter(scoped('PLAID_WRITER')).available).toBe(true)
   })
 
   it('authenticates one-shot and updates a deterministic secret without returning or logging values', async () => {

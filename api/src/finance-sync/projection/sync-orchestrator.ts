@@ -55,6 +55,9 @@ export async function runPlaidSyncSession(config: PlaidSyncSession): Promise<Syn
     // Build bridge operations from observations
     const operations: BridgeDisclosureOperation[] = []
     for (const obs of syncResult.observations) {
+      // This legacy session projects transaction activity only. Complete balance
+      // facts are handled atomically by the durable current-state assembler.
+      if (!obs.providerVersion.startsWith('plaid:txn:') && obs.payload.isRemoved !== true) continue
       // Map provider account ID to Wealthfolio account ID
       const p = obs.payload as Record<string, unknown>
       const providerAccountId = p.accountId as string

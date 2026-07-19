@@ -5,12 +5,16 @@ import {
   commitObservation,
   commitObservationBatch,
   bridgeOperationToWire,
+  currentStateToBridge,
   type BridgeTransport,
   type BridgeDisclosureOperation,
   type BridgeReceipt,
 } from './bridge-client'
 
-const wireOperation = { ActivityUpsert: 'activity_upsert', ActivityDelete: 'activity_delete', ProjectionFence: 'projection_fence' } as const
+const wireOperation = {
+  ActivityUpsert: 'activity_upsert', ActivityDelete: 'activity_delete',
+  ProjectionFence: 'projection_fence', CurrentStateUpsert: 'current_state_upsert',
+} as const
 const baseOperation = (overrides: Partial<BridgeDisclosureOperation> = {}): BridgeDisclosureOperation => ({
   deploymentId: 'dep-1',
   accountId: 'account-1',
@@ -24,11 +28,12 @@ const baseOperation = (overrides: Partial<BridgeDisclosureOperation> = {}): Brid
 
 function binding(fields: readonly string[]): string {
   const encoder = new TextEncoder()
-  return `v1;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
+  return `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
 }
 
 function boundReceipt(op: BridgeDisclosureOperation, overrides: Partial<BridgeReceipt> = {}): BridgeReceipt {
   const successor = op.lifecycleSuccessorId ?? null
+  const semanticHash = op.kind === 'CurrentStateUpsert' ? op.semanticHash ?? null : null
   return {
     deploymentId: op.deploymentId,
     accountId: op.accountId,
@@ -39,10 +44,12 @@ function boundReceipt(op: BridgeDisclosureOperation, overrides: Partial<BridgeRe
     resourceId: op.resourceId,
     lifecycleSuccessorId: successor,
     outcome: 'Accepted',
-    bindingVersion: 1,
+    bindingVersion: 3,
+    semanticHash,
     receiptBinding: binding([
       op.deploymentId, op.subject, op.idempotencyKey, String(op.accessGeneration), wireOperation[op.kind],
-      op.resourceId, op.accountId, successor ?? '<null>', 'accepted',
+      op.resourceId, op.accountId, successor === null ? '0' : '1', successor ?? '',
+      'accepted', semanticHash === null ? '0' : '1', semanticHash ?? '',
     ]),
     ...overrides,
   }
@@ -74,6 +81,19 @@ describe('Bridge client', () => {
     expect(op.activity).toMatchObject({ accountId: 'wf-acc-uuid-1', amount: '42.5', activityType: 'WITHDRAWAL', status: 'POSTED' })
   })
 
+  it('carries merchant context without projecting a provider hint as notes or category', () => {
+    const merchantContext = { merchantKeyVersion: 1, normalizationVersion: 1, rawDescription: 'RAW', merchantDisplay: 'Merchant', merchantKey: 'v1:key', direction: 'outflow', activityType: null, providerHint: { personalFinanceCategory: { primary: 'FOOD' } }, provenance: { source: 'provider_observation', provider: 'plaid' } }
+    const op = cashObservationToBridge({
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'merchant', payload: { transactionId: 't1', amount: '12', currency: 'USD', date: '2026-07-11', merchantContext },
+      observedAt: '2026-07-11T00:00:00.000Z',
+    }, 1, 'acc-1')
+    expect(op.activity?.merchantContext).toEqual(merchantContext)
+    expect(op.activity).not.toHaveProperty('notes')
+    expect(bridgeOperationToWire(op)).toMatchObject({ activity: { merchant_context: { merchant_key: 'v1:key', merchant_key_version: 1, normalization_version: 1 } } })
+    expect(Object.keys((bridgeOperationToWire(op).activity as Record<string, unknown>).merchant_context as object)).toEqual(['merchant_key', 'merchant_key_version', 'normalization_version'])
+  })
+
   it('normalizes Plaid negative income to deposit', () => {
     const op = cashObservationToBridge({
       deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
@@ -102,9 +122,35 @@ describe('Bridge client', () => {
     expect(posted).toMatchObject({ resourceId: 'g8:inc-1:pending', lifecycleSuccessorId: 'g8:inc-1:posted' })
   })
 
-  it('validates the complete canonical receipt binding', async () => {
+  it('serializes and receipt-binds the complete current-state payload hash', async () => {
+    const currentState = {
+      accountId: 'wf-1', providerConnectionId: 'connection-1', providerIncarnationId: 'inc-1', providerGeneration: 2,
+      observedAt: '2026-07-18T12:00:00.000Z', revision: 1784376000000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '30', liabilityBalance: '20',
+      positions: [{ symbol: 'VTI', quantity: '2', price: '40', marketValue: '80', currency: 'USD' }],
+    }
+    const { currentStateSemanticHash } = await import('./current-state')
+    expect(currentStateSemanticHash(currentState)).toBe('5ef55832c52dae3d2b629d685ea7e78472813c74430c44f4b7f791383e2ce96a')
+    const op = currentStateToBridge({ deploymentId: 'dep-1', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1' }, currentState, currentStateSemanticHash(currentState), 2, 'connection-1')
+    expect(bridgeOperationToWire(op)).toEqual({
+      idempotency_key: op.idempotencyKey,
+      subject: 'urn:wealthfolio:test#alexis', access_generation: 2, kind: 'CurrentStateUpsert', resource_id: 'dep-1:inc-1:current-state:wf-1',
+      current_state: { account_id: 'wf-1', provider_connection_id: 'connection-1', provider_incarnation_id: 'inc-1', provider_generation: 2, observed_at: '2026-07-18T12:00:00.000Z', revision: 1784376000000, as_of_date: '2026-07-18', currency: 'USD', cash_balance: '30', liability_balance: '20', positions: [{ symbol: 'VTI', quantity: '2', price: '40', market_value: '80', currency: 'USD' }] },
+      semantic_hash: op.semanticHash,
+    })
+    await expect(commitObservation(mockTransport(), op, 1)).resolves.toEqual(boundReceipt(op))
+    const mutated = { ...op, currentState: { ...currentState, cashBalance: '31' } }
+    expect(() => bridgeOperationToWire(mutated)).toThrow('payload binding mismatch')
+    await expect(commitObservation(mockTransport(), mutated, 1)).rejects.toThrow('payload binding mismatch')
+  })
+
+  it('validates receiver-canonical v3 12-field receipt vectors for every operation kind', async () => {
     const op = baseOperation()
+    expect(boundReceipt(op).receiptBinding).toBe('v3;5:dep-127:urn:wealthfolio:test#alexis5:key-11:115:activity_upsert10:resource-19:account-11:00:8:accepted1:00:')
     await expect(commitObservation(mockTransport(), op)).resolves.toEqual(boundReceipt(op))
+    for (const kind of ['ActivityUpsert', 'ActivityDelete', 'ProjectionFence'] as const) {
+      expect(boundReceipt(baseOperation({ kind })).receiptBinding).toContain('8:accepted1:00:')
+    }
     for (const receipt of [
       boundReceipt(op, { accountId: 'wrong' }),
       boundReceipt(op, { lifecycleSuccessorId: 'wrong' }),

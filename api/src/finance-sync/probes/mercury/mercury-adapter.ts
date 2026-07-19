@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { CanonicalDomain } from '../../domain'
+import { merchantContext } from '../shared/merchant-context'
 
 export function mercuryResourceKind(mercuryType: string): CanonicalDomain {
   switch (mercuryType) {
@@ -124,6 +125,8 @@ export async function runMercurySync(
   let quarantinedTransactions = 0
   let latestProviderTimestamp: number | null = null
   let paginationComplete = true
+  const snapshotObservedAt = new Date().toISOString()
+  const snapshotAsOfDate = snapshotObservedAt.slice(0, 10)
 
   let allAccounts: MercuryAccount[]
   try {
@@ -151,6 +154,7 @@ export async function runMercurySync(
       availableBalance: decimalString(account.availableBalance),
       currency: account.currency,
       status: account.status,
+      asOfDate: snapshotAsOfDate,
     }
     const balanceSemantic = [
       config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
@@ -167,7 +171,7 @@ export async function runMercurySync(
       hashSpecificationVersion: HASH_SPEC_VERSION,
       domain: balanceDomain,
       payload: Object.freeze(balancePayload) as Readonly<Record<string, unknown>>,
-      observedAt: new Date().toISOString(),
+      observedAt: snapshotObservedAt,
     })
 
     if (account.status !== 'active') continue
@@ -219,6 +223,12 @@ export async function runMercurySync(
           status,
           accountName: account.name,
           accountCurrency: account.currency,
+          merchantContext: merchantContext({
+            provider: 'mercury', rawDescription: txn.bankDescription ?? txn.counterpartyName ?? txn.note,
+            merchantDisplay: txn.counterpartyName ?? txn.bankDescription ?? txn.note, amount: txn.amount,
+            // Preserve all provider text without promoting the note to a user-editable note field.
+            providerHint: { counterpartyName: txn.counterpartyName, bankDescription: txn.bankDescription, note: txn.note },
+          }),
         }
 
         const semanticPayload = [

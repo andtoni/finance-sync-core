@@ -10,12 +10,16 @@ import {
 import {
   assertIssuerQualifiedSubject,
   bridgeOperationToWire,
+  currentStateToBridge,
   providerObservationToBridge,
   validateBridgeReceipt,
   type BridgeDisclosureOperation,
 } from './projection/bridge-client'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import { readExclusiveInput } from './secret-input'
+import { loadDurableRuntimeConnections, type ProviderSecretResolver } from './durable-connections'
+import { unavailableProviderSecretStore } from './connect-control'
+import { assembleCurrentState } from './projection/current-state'
 
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
 const MAX_PROJECTION_BATCH = 25
@@ -55,6 +59,45 @@ function bridgeHosts(env: RuntimeEnv): ReadonlySet<string> {
   return new Set(hosts)
 }
 
+const UUID_PREFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:/i
+
+/**
+ * Durable connections use `<provider-connection-uuid>:<provider-account-id>`.
+ * Non-matching IDs are retained only for isolated legacy unit paths; they can
+ * never be returned by the PostgreSQL loader.
+ */
+async function assertDurableAuthority(sql: FinanceSyncSql, deploymentId: string, connection: RuntimeConnection): Promise<void> {
+  if (!UUID_PREFIX.test(connection.connectionId)) return
+  const separator = connection.connectionId.indexOf(':')
+  const connectionId = connection.connectionId.slice(0, separator)
+  const providerAccountId = connection.connectionId.slice(separator + 1)
+  if (!providerAccountId || connection.accountIds.length !== 1 || connection.accountIds[0] !== providerAccountId) {
+    throw new Error('durable connection identity is invalid')
+  }
+  const authorized = await sql<{ authorized: number }[]>`
+    SELECT 1 AS authorized
+    FROM provider_connections pc
+    JOIN discovered_provider_accounts dpa
+      ON dpa.deployment_id = pc.deployment_id AND dpa.local_owner_id = pc.local_owner_id
+      AND dpa.connection_id = pc.connection_id
+    JOIN provider_account_admissions paa
+      ON paa.deployment_id = dpa.deployment_id AND paa.local_owner_id = dpa.local_owner_id
+      AND paa.connection_id = dpa.connection_id AND paa.provider_account_id = dpa.provider_account_id
+    WHERE pc.deployment_id = ${deploymentId} AND pc.local_owner_id = ${connection.localOwnerId}
+      AND pc.connection_id = ${connectionId}::uuid AND pc.provider = ${connection.provider}
+      AND pc.state = 'active' AND pc.disabled_at IS NULL
+      AND pc.provider_generation = ${connection.providerGeneration}
+      AND dpa.provider_account_id = ${providerAccountId}
+      AND dpa.source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+      AND dpa.discovery_generation = pc.provider_generation
+      AND paa.revoked_at IS NULL AND paa.baseline_state = 'verified'
+      AND paa.receiver_access_generation = ${connection.receiverAccessGeneration}
+      AND paa.wealthfolio_account_id = ${connection.wealthfolioAccountIds[providerAccountId]}
+    FOR SHARE OF pc, dpa, paa
+  `
+  if (authorized.length !== 1) throw new Error('durable connection authority is stale')
+}
+
 export type BridgeReceiptLookup = (operation: BridgeDisclosureOperation) => Promise<unknown | null>
 
 export function createRuntimeDependencies(
@@ -63,21 +106,25 @@ export function createRuntimeDependencies(
   env: RuntimeEnv = process.env,
   transportFactories?: ProviderTransportFactories,
   receiptLookup?: BridgeReceiptLookup,
+  secretResolver: ProviderSecretResolver = unavailableProviderSecretStore,
 ): SyncRuntimeDependencies {
-  const configured = parseRuntimeConnections(env, deploymentId)
+  // Legacy metadata is parsed only as a startup validation aid for existing
+  // deployments/tests. It is never returned by loadConnections; PostgreSQL is
+  // the sole runtime admission authority.
+  const legacyValidationOnly = parseRuntimeConnections(env, deploymentId)
   const factories = transportFactories ?? createProviderTransportFactories(env)
+  for (const connection of legacyValidationOnly) {
+    if (connection.provider === 'plaid') factories.plaid(connection)
+    else if (connection.provider === 'investec') factories.investec(connection)
+    else if (connection.provider === 'mercury') factories.mercury(connection)
+    else factories.snaptrade(connection)
+  }
   let bridgeUrl: URL | undefined
   let bridgeReceiptUrl: URL | undefined
   let bridgeToken: string | undefined
-  if (configured.length > 0) {
-    // Construct every configured provider transport at startup so endpoint and
-    // server-credential errors fail before the service reports readiness.
-    for (const connection of configured) {
-      if (connection.provider === 'plaid') factories.plaid(connection)
-      else if (connection.provider === 'investec') factories.investec(connection)
-      else if (connection.provider === 'mercury') factories.mercury(connection)
-      else factories.snaptrade(connection)
-    }
+  const bridgeInputs = [env.FINANCE_SYNC_BRIDGE_URL, env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, env.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS,
+    env.FINANCE_SYNC_BRIDGE_TOKEN, env.FINANCE_SYNC_BRIDGE_TOKEN_FILE]
+  if (bridgeInputs.some(Boolean)) {
     const allowedBridgeHosts = bridgeHosts(env)
     bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts)
     bridgeReceiptUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts)
@@ -85,16 +132,30 @@ export function createRuntimeDependencies(
   }
 
   return {
-    loadConnections: async () => configured,
-    loadCheckpoint: async connection => (
-      await sql<{ cursor: string | null }[]>`
+    loadConnections: async () => {
+      const connections = await loadDurableRuntimeConnections(sql, deploymentId, secretResolver)
+      if (connections.length > 0 && (!bridgeUrl || !bridgeReceiptUrl || !bridgeToken)) throw new Error('bridge configuration is required for admitted connections')
+      return connections
+    },
+    loadCheckpoint: async connection => {
+      await assertDurableAuthority(sql, deploymentId, connection)
+      return (await sql<{ cursor: string | null }[]>`
         SELECT cursor FROM sync_checkpoints
         WHERE deployment_id = ${deploymentId} AND connection_id = ${connection.connectionId}
-      `
-    )[0]?.cursor ?? null,
+      `)[0]?.cursor ?? null
+    },
     runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
     persistAndEnqueue: async (connection, observations) => sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
+      await assertDurableAuthority(tx, deploymentId, connection)
+      const currentStates = assembleCurrentState(connection.provider, observations, connection.accountIds.map(providerAccountId => ({
+        providerAccountId,
+        accountId: connection.wealthfolioAccountIds[providerAccountId],
+      })), {
+        providerConnectionId: connection.connectionId,
+        providerIncarnationId: connection.sourceResourceIncarnationId,
+        providerGeneration: connection.providerGeneration,
+      })
       let insertedCount = 0
       for (const observation of observations) {
         if (observation.deploymentId !== deploymentId
@@ -139,8 +200,24 @@ export function createRuntimeDependencies(
           RETURNING observation_id
         `
         insertedCount += inserted.length
-        const operation = providerObservationToBridge(connection.provider, enriched, connection.accessGeneration, wealthfolioAccountId, connection.connectionId)
+        const operation = providerObservationToBridge(connection.provider, enriched, connection.receiverAccessGeneration, wealthfolioAccountId, connection.connectionId)
         if (operation) await tx`
+          INSERT INTO projection_outbox (
+            deployment_id, local_owner_id, connection_id, idempotency_key, payload
+          ) VALUES (
+            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId},
+            ${operation.idempotencyKey}, ${tx.json(operation as never)}
+          )
+          ON CONFLICT (deployment_id, idempotency_key) DO NOTHING
+        `
+      }
+      for (const current of currentStates) {
+        const operation = currentStateToBridge({
+          deploymentId,
+          localOwnerId: connection.localOwnerId,
+          sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+        }, current.payload, current.semanticHash, connection.receiverAccessGeneration, connection.connectionId)
+        await tx`
           INSERT INTO projection_outbox (
             deployment_id, local_owner_id, connection_id, idempotency_key, payload
           ) VALUES (
@@ -156,6 +233,7 @@ export function createRuntimeDependencies(
       if (!bridgeUrl || !bridgeToken) return { delivered: 0, failed: 0 }
       return sql.begin(async transaction => {
         const tx = transaction as unknown as FinanceSyncSql
+        await assertDurableAuthority(tx, deploymentId, connection)
         const unresolvedBefore = await tx<{ count: number }[]>`
           SELECT count(*)::integer AS count
           FROM projection_outbox
@@ -279,13 +357,15 @@ export function createRuntimeDependencies(
         return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
       })
     },
-    saveCheckpoint: async (connection, cursor) => {
-      await sql`
+    saveCheckpoint: async (connection, cursor) => sql.begin(async transaction => {
+      const tx = transaction as unknown as FinanceSyncSql
+      await assertDurableAuthority(tx, deploymentId, connection)
+      await tx`
         INSERT INTO sync_checkpoints (deployment_id, connection_id, provider, cursor)
         VALUES (${deploymentId}, ${connection.connectionId}, ${connection.provider}, ${cursor})
         ON CONFLICT (deployment_id, connection_id) DO UPDATE
         SET cursor = EXCLUDED.cursor, provider = EXCLUDED.provider, updated_at = now()
       `
-    },
+    }),
   }
 }

@@ -59,7 +59,37 @@ export function createFinanceSyncHttpHandler(input: {
 
     try {
       if (request.method === 'GET' && path === '/control/v1/provider-connections') {
-        return send(response, 200, input.connect.list(rawSubject))
+        return send(response, 200, await input.connect.list(rawSubject))
+      }
+      const accounts = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/accounts$/)
+      if (request.method === 'GET' && accounts) {
+        return send(response, 200, await input.connect.pendingAccounts(rawSubject, decodeURIComponent(accounts[1])))
+      }
+      const admissionStatus = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/admissions\/([^/]+)\/([^/]+)$/)
+      if (request.method === 'GET' && admissionStatus) {
+        return send(response, 200, await input.connect.admissionStatus(rawSubject,
+          decodeURIComponent(admissionStatus[1]), decodeURIComponent(admissionStatus[2]), decodeURIComponent(admissionStatus[3])))
+      }
+      const admit = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/admit$/)
+      if (request.method === 'POST' && admit) {
+        const body = await jsonBody(request)
+        const fields = ['authenticatedSubject', 'connectionId', 'providerAccountId', 'wealthfolioAccountId', 'databaseStateDigest'] as const
+        if (!fields.every(field => typeof body[field] === 'string') || typeof body.providerGeneration !== 'number'
+          || typeof body.receiverAccessGeneration !== 'number'
+          || (body.baselineKind !== 'empty' && body.baselineKind !== 'relink')
+          || (body.priorProviderGeneration !== undefined && typeof body.priorProviderGeneration !== 'number')
+          || !Array.isArray(body.assetMappings)) {
+          throw new ConnectControlError(400, 'invalid admission request')
+        }
+        return send(response, 200, await input.connect.admit(rawSubject, decodeURIComponent(admit[1]), {
+          authenticatedSubject: body.authenticatedSubject as string,
+          connectionId: body.connectionId as string, providerAccountId: body.providerAccountId as string,
+          wealthfolioAccountId: body.wealthfolioAccountId as string, databaseStateDigest: body.databaseStateDigest as string,
+          providerGeneration: body.providerGeneration, receiverAccessGeneration: body.receiverAccessGeneration,
+          baselineKind: body.baselineKind,
+          ...(body.priorProviderGeneration === undefined ? {} : { priorProviderGeneration: body.priorProviderGeneration }),
+          assetMappings: body.assetMappings as { providerAssetId: string; wealthfolioAssetId: string }[],
+        }))
       }
       const start = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/start$/)
       if (request.method === 'POST' && start) {

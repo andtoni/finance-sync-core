@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { CanonicalDomain } from '../../domain'
+import { merchantContext } from '../shared/merchant-context'
 
 /**
  * Plaid account type → canonical resource domain mapping.
@@ -25,6 +26,11 @@ export interface PlaidTransaction {
   readonly pending_transaction_id?: string | null
   readonly iso_currency_code?: string | null
   readonly unofficial_currency_code?: string | null
+  readonly personal_finance_category?: {
+    readonly primary?: string | null
+    readonly detailed?: string | null
+    readonly confidence_level?: string | null
+  } | null
 }
 
 export interface PlaidAccount {
@@ -47,9 +53,17 @@ export interface PlaidSyncPage {
   readonly has_more: boolean
 }
 
+export interface PlaidLiabilities {
+  readonly credit?: readonly Readonly<Record<string, unknown>>[]
+  readonly loan?: readonly Readonly<Record<string, unknown>>[]
+  readonly student?: readonly Readonly<Record<string, unknown>>[]
+  readonly mortgage?: readonly Readonly<Record<string, unknown>>[]
+}
+
 export interface PlaidTransport {
   syncTransactions(accessToken: string, cursor?: string): Promise<PlaidSyncPage>
   getAccounts?(accessToken: string): Promise<readonly PlaidAccount[]>
+  getLiabilities?(accessToken: string): Promise<PlaidLiabilities>
 }
 
 export interface PlaidSyncConfig {
@@ -145,6 +159,11 @@ export async function runPlaidSync(
             plaidAccountName: acct?.name ?? null,
             plaidAccountType: acct?.type ?? null,
             accountCurrency: currency,
+            merchantContext: merchantContext({
+              provider: 'plaid', rawDescription: txn.name, merchantDisplay: txn.merchant_name ?? txn.name,
+              // Plaid's PFC is retained as provider evidence only; it is not a category assignment.
+              amount: -txn.amount, providerHint: txn.personal_finance_category ? { personalFinanceCategory: txn.personal_finance_category } : null,
+            }),
           }
           const semanticPayload = [
             config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
@@ -185,6 +204,10 @@ export async function runPlaidSync(
             pending: txn.pending ?? false,
             pendingTransactionId: txn.pending_transaction_id ?? null,
             isModified: true,
+            merchantContext: merchantContext({
+              provider: 'plaid', rawDescription: txn.name, merchantDisplay: txn.merchant_name ?? txn.name,
+              amount: -txn.amount, providerHint: txn.personal_finance_category ? { personalFinanceCategory: txn.personal_finance_category } : null,
+            }),
           }
           const semanticPayload = [
             config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
@@ -231,6 +254,47 @@ export async function runPlaidSync(
         }
 
         if (!page.has_more) {
+          const snapshotObservedAt = new Date().toISOString()
+          const liabilityAccounts = [...accountMap.values()].filter(account => account.type === 'credit' || account.type === 'loan')
+          const liabilities = liabilityAccounts.length > 0
+            ? await transport.getLiabilities?.(config.accessToken) ?? {}
+            : {}
+          const liabilityRows = [...(liabilities.credit ?? []), ...(liabilities.loan ?? []), ...(liabilities.student ?? []), ...(liabilities.mortgage ?? [])]
+          for (const accountId of config.accountIds) {
+            const account = accountMap.get(accountId)
+            if (!account || account.balances.current === null || !Number.isFinite(account.balances.current)) throw new Error('INCOMPLETE_ACCOUNT_BALANCE')
+            const accountCurrency = account.balances.iso_currency_code
+            if (!accountCurrency) throw new Error('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY')
+            const balancePayload = Object.freeze({
+              accountId,
+              currentBalance: String(account.balances.current),
+              currency: accountCurrency,
+              accountType: account.type,
+              accountSubtype: account.subtype,
+              asOfDate: snapshotObservedAt.slice(0, 10),
+            })
+            observations.push({
+              deploymentId: config.deploymentId, localOwnerId: config.localOwnerId,
+              sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+              providerVersion: `plaid:balance:${accountId}`,
+              semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'balance', JSON.stringify(balancePayload)].join('\x00')),
+              hashSpecificationVersion: HASH_SPEC_VERSION,
+              domain: plaidResourceKind(account.type), payload: balancePayload, observedAt: snapshotObservedAt,
+            })
+            if (account.type === 'credit' || account.type === 'loan') {
+              const details = liabilityRows.filter(row => row.account_id === accountId)
+              const liabilityPayload = Object.freeze({ accountId, currentBalance: String(Math.abs(account.balances.current)), currency: accountCurrency, details })
+              observations.push({
+                deploymentId: config.deploymentId, localOwnerId: config.localOwnerId,
+                sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+                providerVersion: `plaid:liability:${accountId}`,
+                semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'liability', JSON.stringify(liabilityPayload)].join('\x00')),
+                hashSpecificationVersion: HASH_SPEC_VERSION,
+                domain: 'liability', payload: liabilityPayload, observedAt: snapshotObservedAt,
+              })
+            }
+          }
+
           // Plaid can return a removal before or after the posted transaction that
           // names it as its pending predecessor. Decide suppression only after the
           // complete item drain so page ordering cannot delete the successor chain.

@@ -14,7 +14,10 @@ import {
 } from './connect-control'
 import { createFinanceSyncHttpHandler } from './connect-http'
 import { PostgresConnectSessionStore } from './connect-session-store'
-import { createInfisicalProviderSecretStore } from './infisical-secret-store'
+import { createInfisicalPlaidTokenWriter, createInfisicalProviderSecretReader } from './infisical-secret-store'
+import { PostgresOnboardingRepository } from './onboarding-repository'
+import { createNativeProviderOnboarding } from './server-onboarding'
+import { createProviderTransportFactories } from './provider-runtime'
 
 interface CliArgs { help?: boolean; once?: boolean }
 function parseArgs(argv = process.argv): CliArgs { return { help: argv.includes('--help') || argv.includes('-h'), once: argv.includes('--once') } }
@@ -22,18 +25,31 @@ async function main() {
   const args = parseArgs()
   if (args.help) { console.log(`Finance Sync Runner
 
-Runs configured read-only providers to canonical observations and a bridge outbox.
-FINANCE_SYNC_CONNECTIONS_JSON is optional; without it, the runner performs migrations/readiness only.
+Runs admitted read-only provider accounts from PostgreSQL to canonical observations and a bridge outbox.
+Provider credentials are resolved by server-side Infisical references; environment metadata is not runtime authority.
 --once runs one complete sync cycle and exits.`); return }
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
-  const deps = createRuntimeDependencies(sql, config.deploymentId)
+  const secretReader = createInfisicalProviderSecretReader(process.env)
+  const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
+  const deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
+  const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
+  const snaptrade = createSnapTradeConnectTransport(process.env)
+  const nativeOnboarding = createNativeProviderOnboarding({
+    env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
+  })
   const connect = new FinanceSyncConnectControl({
     deploymentId: config.deploymentId,
-    connections: await deps.loadConnections(config.deploymentId),
+    connections: () => deps.loadConnections(config.deploymentId),
     plaid: createPlaidConnectTransport(process.env),
-    snaptrade: createSnapTradeConnectTransport(process.env),
-    secretStore: createInfisicalProviderSecretStore(process.env),
+    snaptrade,
+    secretStore: tokenWriter,
+    nativeOnboarding,
     sessionStore: new PostgresConnectSessionStore(sql),
+    onboarding,
+    onPlaidConnected: input => onboarding.recordConnection({
+      subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
+      secretReference: input.secretReference, accounts: input.accounts,
+    }),
   })
   let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {

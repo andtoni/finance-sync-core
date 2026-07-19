@@ -15,7 +15,7 @@ const sourceId = 'b0000000-0000-0000-0000-000000000030'
 const connection: RuntimeConnection = {
   provider: 'plaid', connectionId: `connection-${runId}`, deploymentId, accessToken: 'test', localOwnerId: owner,
   sourceResourceIncarnationId: sourceId, accountIds: ['provider-account'],
-  wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, accessGeneration: 1,
+  wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, providerGeneration: 1, receiverAccessGeneration: 1,
 }
 const { accessToken: _accessToken, ...connectionMetadata } = connection
 const runtimeEnv = {
@@ -35,9 +35,19 @@ function observation(transactionId: string, payload: Record<string, unknown>): O
   }
 }
 
+function balanceObservation(): ObservationOutput {
+  return {
+    deploymentId, localOwnerId: owner, sourceResourceIncarnationId: sourceId,
+    providerVersion: 'plaid:balance:provider-account', semanticHash: 'b'.repeat(64),
+    hashSpecificationVersion: 1, domain: 'cash_ledger',
+    payload: { accountId: 'provider-account', currentBalance: '100', currency: 'USD', asOfDate: '2026-07-17' },
+    observedAt: '2026-07-17T00:00:00.000Z',
+  }
+}
+
 function binding(fields: readonly string[]): string {
   const encoder = new TextEncoder()
-  return `v1;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
+  return `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
 }
 
 suite('runtime dependencies with PostgreSQL', () => {
@@ -54,23 +64,29 @@ suite('runtime dependencies with PostgreSQL', () => {
     const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
     await sql.unsafe(`CREATE FUNCTION reject_runtime_outbox() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.deployment_id = '${deploymentId}' THEN RAISE EXCEPTION 'test crash'; END IF; RETURN NEW; END $$`)
     await sql.unsafe('CREATE TRIGGER reject_runtime_outbox BEFORE INSERT ON projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_runtime_outbox()')
-    const item = observation('atomic', { transactionId: 'atomic', accountId: 'provider-account', amount: '1', currency: 'USD', date: '2026-07-17' })
-    await expect(deps.persistAndEnqueue(connection, [item])).rejects.toThrow(/test crash/)
-    const [rolledBack] = await sql`SELECT (SELECT count(*)::int FROM raw_observations WHERE deployment_id=${deploymentId}) observations, (SELECT count(*)::int FROM projection_outbox WHERE deployment_id=${deploymentId}) outbox`
-    expect(rolledBack).toEqual({ observations: 0, outbox: 0 })
-    await sql`DROP TRIGGER reject_runtime_outbox ON projection_outbox`
-    await sql`DROP FUNCTION reject_runtime_outbox()`
-    await expect(deps.persistAndEnqueue(connection, [item])).resolves.toBe(1)
+    const items = [
+      observation('atomic', { transactionId: 'atomic', accountId: 'provider-account', amount: '1', currency: 'USD', date: '2026-07-17' }),
+      balanceObservation(),
+    ]
+    try {
+      await expect(deps.persistAndEnqueue(connection, items)).rejects.toThrow(/test crash/)
+      const [rolledBack] = await sql`SELECT (SELECT count(*)::int FROM raw_observations WHERE deployment_id=${deploymentId}) observations, (SELECT count(*)::int FROM projection_outbox WHERE deployment_id=${deploymentId}) outbox`
+      expect(rolledBack).toEqual({ observations: 0, outbox: 0 })
+    } finally {
+      await sql`DROP TRIGGER IF EXISTS reject_runtime_outbox ON projection_outbox`
+      await sql`DROP FUNCTION IF EXISTS reject_runtime_outbox()`
+    }
+    await expect(deps.persistAndEnqueue(connection, items)).resolves.toBe(2)
     const [recovered] = await sql`SELECT (SELECT count(*)::int FROM raw_observations WHERE deployment_id=${deploymentId}) observations, (SELECT count(*)::int FROM projection_outbox WHERE deployment_id=${deploymentId}) outbox`
-    expect(recovered).toEqual({ observations: 1, outbox: 1 })
+    expect(recovered).toEqual({ observations: 2, outbox: 2 })
   })
 
   it('recovers removal account identity but suppresses unresolved visible deletion', async () => {
     const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
     const original = observation('removed', { transactionId: 'removed', accountId: 'provider-account', amount: '2', currency: 'USD', date: '2026-07-17' })
-    await deps.persistAndEnqueue(connection, [original])
+    await deps.persistAndEnqueue(connection, [original, balanceObservation()])
     const removed = { ...observation('removed-tombstone', { transactionId: 'removed', isRemoved: true }), providerVersion: 'plaid:removed:removed' }
-    await expect(deps.persistAndEnqueue(connection, [removed])).resolves.toBe(1)
+    await expect(deps.persistAndEnqueue(connection, [removed, balanceObservation()])).resolves.toBe(1)
     const [counts] = await sql`SELECT
       count(*) FILTER (WHERE payload->>'kind'='ActivityDelete')::int deletes,
       (SELECT count(*)::int FROM raw_observations WHERE deployment_id=${deploymentId} AND payload->>'isRemoved'='true') removals
@@ -89,8 +105,8 @@ suite('runtime dependencies with PostgreSQL', () => {
       const wire = JSON.parse(String(init?.body)) as Record<string, unknown>
       const operation = 'activity_delete'
       const successor = null
-      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', operation, String(wire.resource_id), 'wealthfolio-account', '<null>', 'accepted']
-      return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner, idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation, resourceId: wire.resource_id, lifecycleSuccessorId: successor, outcome: 'Accepted', bindingVersion: 1, receiptBinding: binding(fields) }), { status: 200 })
+      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', operation, String(wire.resource_id), 'wealthfolio-account', '0', '', 'accepted', '0', '']
+      return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner, idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation, resourceId: wire.resource_id, lifecycleSuccessorId: successor, outcome: 'Accepted', bindingVersion: 3, receiptBinding: binding(fields), semanticHash: null }), { status: 200 })
     }) as typeof fetch
     try {
       const first = createRuntimeDependencies(sql, deploymentId, runtimeEnv)

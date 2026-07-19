@@ -1,14 +1,17 @@
 import { createHmac } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { assertIssuerQualifiedSubject } from './projection/bridge-client'
 import type { ProviderName } from './probes/provider-registry'
 import type { ProviderRuntimeEnv } from './provider-runtime'
 import type { RuntimeConnection, SnapTradeRuntimeConnection } from './runtime'
+import type { NativeProviderOnboarding } from './server-onboarding'
+import type { AdmissionMetadata, DiscoveredProviderAsset, ProviderAssetMapping } from './onboarding-repository'
 
 export const CONNECT_PROVIDERS = ['investec', 'mercury', 'plaid', 'snaptrade'] as const
 export type ConnectProvider = (typeof CONNECT_PROVIDERS)[number]
 
-export interface ProviderSecretStore {
+export interface PlaidTokenWriter {
   readonly available: boolean
   /** Authenticate and prove the durable sink is reachable before consuming a public token. */
   prepare?(): Promise<void>
@@ -16,12 +19,25 @@ export interface ProviderSecretStore {
     readonly subject: string
     readonly itemId: string
     readonly accessToken: string
-  }): Promise<void>
+  }): Promise<string>
 }
+
+export interface ProviderSecretReader {
+  readonly available: boolean
+  /** Resolve a server-side secret reference; values are never exposed by control APIs. */
+  resolve(reference: string): Promise<Readonly<Record<string, unknown>>>
+}
+
+/** @deprecated Use the separate reader and Plaid writer identities. */
+export type ProviderSecretStore = PlaidTokenWriter & ProviderSecretReader
 
 export interface PlaidConnectTransport {
   createLinkToken(subject: string): Promise<{ readonly linkToken: string }>
   exchangePublicToken(publicToken: string): Promise<{ readonly accessToken: string; readonly itemId: string }>
+  listAccounts(accessToken: string): Promise<readonly {
+    readonly providerAccountId: string; readonly name: string; readonly type: string
+    readonly currency: string; readonly mask?: string; readonly assets: readonly DiscoveredProviderAsset[]
+  }[]>
 }
 
 export interface SnapTradeConnectTransport {
@@ -35,11 +51,29 @@ export interface ConnectSessionStore {
 
 export interface ConnectControlDependencies {
   readonly deploymentId: string
-  readonly connections: readonly RuntimeConnection[]
+  readonly connections: readonly RuntimeConnection[] | (() => Promise<readonly RuntimeConnection[]>)
   readonly plaid?: PlaidConnectTransport
   readonly snaptrade?: SnapTradeConnectTransport
-  readonly secretStore: ProviderSecretStore
+  readonly secretStore: PlaidTokenWriter
   readonly sessionStore: ConnectSessionStore
+  readonly nativeOnboarding?: NativeProviderOnboarding
+  readonly onboarding?: {
+    listPending(subject: string, provider: string): Promise<readonly {
+      connectionId: string; providerGeneration: number; providerAccountId: string; name: string; type: string; currency: string; mask?: string
+      assets: readonly DiscoveredProviderAsset[]
+    }[]>
+    admit(input: {
+      subject: string; provider: string; connectionId: string; providerAccountId: string
+      wealthfolioAccountId: string; databaseStateDigest: string; providerGeneration: number
+      receiverAccessGeneration: number; baselineKind: 'empty' | 'relink'; priorProviderGeneration?: number
+      assetMappings: readonly ProviderAssetMapping[]
+    }): Promise<AdmissionMetadata>
+    reconciliationStatus(subject: string, provider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata | null>
+  }
+  readonly onPlaidConnected?: (input: {
+    readonly subject: string; readonly itemId: string; readonly secretReference: string
+    readonly accounts: Awaited<ReturnType<PlaidConnectTransport['listAccounts']>>
+  }) => Promise<void>
 }
 
 export interface ProviderConnectStatus {
@@ -62,29 +96,80 @@ function subject(value: string): string {
   catch { throw new ConnectControlError(400, 'invalid subject') }
 }
 
+/** Exact Wealthfolio empty-account attestation framing (Rust usize is 64-bit on supported hosts). */
+export function wealthfolioEmptyAccountAttestation(input: {
+  readonly authenticatedSubject: string; readonly provider: ConnectProvider
+  readonly connectionId: string; readonly providerAccountId: string; readonly wealthfolioAccountId: string
+  readonly receiverAccessGeneration: number
+}): string {
+  const hash = createHash('sha256')
+  for (const field of [
+    'wealthfolio-empty-account-attestation-v1', input.authenticatedSubject, input.provider,
+    input.connectionId, input.providerAccountId, input.wealthfolioAccountId,
+    String(input.receiverAccessGeneration), 'activities=0;snapshots=0;positions=0;valuations=0',
+  ]) {
+    const value = Buffer.from(field, 'utf8')
+    const length = Buffer.alloc(8); length.writeBigUInt64BE(BigInt(value.length))
+    hash.update(length); hash.update(value)
+  }
+  return `sha256:${hash.digest('hex')}`
+}
+
+export function wealthfolioProviderRelinkAttestation(input: {
+  readonly authenticatedSubject: string; readonly provider: ConnectProvider
+  readonly connectionId: string; readonly providerAccountId: string; readonly wealthfolioAccountId: string
+  readonly receiverAccessGeneration: number; readonly priorProviderGeneration: number
+  readonly providerGeneration: number
+}): string {
+  const hash = createHash('sha256')
+  for (const field of [
+    'wealthfolio-provider-relink-attestation-v1', input.authenticatedSubject, input.provider,
+    input.connectionId, input.providerAccountId, input.wealthfolioAccountId,
+    String(input.receiverAccessGeneration), String(input.priorProviderGeneration),
+    String(input.providerGeneration), 'existing-provider-account-and-overlays-preserved',
+  ]) {
+    const value = Buffer.from(field, 'utf8')
+    const length = Buffer.alloc(8); length.writeBigUInt64BE(BigInt(value.length))
+    hash.update(length); hash.update(value)
+  }
+  return `sha256:${hash.digest('hex')}`
+}
+
+function exactDigest(actual: string, expected: string): boolean {
+  const left = Buffer.from(actual); const right = Buffer.from(expected)
+  return left.length === right.length && timingSafeEqual(left, right)
+}
+
 export class FinanceSyncConnectControl {
   constructor(private readonly deps: ConnectControlDependencies) {}
 
-  private subjectConnections(rawSubject: string): readonly RuntimeConnection[] {
+  private async subjectConnections(rawSubject: string): Promise<readonly RuntimeConnection[]> {
     const boundSubject = subject(rawSubject)
-    return this.deps.connections.filter(connection => connection.localOwnerId === boundSubject)
+    const connections = typeof this.deps.connections === 'function'
+      ? await this.deps.connections() : this.deps.connections
+    return connections.filter(connection => connection.localOwnerId === boundSubject)
   }
 
-  list(rawSubject: string): readonly ProviderConnectStatus[] {
-    const connections = this.subjectConnections(rawSubject)
+  async list(rawSubject: string): Promise<readonly ProviderConnectStatus[]> {
+    const connections = await this.subjectConnections(rawSubject)
     return CONNECT_PROVIDERS.map(name => this.providerStatus(name, connections))
   }
 
-  status(rawSubject: string, rawProvider: string): ProviderConnectStatus {
+  async status(rawSubject: string, rawProvider: string): Promise<ProviderConnectStatus> {
     const selected = provider(rawProvider)
-    const connections = this.subjectConnections(rawSubject)
+    const connections = await this.subjectConnections(rawSubject)
     return this.providerStatus(selected, connections)
   }
 
   private providerStatus(selected: ConnectProvider, connections: readonly RuntimeConnection[]): ProviderConnectStatus {
     const configured = this.isConfigured(selected, connections)
     if (configured) return { provider: selected, status: 'configured', message: 'Provider is configured.' }
-    if (selected === 'plaid' && this.deps.plaid && this.deps.secretStore.available) return { provider: selected, status: 'available', message: 'Provider is available to connect.' }
+    if (selected === 'plaid' && this.deps.plaid && this.deps.secretStore.available && this.deps.onPlaidConnected) {
+      return { provider: selected, status: 'available', message: 'Provider is available to connect.' }
+    }
+    if (selected !== 'plaid' && this.deps.nativeOnboarding?.available(selected)) {
+      return { provider: selected, status: 'available', message: 'Provider is available to connect.' }
+    }
     return { provider: selected, status: 'not_configured', message: 'Provider is not configured.' }
   }
 
@@ -95,13 +180,24 @@ export class FinanceSyncConnectControl {
   async start(rawSubject: string, rawProvider: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
     const selected = provider(rawProvider)
-    const connections = this.subjectConnections(boundSubject)
+    const connections = await this.subjectConnections(boundSubject)
+    if (selected !== 'plaid' && !connections.some(connection => connection.provider === selected)
+      && this.deps.nativeOnboarding?.available(selected)) {
+      try {
+        const result = await this.deps.nativeOnboarding.discover(boundSubject, selected)
+        return result.status === 'link_ready'
+          ? { provider: selected, status: 'link_ready', message: 'SnapTrade authorization is ready.', redirectUrl: result.redirectUrl }
+          : { provider: selected, status: 'pending', message: `Choose the ${selected} accounts to add.` }
+      } catch {
+        throw new ConnectControlError(502, 'provider discovery failed')
+      }
+    }
     if (selected === 'investec' || selected === 'mercury') {
       if (!connections.some(connection => connection.provider === selected)) throw new ConnectControlError(409, 'provider is not configured')
       return { provider: selected, status: 'configured', message: 'Provider is configured.' }
     }
     if (selected === 'plaid') {
-      if (!this.deps.plaid || !this.deps.secretStore.available) throw new ConnectControlError(503, 'provider is unavailable')
+      if (!this.deps.plaid || !this.deps.secretStore.available || !this.deps.onPlaidConnected) throw new ConnectControlError(503, 'provider is unavailable')
       const result = await this.deps.plaid.createLinkToken(boundSubject)
       if (!result.linkToken) throw new ConnectControlError(502, 'provider returned an invalid response')
       const continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid' })
@@ -117,14 +213,81 @@ export class FinanceSyncConnectControl {
   async completePlaid(rawSubject: string, publicToken: string, continuationToken: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
     if (!publicToken || !continuationToken) throw new ConnectControlError(400, 'completion tokens are required')
-    if (!this.deps.plaid || !this.deps.secretStore.available) throw new ConnectControlError(503, 'provider is unavailable')
+    if (!this.deps.plaid || !this.deps.secretStore.available || !this.deps.onPlaidConnected) throw new ConnectControlError(503, 'provider is unavailable')
     await this.deps.secretStore.prepare?.()
     const consumed = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken })
     if (!consumed) throw new ConnectControlError(409, 'link session is invalid or already used')
     const exchanged = await this.deps.plaid.exchangePublicToken(publicToken)
     if (!exchanged.accessToken || !exchanged.itemId) throw new ConnectControlError(502, 'provider returned an invalid response')
-    await this.deps.secretStore.storePlaidAccessToken({ subject: boundSubject, itemId: exchanged.itemId, accessToken: exchanged.accessToken })
-    return { provider: 'plaid', status: 'configured', message: 'Plaid connection was stored.' }
+    const secretReference = await this.deps.secretStore.storePlaidAccessToken({ subject: boundSubject, itemId: exchanged.itemId, accessToken: exchanged.accessToken })
+    const accounts = await this.deps.plaid.listAccounts(exchanged.accessToken)
+    if (accounts.length === 0) throw new ConnectControlError(502, 'provider returned no accounts')
+    await this.deps.onPlaidConnected({ subject: boundSubject, itemId: exchanged.itemId, secretReference, accounts })
+    return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
+  }
+
+  async pendingAccounts(rawSubject: string, rawProvider: string): Promise<readonly {
+    connectionId: string; providerGeneration: number; providerAccountId: string; name: string; type: string; currency: string; mask?: string
+    assets: readonly DiscoveredProviderAsset[]
+  }[]> {
+    const boundSubject = subject(rawSubject)
+    const selected = provider(rawProvider)
+    if (!this.deps.onboarding) throw new ConnectControlError(503, 'provider onboarding is unavailable')
+    return this.deps.onboarding.listPending(boundSubject, selected)
+  }
+
+  async admit(rawSubject: string, rawProvider: string, input: {
+    authenticatedSubject: string; connectionId: string; providerAccountId: string; wealthfolioAccountId: string
+    databaseStateDigest: string; providerGeneration: number; receiverAccessGeneration: number
+    baselineKind: 'empty' | 'relink'; priorProviderGeneration?: number
+    assetMappings: readonly ProviderAssetMapping[]
+  }): Promise<AdmissionMetadata> {
+    const boundSubject = subject(rawSubject)
+    const selected = provider(rawProvider)
+    if (!this.deps.onboarding) throw new ConnectControlError(503, 'provider onboarding is unavailable')
+    for (const value of [input.authenticatedSubject, input.connectionId, input.providerAccountId, input.wealthfolioAccountId, input.databaseStateDigest]) {
+      if (!value || value.length > 512 || value.includes('\0')) throw new ConnectControlError(400, 'invalid admission request')
+    }
+    if (input.authenticatedSubject !== boundSubject
+      || !Number.isSafeInteger(input.providerGeneration) || input.providerGeneration < 1
+      || !Number.isSafeInteger(input.receiverAccessGeneration) || input.receiverAccessGeneration < 1
+      || (input.baselineKind !== 'empty' && input.baselineKind !== 'relink')
+      || !Array.isArray(input.assetMappings) || input.assetMappings.some(mapping => !mapping || typeof mapping.providerAssetId !== 'string'
+        || typeof mapping.wealthfolioAssetId !== 'string')) {
+      throw new ConnectControlError(400, 'invalid admission request')
+    }
+    let expected: string
+    if (input.baselineKind === 'empty') {
+      if (input.priorProviderGeneration !== undefined) throw new ConnectControlError(400, 'invalid admission request')
+      expected = wealthfolioEmptyAccountAttestation({ ...input, provider: selected })
+    } else {
+      if (!Number.isSafeInteger(input.priorProviderGeneration) || input.priorProviderGeneration! < 1
+        || input.priorProviderGeneration! >= input.providerGeneration) {
+        throw new ConnectControlError(400, 'invalid admission request')
+      }
+      expected = wealthfolioProviderRelinkAttestation({
+        ...input, provider: selected, priorProviderGeneration: input.priorProviderGeneration!,
+      })
+    }
+    if (!exactDigest(input.databaseStateDigest, expected)) throw new ConnectControlError(409, 'provider account could not be admitted')
+    try { return await this.deps.onboarding.admit({
+      subject: boundSubject, provider: selected, connectionId: input.connectionId,
+      providerAccountId: input.providerAccountId, wealthfolioAccountId: input.wealthfolioAccountId,
+      databaseStateDigest: input.databaseStateDigest, providerGeneration: input.providerGeneration,
+      receiverAccessGeneration: input.receiverAccessGeneration, baselineKind: input.baselineKind,
+      ...(input.priorProviderGeneration === undefined ? {} : { priorProviderGeneration: input.priorProviderGeneration }),
+      assetMappings: input.assetMappings,
+    }) }
+    catch { throw new ConnectControlError(409, 'provider account could not be admitted') }
+  }
+
+  async admissionStatus(rawSubject: string, rawProvider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata> {
+    const boundSubject = subject(rawSubject)
+    const selected = provider(rawProvider)
+    if (!this.deps.onboarding || !connectionId || !providerAccountId) throw new ConnectControlError(400, 'invalid admission status request')
+    const metadata = await this.deps.onboarding.reconciliationStatus(boundSubject, selected, connectionId, providerAccountId)
+    if (!metadata) throw new ConnectControlError(404, 'admission not found')
+    return metadata
   }
 
   async disconnect(rawSubject: string, rawProvider: string): Promise<never> {
@@ -175,7 +338,7 @@ export function createPlaidConnectTransport(env: ProviderRuntimeEnv = process.en
   return {
     async createLinkToken(boundSubject) {
       const value = await post('/link/token/create', {
-        user: { client_user_id: boundSubject }, client_name: 'Finance Sync', products: ['transactions'],
+        user: { client_user_id: boundSubject }, client_name: 'Finance Sync', products: ['transactions', 'liabilities'],
         country_codes: ['US'], language: 'en',
       })
       if (typeof value.link_token !== 'string' || !value.link_token) throw new ConnectControlError(502, 'provider returned an invalid response')
@@ -187,6 +350,26 @@ export function createPlaidConnectTransport(env: ProviderRuntimeEnv = process.en
         throw new ConnectControlError(502, 'provider returned an invalid response')
       }
       return { accessToken: value.access_token, itemId: value.item_id }
+    },
+    async listAccounts(accessToken) {
+      const value = await post('/accounts/get', { access_token: accessToken })
+      if (!Array.isArray(value.accounts)) throw new ConnectControlError(502, 'provider returned an invalid response')
+      return value.accounts.map(item => {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) throw new ConnectControlError(502, 'provider returned an invalid response')
+        const account = item as Record<string, unknown>
+        const balances = account.balances && typeof account.balances === 'object' && !Array.isArray(account.balances)
+          ? account.balances as Record<string, unknown> : {}
+        const providerAccountId = account.account_id
+        const name = account.official_name ?? account.name
+        const type = account.subtype ?? account.type
+        const currency = balances.iso_currency_code ?? balances.unofficial_currency_code
+        if (typeof providerAccountId !== 'string' || !providerAccountId || typeof name !== 'string' || !name
+          || typeof type !== 'string' || !type || typeof currency !== 'string' || !currency) {
+          throw new ConnectControlError(502, 'provider returned an invalid response')
+        }
+        if (account.mask !== undefined && account.mask !== null && typeof account.mask !== 'string') throw new ConnectControlError(502, 'provider returned an invalid response')
+        return { providerAccountId, name, type, currency, assets: [], ...(typeof account.mask === 'string' ? { mask: account.mask } : {}) }
+      })
     },
   }
 }
@@ -228,6 +411,7 @@ export function createSnapTradeConnectTransport(env: ProviderRuntimeEnv = proces
 export const unavailableProviderSecretStore: ProviderSecretStore = {
   available: false,
   async storePlaidAccessToken() { throw new ConnectControlError(503, 'provider secret store is unavailable') },
+  async resolve() { throw new ConnectControlError(503, 'provider secret store is unavailable') },
 }
 
 export function isProviderName(value: string): value is ProviderName {

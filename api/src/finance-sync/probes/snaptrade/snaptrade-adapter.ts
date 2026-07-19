@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { CanonicalDomain } from '../../domain'
+import { merchantContext } from '../shared/merchant-context'
 
 // ─── Domain mapping ────────────────────────────────────────────────────────────
 
@@ -22,7 +23,10 @@ export function snaptradeResourceKind(resource: {
 // ─── SnapTrade raw API shapes ───────────────────────────────────────────────────
 
 export interface SnapTradeRawSymbol {
-  readonly symbol?: string | { readonly symbol?: string }
+  readonly id?: string
+  readonly universal_symbol_id?: string
+  readonly universal_symbol?: { readonly id?: string }
+  readonly symbol?: string | { readonly id?: string; readonly symbol?: string }
   readonly ticker?: string
   readonly name?: string
   readonly currency?: { readonly code?: string }
@@ -135,6 +139,7 @@ export interface SnapTradeNormalizedAccount {
 
 export interface SnapTradeNormalizedHolding {
   readonly accountId: string
+  readonly providerAssetId: string | null
   readonly symbol: string
   readonly name: string | null
   readonly units: string
@@ -332,6 +337,8 @@ export function normalizeHoldings(
 
     return {
       accountId,
+      providerAssetId: pos.symbol?.id ?? (typeof pos.symbol?.symbol === 'object' ? pos.symbol.symbol.id : undefined)
+        ?? pos.symbol?.universal_symbol_id ?? pos.symbol?.universal_symbol?.id ?? null,
       symbol,
       name: name ?? symbol,
       units,
@@ -477,6 +484,7 @@ export async function runSnapTradeSync(
       const domain: CanonicalDomain = h.instrumentTypeTag === 'cash' ? 'cash_ledger' : 'holding'
       const payload = {
         accountId: h.accountId,
+        providerAssetId: h.providerAssetId,
         symbol: h.symbol,
         name: h.name,
         units: h.units,
@@ -545,6 +553,12 @@ export async function runSnapTradeSync(
         currency: a.currency,
         date: a.date,
         description: a.description,
+        merchantContext: merchantContext({
+          provider: 'snaptrade', rawDescription: a.description, merchantDisplay: a.description,
+          activityType: a.type,
+          // Explicit brokerage provenance keeps these semantics out of household spending categorisation.
+          providerHint: { lane: 'brokerage', symbol: a.symbol },
+        }),
       }
       const semanticPayload = [
         config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,

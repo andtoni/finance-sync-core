@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
