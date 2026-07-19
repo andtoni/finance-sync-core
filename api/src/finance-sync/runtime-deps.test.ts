@@ -121,6 +121,23 @@ describe('createRuntimeDependencies startup validation', () => {
   })
 })
 
+describe('checkpoint generation identity', () => {
+  it('uses provider generation in checkpoint reads, writes, and conflict identity', async () => {
+    const queries: string[] = []
+    const sql = (async (strings: TemplateStringsArray) => {
+      queries.push(strings.join('?'))
+      return []
+    }) as unknown as FinanceSyncSql
+    ;(sql as unknown as { begin: (fn: (tx: FinanceSyncSql) => Promise<unknown>) => Promise<unknown> }).begin = fn => fn(sql)
+    const deps = createRuntimeDependencies(sql, 'dep-1', env())
+    await expect(deps.loadCheckpoint(CONNECTION)).resolves.toBeNull()
+    await deps.saveCheckpoint(CONNECTION, 'cursor-1')
+    expect(queries.find(query => /SELECT cursor FROM sync_checkpoints/i.test(query))).toMatch(/provider_generation/i)
+    expect(queries.find(query => /INSERT INTO sync_checkpoints/i.test(query)))
+      .toMatch(/ON CONFLICT \(deployment_id, connection_id, provider_generation\)/i)
+  })
+})
+
 describe('persistAndEnqueue current-state contract', () => {
   it('enqueues transaction activity unchanged plus one atomic complete current-state payload', async () => {
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000099', payload: {
@@ -144,6 +161,8 @@ describe('persistAndEnqueue current-state contract', () => {
       asOfDate: '2026-07-18', currency: 'USD', cashBalance: '95', liabilityBalance: '0', positions: [],
     })
     expect(fixture.enqueued[1].semanticHash).toMatch(/^[a-f0-9]{64}$/)
+    expect(fixture.queries.filter(query => /INSERT\s+INTO\s+projection_outbox/i.test(query))
+      .every(query => /provider_generation/i.test(query))).toBe(true)
   })
 })
 
@@ -167,6 +186,8 @@ describe('projectPending transaction and receipt contract', () => {
       await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 1, failed: 0 })
       expect(fixture.state()).toBe('delivered')
       expect(fixture.queries.some(query => /FOR UPDATE SKIP LOCKED/i.test(query))).toBe(true)
+      expect(fixture.queries.filter(query => /projection_outbox/i.test(query))
+        .every(query => /provider_generation/i.test(query))).toBe(true)
     } finally {
       globalThis.fetch = originalFetch
     }

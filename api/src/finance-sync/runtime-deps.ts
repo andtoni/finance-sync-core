@@ -90,6 +90,7 @@ async function assertDurableAuthority(sql: FinanceSyncSql, deploymentId: string,
       AND dpa.provider_account_id = ${providerAccountId}
       AND dpa.source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
       AND dpa.discovery_generation = pc.provider_generation
+      AND paa.provider_generation = pc.provider_generation
       AND paa.revoked_at IS NULL AND paa.baseline_state = 'verified'
       AND paa.receiver_access_generation = ${connection.receiverAccessGeneration}
       AND paa.wealthfolio_account_id = ${connection.wealthfolioAccountIds[providerAccountId]}
@@ -142,6 +143,7 @@ export function createRuntimeDependencies(
       return (await sql<{ cursor: string | null }[]>`
         SELECT cursor FROM sync_checkpoints
         WHERE deployment_id = ${deploymentId} AND connection_id = ${connection.connectionId}
+          AND provider_generation = ${connection.providerGeneration}
       `)[0]?.cursor ?? null
     },
     runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
@@ -203,12 +205,12 @@ export function createRuntimeDependencies(
         const operation = providerObservationToBridge(connection.provider, enriched, connection.receiverAccessGeneration, wealthfolioAccountId, connection.connectionId)
         if (operation) await tx`
           INSERT INTO projection_outbox (
-            deployment_id, local_owner_id, connection_id, idempotency_key, payload
+            deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
           ) VALUES (
-            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId},
+            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
             ${operation.idempotencyKey}, ${tx.json(operation as never)}
           )
-          ON CONFLICT (deployment_id, idempotency_key) DO NOTHING
+          ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
         `
       }
       for (const current of currentStates) {
@@ -219,12 +221,12 @@ export function createRuntimeDependencies(
         }, current.payload, current.semanticHash, connection.receiverAccessGeneration, connection.connectionId)
         await tx`
           INSERT INTO projection_outbox (
-            deployment_id, local_owner_id, connection_id, idempotency_key, payload
+            deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
           ) VALUES (
-            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId},
+            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
             ${operation.idempotencyKey}, ${tx.json(operation as never)}
           )
-          ON CONFLICT (deployment_id, idempotency_key) DO NOTHING
+          ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
         `
       }
       return insertedCount
@@ -239,6 +241,7 @@ export function createRuntimeDependencies(
           FROM projection_outbox
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
+            AND provider_generation = ${connection.providerGeneration}
             AND state = 'dead_letter'
         `
         if ((unresolvedBefore[0]?.count ?? 0) > 0) return { delivered: 0, failed: unresolvedBefore[0].count }
@@ -250,6 +253,7 @@ export function createRuntimeDependencies(
           FROM projection_outbox
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
+            AND provider_generation = ${connection.providerGeneration}
             AND state IN ('pending', 'uncertain')
           ORDER BY created_at
           LIMIT ${MAX_PROJECTION_BATCH}
@@ -262,6 +266,7 @@ export function createRuntimeDependencies(
               SET state = 'delivered', delivered_at = now(), attempts = attempts + 1,
                   last_error = NULL, dead_lettered_at = NULL, dead_letter_reason = NULL
               WHERE id = ${row.id}::uuid
+                AND provider_generation = ${connection.providerGeneration}
             `
             delivered++
           }
@@ -308,6 +313,7 @@ export function createRuntimeDependencies(
               UPDATE projection_outbox
               SET attempts = attempts + 1, last_error = 'BRIDGE_RESPONSE_UNCERTAIN', state = 'uncertain'
               WHERE id = ${row.id}::uuid
+                AND provider_generation = ${connection.providerGeneration}
             `
             deliveryFailures++
             continue
@@ -321,11 +327,13 @@ export function createRuntimeDependencies(
                 SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED', state = 'dead_letter',
                     dead_lettered_at = now(), dead_letter_reason = 'BRIDGE_HTTP_REJECTED'
                 WHERE id = ${row.id}::uuid
+                  AND provider_generation = ${connection.providerGeneration}
               `
             } else {
               await tx`
                 UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED'
                 WHERE id = ${row.id}::uuid
+                  AND provider_generation = ${connection.providerGeneration}
               `
             }
             deliveryFailures++
@@ -343,6 +351,7 @@ export function createRuntimeDependencies(
               UPDATE projection_outbox
               SET attempts = attempts + 1, last_error = 'BRIDGE_RECEIPT_UNCERTAIN', state = 'uncertain'
               WHERE id = ${row.id}::uuid
+                AND provider_generation = ${connection.providerGeneration}
             `
             deliveryFailures++
           }
@@ -352,6 +361,7 @@ export function createRuntimeDependencies(
           FROM projection_outbox
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
+            AND provider_generation = ${connection.providerGeneration}
             AND state IN ('pending', 'uncertain', 'dead_letter')
         `
         return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
@@ -361,9 +371,9 @@ export function createRuntimeDependencies(
       const tx = transaction as unknown as FinanceSyncSql
       await assertDurableAuthority(tx, deploymentId, connection)
       await tx`
-        INSERT INTO sync_checkpoints (deployment_id, connection_id, provider, cursor)
-        VALUES (${deploymentId}, ${connection.connectionId}, ${connection.provider}, ${cursor})
-        ON CONFLICT (deployment_id, connection_id) DO UPDATE
+        INSERT INTO sync_checkpoints (deployment_id, connection_id, provider_generation, provider, cursor)
+        VALUES (${deploymentId}, ${connection.connectionId}, ${connection.providerGeneration}, ${connection.provider}, ${cursor})
+        ON CONFLICT (deployment_id, connection_id, provider_generation) DO UPDATE
         SET cursor = EXCLUDED.cursor, provider = EXCLUDED.provider, updated_at = now()
       `
     }),

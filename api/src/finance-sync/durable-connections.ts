@@ -51,6 +51,7 @@ export async function loadDurableRuntimeConnections(
       AND pc.state = 'active'
       AND pc.disabled_at IS NULL
       AND dpa.discovery_generation = pc.provider_generation
+      AND paa.provider_generation = pc.provider_generation
       AND paa.revoked_at IS NULL
       AND paa.baseline_state = 'verified'
     ORDER BY pc.connection_id, dpa.provider_account_id
