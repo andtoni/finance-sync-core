@@ -17,6 +17,9 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/provider_account_admissions[\s\S]*provider_generation/i);
     expect(sql).toMatch(/PRIMARY KEY \(deployment_id, connection_id, provider_generation\)/i);
     expect(sql).toMatch(/UNIQUE \(deployment_id, connection_id, provider_generation, idempotency_key\)/i);
+    expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS provider_generation integer NOT NULL DEFAULT 1/i);
+    expect(sql).toMatch(/UPDATE sync_checkpoints[\s\S]*LIKE pc\.connection_id::text \|\| ':%'/i);
+    expect(sql).toMatch(/legacy projection outbox row has no unambiguous provider connection generation/i);
     expect(sql).toMatch(/state = 'dead_letter'[\s\S]*PROVIDER_GENERATION_SUPERSEDED/i);
     expect(sql).toMatch(/provider_generation = OLD\.provider_generation/i);
   });

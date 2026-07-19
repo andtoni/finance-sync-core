@@ -20,7 +20,54 @@ ALTER TABLE provider_account_admissions
   CHECK (provider_generation > 0);
 
 ALTER TABLE sync_checkpoints
-  ADD COLUMN IF NOT EXISTS provider_generation integer NOT NULL DEFAULT 1;
+  ADD COLUMN IF NOT EXISTS provider_generation integer;
+ALTER TABLE projection_outbox
+  ADD COLUMN IF NOT EXISTS provider_generation integer;
+
+-- Runtime connection IDs are `<provider-connection-uuid>:<provider-account-id>`.
+-- Refuse to guess when legacy durable work has no unique provider connection.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM sync_checkpoints sc
+    WHERE sc.provider_generation IS NULL
+      AND (SELECT count(*)
+           FROM provider_connections pc
+           WHERE pc.deployment_id = sc.deployment_id
+             AND sc.connection_id LIKE pc.connection_id::text || ':%') <> 1
+  ) THEN
+    RAISE EXCEPTION 'legacy sync checkpoint has no unambiguous provider connection generation';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM projection_outbox po
+    WHERE po.provider_generation IS NULL
+      AND (SELECT count(*)
+           FROM provider_connections pc
+           WHERE pc.deployment_id = po.deployment_id
+             AND po.connection_id LIKE pc.connection_id::text || ':%') <> 1
+  ) THEN
+    RAISE EXCEPTION 'legacy projection outbox row has no unambiguous provider connection generation';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+UPDATE sync_checkpoints sc
+SET provider_generation = pc.provider_generation
+FROM provider_connections pc
+WHERE sc.provider_generation IS NULL
+  AND pc.deployment_id = sc.deployment_id
+  AND sc.connection_id LIKE pc.connection_id::text || ':%';
+UPDATE projection_outbox po
+SET provider_generation = pc.provider_generation
+FROM provider_connections pc
+WHERE po.provider_generation IS NULL
+  AND pc.deployment_id = po.deployment_id
+  AND po.connection_id LIKE pc.connection_id::text || ':%';
+
+ALTER TABLE sync_checkpoints
+  ALTER COLUMN provider_generation SET NOT NULL;
 ALTER TABLE sync_checkpoints
   DROP CONSTRAINT IF EXISTS sync_checkpoints_pkey;
 ALTER TABLE sync_checkpoints
@@ -30,7 +77,7 @@ ALTER TABLE sync_checkpoints
   CHECK (provider_generation > 0);
 
 ALTER TABLE projection_outbox
-  ADD COLUMN IF NOT EXISTS provider_generation integer NOT NULL DEFAULT 1;
+  ALTER COLUMN provider_generation SET NOT NULL;
 ALTER TABLE projection_outbox
   DROP CONSTRAINT IF EXISTS projection_outbox_deployment_id_idempotency_key_key;
 ALTER TABLE projection_outbox
