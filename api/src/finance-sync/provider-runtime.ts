@@ -9,8 +9,8 @@ import { readExclusiveInput } from './secret-input'
 
 const PROVIDERS = new Set<ProviderName>(['investec', 'mercury', 'plaid', 'snaptrade'])
 const HOSTS: Record<ProviderName, ReadonlySet<string>> = {
-  investec: new Set(['openapi.investec.com']),
-  mercury: new Set(['api.mercury.com']),
+  investec: new Set(['openapi.investec.com', 'openapisandbox.investec.com']),
+  mercury: new Set(['api.mercury.com', 'api-sandbox.mercury.com']),
   plaid: new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com']),
   snaptrade: new Set(['api.snaptrade.com']),
 }

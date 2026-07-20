@@ -66,6 +66,22 @@ describe('four-provider runtime configuration', () => {
     expect(() => parseRuntimeConnections(runtimeEnv([{ ...configurations[0], wealthfolioAccountIds: {} }]), 'dep-1')).toThrow('every provider account')
   })
 
+  it('admits the documented Investec and Mercury sandbox origins without broadening host trust', () => {
+    const parsed = parseRuntimeConnections(runtimeEnv(), 'dep-1')
+    const investec = parsed.find(connection => connection.provider === 'investec')
+    const mercury = parsed.find(connection => connection.provider === 'mercury')
+    if (!investec || investec.provider !== 'investec' || !mercury || mercury.provider !== 'mercury') throw new Error('missing provider fixtures')
+    expect(() => createProviderTransportFactories({
+      FINANCE_SYNC_INVESTEC_URL: 'https://openapisandbox.investec.com',
+    }).investec(investec)).not.toThrow()
+    expect(() => createProviderTransportFactories({
+      FINANCE_SYNC_MERCURY_URL: 'https://api-sandbox.mercury.com',
+    }).mercury(mercury)).not.toThrow()
+    expect(() => createProviderTransportFactories({
+      FINANCE_SYNC_MERCURY_URL: 'https://api-sandbox.mercury.com.attacker.invalid',
+    }).mercury(mercury)).toThrow('host is not allowed')
+  })
+
   it('uses both Plaid transactions and liabilities runtime requests', async () => {
     const requests: string[] = []
     const originalFetch = globalThis.fetch
