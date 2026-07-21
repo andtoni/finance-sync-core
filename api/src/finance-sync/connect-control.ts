@@ -1,5 +1,4 @@
 import { createHmac } from 'node:crypto'
-import { readFileSync } from 'node:fs'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { assertIssuerQualifiedSubject } from './projection/bridge-client'
 import type { ProviderName } from './probes/provider-registry'
@@ -13,11 +12,16 @@ export type ConnectProvider = (typeof CONNECT_PROVIDERS)[number]
 
 export interface PlaidTokenWriter {
   readonly available: boolean
+  /** Exact non-secret pre-provisioned destination slots; writer never derives one. */
+  readonly allowedSlots: readonly string[]
   /** Authenticate and prove the durable sink is reachable before consuming a public token. */
   prepare?(): Promise<void>
   storePlaidAccessToken(input: {
     readonly subject: string
     readonly itemId: string
+    readonly secretReference: string
+    readonly clientId: string
+    readonly clientSecret: string
     readonly accessToken: string
   }): Promise<string>
 }
@@ -33,7 +37,9 @@ export type ProviderSecretStore = PlaidTokenWriter & ProviderSecretReader
 
 export interface PlaidConnectTransport {
   createLinkToken(subject: string): Promise<{ readonly linkToken: string }>
-  exchangePublicToken(publicToken: string): Promise<{ readonly accessToken: string; readonly itemId: string }>
+  exchangePublicToken(publicToken: string): Promise<{
+    readonly clientId: string; readonly clientSecret: string; readonly accessToken: string; readonly itemId: string
+  }>
   listAccounts(accessToken: string): Promise<readonly {
     readonly providerAccountId: string; readonly name: string; readonly type: string
     readonly currency: string; readonly mask?: string; readonly assets: readonly DiscoveredProviderAsset[]
@@ -45,8 +51,11 @@ export interface SnapTradeConnectTransport {
 }
 
 export interface ConnectSessionStore {
-  create(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid' }): Promise<string>
-  consume(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string }): Promise<boolean>
+  /** Returns undefined only when another live continuation owns this exact slot. */
+  create(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly secretReference: string }): Promise<string | undefined>
+  consume(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string }): Promise<string | undefined>
+  /** Releases the slot lease after Link bootstrap or completion success/failure. */
+  release(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string }): Promise<void>
 }
 
 export interface ConnectControlDependencies {
@@ -143,11 +152,14 @@ function exactDigest(actual: string, expected: string): boolean {
 export class FinanceSyncConnectControl {
   constructor(private readonly deps: ConnectControlDependencies) {}
 
+  private async allConnections(): Promise<readonly RuntimeConnection[]> {
+    return typeof this.deps.connections === 'function'
+      ? await this.deps.connections() : this.deps.connections
+  }
+
   private async subjectConnections(rawSubject: string): Promise<readonly RuntimeConnection[]> {
     const boundSubject = subject(rawSubject)
-    const connections = typeof this.deps.connections === 'function'
-      ? await this.deps.connections() : this.deps.connections
-    return connections.filter(connection => connection.localOwnerId === boundSubject)
+    return (await this.allConnections()).filter(connection => connection.localOwnerId === boundSubject)
   }
 
   async list(rawSubject: string): Promise<readonly ProviderConnectStatus[]> {
@@ -180,7 +192,8 @@ export class FinanceSyncConnectControl {
   async start(rawSubject: string, rawProvider: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
     const selected = provider(rawProvider)
-    const connections = await this.subjectConnections(boundSubject)
+    const allConnections = await this.allConnections()
+    const connections = allConnections.filter(connection => connection.localOwnerId === boundSubject)
     if (selected !== 'plaid' && !connections.some(connection => connection.provider === selected)
       && this.deps.nativeOnboarding?.available(selected)) {
       try {
@@ -198,10 +211,25 @@ export class FinanceSyncConnectControl {
     }
     if (selected === 'plaid') {
       if (!this.deps.plaid || !this.deps.secretStore.available || !this.deps.onPlaidConnected) throw new ConnectControlError(503, 'provider is unavailable')
-      const result = await this.deps.plaid.createLinkToken(boundSubject)
-      if (!result.linkToken) throw new ConnectControlError(502, 'provider returned an invalid response')
-      const continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid' })
-      return { provider: selected, status: 'link_ready', message: 'Plaid Link is ready.', linkToken: result.linkToken, continuationToken }
+      // Writer slots are deployment-global. Exclude every active Plaid slot,
+      // not only the authenticated subject's, to prevent cross-subject overwrite.
+      const activeSlots = new Set(allConnections.filter((connection): connection is Extract<RuntimeConnection, { provider: 'plaid' }> => connection.provider === 'plaid')
+        .map(connection => connection.secretReference).filter((reference): reference is string => !!reference))
+      const candidates = this.deps.secretStore.allowedSlots.filter(slot => !activeSlots.has(slot))
+      let continuationToken: string | undefined
+      for (const secretReference of candidates) {
+        continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', secretReference })
+        if (continuationToken) break
+      }
+      if (!continuationToken) throw new ConnectControlError(409, 'no unallocated Plaid credential slot is available')
+      try {
+        const result = await this.deps.plaid.createLinkToken(boundSubject)
+        if (!result.linkToken) throw new ConnectControlError(502, 'provider returned an invalid response')
+        return { provider: selected, status: 'link_ready', message: 'Plaid Link is ready.', linkToken: result.linkToken, continuationToken }
+      } catch (error) {
+        try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken }) } catch { /* expiry is the fallback lease recovery */ }
+        throw error
+      }
     }
     const connection = connections.find((item): item is SnapTradeRuntimeConnection => item.provider === 'snaptrade')
     if (!connection || !this.deps.snaptrade) throw new ConnectControlError(409, 'provider is not configured')
@@ -215,15 +243,26 @@ export class FinanceSyncConnectControl {
     if (!publicToken || !continuationToken) throw new ConnectControlError(400, 'completion tokens are required')
     if (!this.deps.plaid || !this.deps.secretStore.available || !this.deps.onPlaidConnected) throw new ConnectControlError(503, 'provider is unavailable')
     await this.deps.secretStore.prepare?.()
-    const consumed = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken })
-    if (!consumed) throw new ConnectControlError(409, 'link session is invalid or already used')
-    const exchanged = await this.deps.plaid.exchangePublicToken(publicToken)
-    if (!exchanged.accessToken || !exchanged.itemId) throw new ConnectControlError(502, 'provider returned an invalid response')
-    const secretReference = await this.deps.secretStore.storePlaidAccessToken({ subject: boundSubject, itemId: exchanged.itemId, accessToken: exchanged.accessToken })
-    const accounts = await this.deps.plaid.listAccounts(exchanged.accessToken)
-    if (accounts.length === 0) throw new ConnectControlError(502, 'provider returned no accounts')
-    await this.deps.onPlaidConnected({ subject: boundSubject, itemId: exchanged.itemId, secretReference, accounts })
-    return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
+    const secretReference = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken })
+    if (!secretReference || !this.deps.secretStore.allowedSlots.includes(secretReference)) throw new ConnectControlError(409, 'link session is invalid or already used')
+    const release = async () => { try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken }) } catch { /* expiry recovers a lease if PostgreSQL is temporarily unavailable */ } }
+    try {
+      const exchanged = await this.deps.plaid.exchangePublicToken(publicToken)
+      if (!exchanged.accessToken || !exchanged.itemId) throw new ConnectControlError(502, 'provider returned an invalid response')
+      const storedReference = await this.deps.secretStore.storePlaidAccessToken({
+        subject: boundSubject, itemId: exchanged.itemId, secretReference, clientId: exchanged.clientId,
+        clientSecret: exchanged.clientSecret, accessToken: exchanged.accessToken,
+      })
+      if (storedReference !== secretReference) throw new ConnectControlError(502, 'provider secret store returned an invalid slot')
+      const accounts = await this.deps.plaid.listAccounts(exchanged.accessToken)
+      if (accounts.length === 0) throw new ConnectControlError(502, 'provider returned no accounts')
+      await this.deps.onPlaidConnected({ subject: boundSubject, itemId: exchanged.itemId, secretReference, accounts })
+      await release()
+      return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
+    } catch (error) {
+      await release()
+      throw error
+    }
   }
 
   async pendingAccounts(rawSubject: string, rawProvider: string): Promise<readonly {
@@ -297,15 +336,6 @@ export class FinanceSyncConnectControl {
   }
 }
 
-function readOptionalFile(env: Readonly<Record<string, string | undefined>>, name: string): string | undefined {
-  const direct = env[name]
-  const path = env[`${name}_FILE`]
-  if (direct !== undefined && path !== undefined) throw new Error(`${name} and ${name}_FILE are mutually exclusive`)
-  if (direct) return direct
-  if (!path) return undefined
-  try { return readFileSync(path, 'utf8').trim() || undefined } catch { throw new Error(`${name}_FILE could not be read`) }
-}
-
 function endpoint(raw: string | undefined, fallback: string, allowedHosts: ReadonlySet<string>, name: string): URL {
   let value: URL
   try { value = new URL(raw ?? fallback) } catch { throw new Error(`${name} endpoint must be a valid URL`) }
@@ -323,18 +353,21 @@ async function responseJson(response: Response): Promise<Record<string, unknown>
   return value as Record<string, unknown>
 }
 
-export function createPlaidConnectTransport(env: ProviderRuntimeEnv = process.env, fetchImpl: typeof fetch = fetch): PlaidConnectTransport | undefined {
-  const inputs = env as Readonly<Record<string, string | undefined>>
-  const clientId = readOptionalFile(inputs, 'FINANCE_SYNC_PLAID_CLIENT_ID')
-  const secret = readOptionalFile(inputs, 'FINANCE_SYNC_PLAID_SECRET')
-  if (!clientId && !secret) return undefined
-  if (!clientId || !secret) throw new Error('both Plaid server credentials are required for Connect')
+export function createPlaidConnectTransport(input: { readonly env: ProviderRuntimeEnv; readonly secretReader: ProviderSecretReader; readonly secretReference: string }, fetchImpl: typeof fetch = fetch): PlaidConnectTransport | undefined {
+  if (!input.secretReader.available || !/^[A-Za-z0-9_-]{1,128}$/.test(input.secretReference)) return undefined
+  const env = input.env
+  let credentials: Promise<{ readonly clientId: string; readonly clientSecret: string }> | undefined
+  const credentialBundle = () => credentials ??= input.secretReader.resolve(input.secretReference).then(bundle => {
+    const clientId = bundle.clientId; const clientSecret = bundle.clientSecret
+    if (typeof clientId !== 'string' || !clientId || typeof clientSecret !== 'string' || !clientSecret) throw new Error('Plaid Connect credential bundle is invalid')
+    return { clientId, clientSecret }
+  })
   const base = endpoint(env.FINANCE_SYNC_PLAID_URL, 'https://production.plaid.com', new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com']), 'Plaid')
   if (base.pathname !== '/') throw new Error('Plaid endpoint must be an origin URL')
-  const post = async (path: string, body: Record<string, unknown>) => responseJson(await fetchImpl(new URL(path, base), {
-    method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json', 'plaid-version': '2020-09-14' },
-    body: JSON.stringify({ client_id: clientId, secret, ...body }),
-  }))
+  const post = async (path: string, body: Record<string, unknown>) => {
+    const { clientId, clientSecret } = await credentialBundle()
+    return responseJson(await fetchImpl(new URL(path, base), { method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json', 'plaid-version': '2020-09-14' }, body: JSON.stringify({ client_id: clientId, secret: clientSecret, ...body }) }))
+  }
   return {
     async createLinkToken(boundSubject) {
       const value = await post('/link/token/create', {
@@ -349,7 +382,8 @@ export function createPlaidConnectTransport(env: ProviderRuntimeEnv = process.en
       if (typeof value.access_token !== 'string' || !value.access_token || typeof value.item_id !== 'string' || !value.item_id) {
         throw new ConnectControlError(502, 'provider returned an invalid response')
       }
-      return { accessToken: value.access_token, itemId: value.item_id }
+      const { clientId, clientSecret } = await credentialBundle()
+      return { clientId, clientSecret, accessToken: value.access_token, itemId: value.item_id }
     },
     async listAccounts(accessToken) {
       const value = await post('/accounts/get', { access_token: accessToken })
@@ -407,9 +441,10 @@ export function createSnapTradeConnectTransport(env: ProviderRuntimeEnv = proces
   }
 }
 
-/** Production remains fail-closed until the exact Infisical write scope is approved. */
+/** Production remains fail-closed until the exact OpenBao writer slot policy is approved. */
 export const unavailableProviderSecretStore: ProviderSecretStore = {
   available: false,
+  allowedSlots: [],
   async storePlaidAccessToken() { throw new ConnectControlError(503, 'provider secret store is unavailable') },
   async resolve() { throw new ConnectControlError(503, 'provider secret store is unavailable') },
 }

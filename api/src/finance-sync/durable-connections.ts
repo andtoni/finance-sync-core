@@ -72,6 +72,7 @@ export async function loadDurableRuntimeConnections(
       wealthfolioAccountIds: { [row.provider_account_id]: row.wealthfolio_account_id },
       providerGeneration: row.provider_generation,
       receiverAccessGeneration: row.receiver_access_generation,
+      secretReference: row.secret_reference,
       ...(row.provider === 'snaptrade' ? { assetMappings: Object.fromEntries(row.asset_mappings.map(mapping =>
         [mapping.providerAssetId, mapping.wealthfolioAssetId])) } : {}),
     }

@@ -14,7 +14,7 @@ import {
 } from './connect-control'
 import { createFinanceSyncHttpHandler } from './connect-http'
 import { PostgresConnectSessionStore } from './connect-session-store'
-import { createInfisicalPlaidTokenWriter, createInfisicalProviderSecretReader } from './infisical-secret-store'
+import { createOpenBaoPlaidTokenWriter, createOpenBaoProviderSecretReader } from './openbao-secret-store'
 import { PostgresOnboardingRepository } from './onboarding-repository'
 import { createNativeProviderOnboarding } from './server-onboarding'
 import { createProviderTransportFactories } from './provider-runtime'
@@ -26,11 +26,11 @@ async function main() {
   if (args.help) { console.log(`Finance Sync Runner
 
 Runs admitted read-only provider accounts from PostgreSQL to canonical observations and a bridge outbox.
-Provider credentials are resolved by server-side Infisical references; environment metadata is not runtime authority.
+Provider credentials are resolved through server-side OpenBao Agent references; environment metadata is not runtime authority.
 --once runs one complete sync cycle and exits.`); return }
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
-  const secretReader = createInfisicalProviderSecretReader(process.env)
-  const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
+  const secretReader = createOpenBaoProviderSecretReader(process.env)
+  const tokenWriter = createOpenBaoPlaidTokenWriter(process.env)
   const deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
   const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
   const snaptrade = createSnapTradeConnectTransport(process.env)
@@ -40,7 +40,10 @@ Provider credentials are resolved by server-side Infisical references; environme
   const connect = new FinanceSyncConnectControl({
     deploymentId: config.deploymentId,
     connections: () => deps.loadConnections(config.deploymentId),
-    plaid: createPlaidConnectTransport(process.env),
+    plaid: createPlaidConnectTransport({
+      env: process.env, secretReader,
+      secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
+    }),
     snaptrade,
     secretStore: tokenWriter,
     nativeOnboarding,

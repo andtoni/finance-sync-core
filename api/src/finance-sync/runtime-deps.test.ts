@@ -8,22 +8,24 @@ const CONNECTION: RuntimeConnection = {
   provider: 'plaid',
   connectionId: 'item-1',
   deploymentId: 'dep-1',
+  clientId: 'client-test',
+  clientSecret: 'secret-test',
   accessToken: 'access-test',
   localOwnerId: 'urn:wealthfolio:test#owner',
   sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
   accountIds: ['acc-1'],
   wealthfolioAccountIds: { 'acc-1': 'wf-acc-1' },
-  providerGeneration: 1, receiverAccessGeneration: 1,
+  providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT',
 }
-const { accessToken: CONNECTION_ACCESS_TOKEN, ...CONNECTION_METADATA } = CONNECTION
+const { accessToken: CONNECTION_ACCESS_TOKEN, clientId: CONNECTION_CLIENT_ID, clientSecret: CONNECTION_CLIENT_SECRET, ...CONNECTION_METADATA } = CONNECTION
 
 function env(overrides: Record<string, string | undefined> = {}) {
   return {
     FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([CONNECTION_METADATA]),
-    FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'item-1': { accessToken: CONNECTION_ACCESS_TOKEN } }),
+    FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'item-1': {
+      accessToken: CONNECTION_ACCESS_TOKEN, clientId: CONNECTION_CLIENT_ID, clientSecret: CONNECTION_CLIENT_SECRET,
+    } }),
     FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com',
-    FINANCE_SYNC_PLAID_CLIENT_ID: 'client-test',
-    FINANCE_SYNC_PLAID_SECRET: 'secret-test',
     FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge',
     FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts',
     FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test',

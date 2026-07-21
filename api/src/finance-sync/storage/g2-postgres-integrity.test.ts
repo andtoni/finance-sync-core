@@ -200,21 +200,21 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
     };
     await sql`
       INSERT INTO projection_outbox
-        (deployment_id, local_owner_id, connection_id, idempotency_key, payload, attempts)
+        (deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload, attempts)
       VALUES
-        (${deadLetterDeploymentId}, 'test-owner', 'test-conn', 'dlq-int-key-1',
+        (${deadLetterDeploymentId}, 'test-owner', 'test-conn', 1, 'dlq-int-key-1',
          ${JSON.stringify(outboxPayload)}, 2)
     `;
 
-    const connection = { provider: 'plaid' as const, connectionId: 'test-conn', deploymentId: deadLetterDeploymentId, accessToken: 'test', localOwnerId: 'urn:test#owner', sourceResourceIncarnationId: 'a0000000-0000-0000-0000-000000000030', accountIds: ['test-account'], wealthfolioAccountIds: { 'test-account': 'test-account' }, providerGeneration: 1, receiverAccessGeneration: 1 };
-    const { accessToken: _accessToken, ...connectionMetadata } = connection;
+    const connection = { provider: 'plaid' as const, connectionId: 'test-conn', deploymentId: deadLetterDeploymentId, clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test', localOwnerId: 'urn:test#owner', sourceResourceIncarnationId: 'a0000000-0000-0000-0000-000000000030', accountIds: ['test-account'], wealthfolioAccountIds: { 'test-account': 'test-account' }, providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT' };
+    const { accessToken: _accessToken, clientId: _clientId, clientSecret: _clientSecret, ...connectionMetadata } = connection;
     // Fully configured, allowlisted HTTPS endpoint guaranteed to refuse the connection.
     const deps = createRuntimeDependencies(sql, deadLetterDeploymentId, {
       FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connectionMetadata]),
-      FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'test-conn': { accessToken: connection.accessToken } }),
+      FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'test-conn': {
+        accessToken: connection.accessToken, clientId: connection.clientId, clientSecret: connection.clientSecret,
+      } }),
       FINANCE_SYNC_PLAID_URL: "https://sandbox.plaid.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "test-client",
-      FINANCE_SYNC_PLAID_SECRET: "test-secret",
       FINANCE_SYNC_BRIDGE_URL: "https://127.0.0.1:1",
       FINANCE_SYNC_BRIDGE_RECEIPT_URL: "https://127.0.0.1:1/receipts",
       FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: "127.0.0.1",
