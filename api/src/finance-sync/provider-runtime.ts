@@ -266,7 +266,10 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
           const value = await get('accounts')
           const accounts = Array.isArray(value) ? value : record(value, 'invalid Mercury accounts response').accounts
           if (!Array.isArray(accounts)) throw new Error('invalid Mercury accounts response')
-          return { accounts: accounts as never[] }
+          return { accounts: accounts.map(account => {
+            const row = record(account, 'invalid Mercury accounts response')
+            return { ...row, currency: typeof row.currency === 'string' && row.currency ? row.currency : 'USD' }
+          }) as never[] }
         },
         async fetchTransactions(accountId, offset, limit, since) {
           const query = new URLSearchParams({ offset: String(offset), limit: String(limit) }); if (since) query.set('start', since)

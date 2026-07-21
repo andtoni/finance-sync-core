@@ -82,6 +82,22 @@ describe('four-provider runtime configuration', () => {
     }).mercury(mercury)).toThrow('host is not allowed')
   })
 
+  it('normalizes Mercury accounts to provider-native USD when the API omits currency', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({ accounts: [{
+      id: 'account-1', name: 'Operating', type: 'checking', status: 'active',
+      currentBalance: 1, availableBalance: 1,
+    }] }))) as typeof fetch
+    try {
+      const mercury = parseRuntimeConnections(runtimeEnv(), 'dep-1').find(connection => connection.provider === 'mercury')
+      if (!mercury || mercury.provider !== 'mercury') throw new Error('missing Mercury fixture')
+      const page = await createProviderTransportFactories({ FINANCE_SYNC_MERCURY_URL: 'https://api.mercury.com/api/v1' }).mercury(mercury).fetchAccounts()
+      expect(page.accounts).toEqual([expect.objectContaining({ id: 'account-1', currency: 'USD' })])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('uses both Plaid transactions and liabilities runtime requests', async () => {
     const requests: string[] = []
     const originalFetch = globalThis.fetch
