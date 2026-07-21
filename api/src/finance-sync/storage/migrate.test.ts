@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -22,6 +22,14 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/legacy projection outbox row has no unambiguous provider connection generation/i);
     expect(sql).toMatch(/state = 'dead_letter'[\s\S]*PROVIDER_GENERATION_SUPERSEDED/i);
     expect(sql).toMatch(/provider_generation = OLD\.provider_generation/i);
+  });
+
+  it("binds each Plaid continuation to one reserved slot", () => {
+    const sql = readFileSync(resolve(root, "0010_plaid_connect_slot_binding.sql"), "utf8");
+    expect(sql).toMatch(/ADD COLUMN IF NOT EXISTS selected_secret_reference text/i);
+    expect(sql).toMatch(/ALTER COLUMN selected_secret_reference SET NOT NULL/i);
+    expect(sql).toMatch(/provider_connect_sessions_live_slot_idx/i);
+    expect(sql).toMatch(/selected_secret_reference\)\s*WHERE released_at IS NULL/i);
   });
 
   it("rejects checksum drift", () => {

@@ -16,14 +16,14 @@ beforeEach(async () => {
     connections: [],
     plaid: {
       createLinkToken: async () => ({ linkToken: 'link-token' }),
-      exchangePublicToken: async () => ({ accessToken: 'durable-secret', itemId: 'item-1' }),
+      exchangePublicToken: async () => ({ clientId: 'client-id', clientSecret: 'client-secret', accessToken: 'durable-secret', itemId: 'item-1' }),
       listAccounts: async () => [{ providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', assets: [] }],
     },
     secretStore: {
-      available: true,
-      storePlaidAccessToken: async () => 'PLAID_ACCESS_TOKEN_TEST',
+      available: true, allowedSlots: ['PLAID_SLOT_A', 'PLAID_SLOT_B'],
+      storePlaidAccessToken: async () => 'PLAID_SLOT_A',
     },
-    sessionStore: { create: async () => 'continuation-token', consume: async () => true },
+    sessionStore: { create: async () => 'continuation-token', consume: async () => 'PLAID_SLOT_A', release: async () => undefined },
     onboarding: {
       listPending: async boundSubject => [{ connectionId: 'connection-1', providerGeneration: 3, providerAccountId: 'account-1', name: boundSubject, type: 'checking', currency: 'USD', assets: [] }],
       admit: async input => {

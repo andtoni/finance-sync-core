@@ -42,7 +42,7 @@ suite('provider generation durable fences with PostgreSQL', () => {
       receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
     })
     const [generationOne] = await loadDurableRuntimeConnections(sql, deploymentId, {
-      resolve: async () => ({ accessToken: 'test-token' }),
+      resolve: async () => ({ clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test-token' }),
     })
     expect(generationOne.providerGeneration).toBe(1)
     const [storedAdmission] = await sql`
@@ -82,7 +82,7 @@ suite('provider generation durable fences with PostgreSQL', () => {
     })
 
     const [generationThree] = await loadDurableRuntimeConnections(sql, deploymentId, {
-      resolve: async () => ({ accessToken: 'test-token' }),
+      resolve: async () => ({ clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test-token' }),
     })
     expect(generationThree.providerGeneration).toBe(3)
     const dependencies = createRuntimeDependencies(sql, deploymentId, {})
@@ -111,6 +111,25 @@ suite('provider generation durable fences with PostgreSQL', () => {
       (deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload)
       VALUES (${deploymentId}, ${subject}, ${generationThree.connectionId}, 3, ${idempotencyKey},
         ${sql.json({ idempotencyKey, subject })})`).resolves.toHaveLength(0)
+  })
+
+  it('rolls back a post-write onboarding failure without replacing the old active slot or generation', async () => {
+    const failureDeployment = `${deploymentId}-post-write`
+    const failureProviderConnection = `${providerConnectionId}-post-write`
+    const repository = new PostgresOnboardingRepository(sql!, failureDeployment)
+    await repository.recordConnection({ subject, provider: 'plaid', providerConnectionId: failureProviderConnection, secretReference: 'PLAID_SLOT_A', accounts: [account] })
+    const [pending] = await repository.listPending(subject, 'plaid')
+    await repository.admit({ subject, provider: 'plaid', connectionId: pending.connectionId, providerAccountId,
+      wealthfolioAccountId, databaseStateDigest: digest, providerGeneration: 1, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [] })
+    // The writer has already put the candidate bundle in PLAID_SLOT_B. Force a
+    // database failure after recordConnection rotates its in-transaction row.
+    await expect(repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: failureProviderConnection, secretReference: 'PLAID_SLOT_B',
+      accounts: [account, { ...account, providerAccountId: '' }],
+    })).rejects.toThrow()
+    const [active] = await sql!`SELECT secret_reference, provider_generation, state
+      FROM provider_connections WHERE deployment_id = ${failureDeployment} AND local_owner_id = ${subject}`
+    expect(active).toEqual({ secret_reference: 'PLAID_SLOT_A', provider_generation: 1, state: 'active' })
   })
 })
 

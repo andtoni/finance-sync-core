@@ -26,10 +26,7 @@ export interface ProviderRuntimeEnv {
   readonly FINANCE_SYNC_MERCURY_URL?: string
   readonly FINANCE_SYNC_MERCURY_SECRET_REFERENCE?: string
   readonly FINANCE_SYNC_PLAID_URL?: string
-  readonly FINANCE_SYNC_PLAID_CLIENT_ID?: string
-  readonly FINANCE_SYNC_PLAID_CLIENT_ID_FILE?: string
-  readonly FINANCE_SYNC_PLAID_SECRET?: string
-  readonly FINANCE_SYNC_PLAID_SECRET_FILE?: string
+  readonly FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE?: string
   readonly FINANCE_SYNC_SNAPTRADE_URL?: string
   readonly FINANCE_SYNC_SNAPTRADE_SECRET_REFERENCE?: string
 }
@@ -125,9 +122,13 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
       sourceResourceIncarnationId: string(c, 'sourceResourceIncarnationId'), accountIds,
       wealthfolioAccountIds: Object.freeze(wealthfolioAccountIds), providerGeneration: providerGeneration as number,
       receiverAccessGeneration: receiverAccessGeneration as number,
+      secretReference: string(metadata, 'secretReference'),
     }
     switch (provider) {
-      case 'plaid': return { ...common, provider, accessToken: string(c, 'accessToken'), maxPages: optionalPositive(c, 'maxPages') }
+      case 'plaid': return {
+        ...common, provider, clientId: string(c, 'clientId'), clientSecret: string(c, 'clientSecret'),
+        accessToken: string(c, 'accessToken'), maxPages: optionalPositive(c, 'maxPages'),
+      }
       case 'investec': return {
         ...common, provider, clientId: string(c, 'clientId'), clientSecret: string(c, 'clientSecret'), apiKey: string(c, 'apiKey'),
         eligibleProductNames: stringArray(c, 'eligibleProductNames'), fromDate: string(c, 'fromDate'), toDate: string(c, 'toDate'),
@@ -195,12 +196,9 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
     plaid(connection) {
       const base = endpoint(env.FINANCE_SYNC_PLAID_URL, 'https://production.plaid.com', 'plaid')
       if (base.pathname !== '/') throw new Error('Plaid endpoint must be an origin URL')
-      const inputs = env as Readonly<Record<string, string | undefined>>
-      const clientId = readExclusiveInput(inputs, 'FINANCE_SYNC_PLAID_CLIENT_ID', true)
-      const secret = readExclusiveInput(inputs, 'FINANCE_SYNC_PLAID_SECRET', true)
       const request = async (path: string, body: Record<string, unknown>) => json(await fetch(new URL(path, base), {
         method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ client_id: clientId, secret, access_token: connection.accessToken, ...body }),
+        body: JSON.stringify({ client_id: connection.clientId, secret: connection.clientSecret, access_token: connection.accessToken, ...body }),
       }), 'plaid')
       return {
         async syncTransactions(_token, cursor) { return await request('/transactions/sync', { cursor: cursor ?? undefined }) as Awaited<ReturnType<PlaidTransport['syncTransactions']>> },

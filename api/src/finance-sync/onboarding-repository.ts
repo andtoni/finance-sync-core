@@ -187,6 +187,11 @@ export class PostgresOnboardingRepository {
     if (input.accounts.length === 0) throw new Error('provider discovery returned no accounts')
     await this.sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
+      if (input.provider === 'plaid') {
+        // Match Connect slot-allocation locking so an exact slot cannot be
+        // concurrently assigned across subjects while connection state advances.
+        await tx`SELECT pg_advisory_xact_lock(hashtext(${this.deploymentId}), hashtext(${input.secretReference}))`
+      }
       const principal = await tx<{ provider_principal_id: string }[]>`
         INSERT INTO provider_principals (
           deployment_id, local_owner_id, provider_principal_id, provider, provider_subject_id

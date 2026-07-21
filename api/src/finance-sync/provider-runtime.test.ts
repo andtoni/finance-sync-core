@@ -5,7 +5,7 @@ const common = {
   connectionId: 'connection-1', deploymentId: 'dep-1', localOwnerId: 'urn:test#owner',
   sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
   accountIds: ['account-1'], wealthfolioAccountIds: { 'account-1': 'wf-account-1' },
-  providerGeneration: 1, receiverAccessGeneration: 1,
+  providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT',
 }
 const configurations = [
   { ...common, provider: 'plaid' },
@@ -14,7 +14,7 @@ const configurations = [
   { ...common, connectionId: 'connection-4', provider: 'snaptrade', clientId: 'id', userId: 'user', assetMappings: {}, activitiesStartDate: '2026-01-01', activitiesEndDate: '2026-07-18' },
 ]
 const providerSecrets = {
-  'connection-1': { accessToken: 'server-token' },
+  'connection-1': { clientId: 'client', clientSecret: 'secret', accessToken: 'server-token' },
   'connection-2': { clientSecret: 'secret', apiKey: 'key' },
   'connection-3': { apiToken: 'read-token' },
   'connection-4': { consumerKey: 'key', userSecret: 'durable-secret' },
@@ -95,10 +95,7 @@ describe('four-provider runtime configuration', () => {
     try {
       const [connection] = parseRuntimeConnections(runtimeEnv([configurations[0]]), 'dep-1')
       if (connection.provider !== 'plaid') throw new Error('expected Plaid fixture')
-      const transport = createProviderTransportFactories({
-        FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com',
-        FINANCE_SYNC_PLAID_CLIENT_ID: 'client', FINANCE_SYNC_PLAID_SECRET: 'secret',
-      }).plaid(connection)
+      const transport = createProviderTransportFactories({ FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com' }).plaid(connection)
       await transport.syncTransactions(connection.accessToken)
       await transport.getLiabilities?.(connection.accessToken)
       expect(requests).toEqual(['/transactions/sync', '/liabilities/get'])

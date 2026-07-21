@@ -49,7 +49,7 @@ function common(provider: NativeOnboardingProvider, subject: string) {
   return {
     provider, connectionId: 'onboarding-discovery', deploymentId: 'onboarding-discovery', localOwnerId: subject,
     sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000000', accountIds: [],
-    wealthfolioAccountIds: {}, providerGeneration: 1, receiverAccessGeneration: 1,
+    wealthfolioAccountIds: {}, providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'onboarding-discovery',
   }
 }
 function currency(value: unknown): string {
@@ -89,7 +89,7 @@ function snapTradeAccounts(value: Awaited<ReturnType<ReturnType<ProviderTranspor
   }))
 }
 
-/** Server-only discovery using named Infisical bundles. No secret or provider identity enters from HTTP. */
+/** Server-only discovery using named OpenBao bundles. No secret or provider identity enters from HTTP. */
 export function createNativeProviderOnboarding(input: {
   readonly env: ProviderRuntimeEnv
   readonly secretStore: ProviderSecretReader

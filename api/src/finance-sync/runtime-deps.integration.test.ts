@@ -13,15 +13,17 @@ const deploymentId = `runtime-deps-${runId}`
 const owner = 'urn:wealthfolio:test#owner'
 const sourceId = 'b0000000-0000-0000-0000-000000000030'
 const connection: RuntimeConnection = {
-  provider: 'plaid', connectionId: `connection-${runId}`, deploymentId, accessToken: 'test', localOwnerId: owner,
+  provider: 'plaid', connectionId: `connection-${runId}`, deploymentId, clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test', localOwnerId: owner,
   sourceResourceIncarnationId: sourceId, accountIds: ['provider-account'],
-  wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, providerGeneration: 1, receiverAccessGeneration: 1,
+  wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT',
 }
-const { accessToken: _accessToken, ...connectionMetadata } = connection
+const { accessToken: _accessToken, clientId: _clientId, clientSecret: _clientSecret, ...connectionMetadata } = connection
 const runtimeEnv = {
   FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connectionMetadata]),
-  FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ [connection.connectionId]: { accessToken: connection.accessToken } }),
-  FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com', FINANCE_SYNC_PLAID_CLIENT_ID: 'test', FINANCE_SYNC_PLAID_SECRET: 'test',
+  FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ [connection.connectionId]: {
+    accessToken: connection.accessToken, clientId: connection.clientId, clientSecret: connection.clientSecret,
+  } }),
+  FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com',
   FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge', FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts', FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test', FINANCE_SYNC_BRIDGE_TOKEN: 'test',
 }
 let sql: ReturnType<typeof postgres>
@@ -98,7 +100,7 @@ suite('runtime dependencies with PostgreSQL', () => {
     await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
     for (let index = 0; index < 30; index++) {
       const operation = { deploymentId, accountId: 'wealthfolio-account', idempotencyKey: `batch-${runId}-${index}`, subject: owner, accessGeneration: 1, kind: 'ActivityDelete', resourceId: `resource-${index}` }
-      await sql`INSERT INTO projection_outbox (deployment_id,local_owner_id,connection_id,idempotency_key,payload) VALUES (${deploymentId},${owner},${connection.connectionId},${operation.idempotencyKey},${sql.json(operation)})`
+      await sql`INSERT INTO projection_outbox (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload) VALUES (${deploymentId},${owner},${connection.connectionId},${connection.providerGeneration},${operation.idempotencyKey},${sql.json(operation)})`
     }
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (_input, init) => {
