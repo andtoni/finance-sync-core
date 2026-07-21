@@ -3,6 +3,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { plaidResourceKind, runPlaidSync } from './plaid-adapter'
 import type { PlaidTransport } from './plaid-adapter'
 
+function transactionObservations(result: Awaited<ReturnType<typeof runPlaidSync>>) {
+  return result.observations.filter(observation => observation.providerVersion.startsWith('plaid:txn:'))
+}
+
 function mockTransport(overrides: Partial<PlaidTransport> = {}): PlaidTransport {
   const base: PlaidTransport = {
     syncTransactions: async (_accessToken, cursor) => {
@@ -49,12 +53,30 @@ describe('Plaid adapter G4', () => {
     }, transport)
     expect(result.nextCursor).toBe('cursor-1')
     expect(result.accounts.length).toBe(2)
-    expect(result.observations.length).toBe(2)
-    expect(result.observations[0].payload).toMatchObject({
-      transactionId: 'txn-1',
-      accountId: 'acc-1',
+    const transactions = transactionObservations(result)
+    expect(transactions).toHaveLength(2)
+    expect(transactions[0].payload).toMatchObject({ transactionId: 'txn-1', accountId: 'acc-1' })
+    expect(transactions[1].payload.transactionId).toBe('txn-2')
+    expect(result.observations.filter(observation => observation.providerVersion.startsWith('plaid:balance:'))).toHaveLength(2)
+    expect(result.observations.filter(observation => observation.providerVersion.startsWith('plaid:liability:'))).toHaveLength(1)
+  })
+
+  it('normalizes the real Plaid wire currency when sync pages omit accounts', async () => {
+    const transport = mockTransport({
+      getAccounts: async () => [{ account_id: 'acc-1', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 100, iso_currency_code: 'USD' } }],
+      syncTransactions: async () => ({
+        added: [{ transaction_id: 'txn-wire', account_id: 'acc-1', amount: 25, date: '2026-07-10', name: 'SHOP', iso_currency_code: 'USD' }],
+        modified: [], removed: [], next_cursor: 'wire-cursor', has_more: false,
+      }),
     })
-    expect(result.observations[1].payload.transactionId).toBe('txn-2')
+    const result = await runPlaidSync({
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-1'],
+    }, transport)
+    const transactions = transactionObservations(result)
+    expect(transactions).toHaveLength(1)
+    expect(transactions[0].payload).toMatchObject({ currency: 'USD', accountId: 'acc-1' })
+    expect(result.accounts).toHaveLength(1)
   })
 
   it('handles empty page gracefully', async () => {
@@ -86,7 +108,7 @@ describe('Plaid adapter G4', () => {
         err.code = 'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION'
         throw err
       }
-      return { added: [], modified: [], removed: [], accounts: [{ account_id: 'acc-1', name: 'Mock', type: 'depository', subtype: 'checking', balances: { current: null, iso_currency_code: 'USD' } }], next_cursor: 'cursor-restart', has_more: false }
+      return { added: [], modified: [], removed: [], accounts: [{ account_id: 'acc-1', name: 'Mock', type: 'depository', subtype: 'checking', balances: { current: 125, iso_currency_code: 'USD' } }], next_cursor: 'cursor-restart', has_more: false }
     }
     const result = await runPlaidSync({
       accessToken: 'access-sandbox-xxx',
@@ -114,22 +136,21 @@ describe('Plaid adapter G4', () => {
     expect(obs0.localOwnerId).toBe('alexis')
   })
 
-  it('quarantines observations with missing currency', async () => {
+  it('refuses an incomplete current-state snapshot with missing account currency', async () => {
     const transport = mockTransport({
       syncTransactions: async () => ({
         added: [{ transaction_id: 'txn-no-ccy', account_id: 'acc-1', amount: 100, date: '2026-07-10', name: 'NOCCY' }],
         modified: [], removed: [],
-        accounts: [{ account_id: 'acc-1', name: 'Unknown', type: 'depository', subtype: 'checking', balances: { current: null, iso_currency_code: null } }],
+        accounts: [{ account_id: 'acc-1', name: 'Unknown', type: 'depository', subtype: 'checking', balances: { current: 100, iso_currency_code: null } }],
         next_cursor: 'cursor-x', has_more: false,
       }),
     })
-    const result = await runPlaidSync({
+    await expect(runPlaidSync({
       accessToken: 'access-sandbox-abc',
       deploymentId: 'g4-test',
       localOwnerId: 'alexis',
       sourceResourceIncarnationId: 'plaid:item-1',
       accountIds: ['acc-1'],
-    }, transport)
-    expect(result.observations.length).toBe(0)
+    }, transport)).rejects.toThrow('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY')
   })
 })

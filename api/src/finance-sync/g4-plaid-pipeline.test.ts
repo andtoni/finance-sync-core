@@ -36,8 +36,10 @@ describe("G4 integration: Plaid → observations → authority → revisions", (
       accountIds: ["acc-1"],
     }, mockPlaidTransport())
 
-    expect(syncResult.observations.length).toBe(1)
-    const obs = syncResult.observations[0]
+    expect(syncResult.observations).toHaveLength(2) // transaction plus complete balance fact
+    const obs = syncResult.observations.find(observation => observation.providerVersion.startsWith('plaid:txn:'))
+    expect(obs).toBeDefined()
+    if (!obs) throw new Error('missing transaction observation')
 
     // Can construct lifecycle observation identity
     const lifecycleIdentity = {

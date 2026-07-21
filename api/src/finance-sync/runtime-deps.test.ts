@@ -1,532 +1,213 @@
-import { describe, expect, it } from "vitest";
-import { createRuntimeDependencies, type SyncCycleAuditEntry } from "./runtime-deps";
-import type { FinanceSyncSql } from "./storage/pg";
-import type { RuntimeConnection } from "./runtime";
+import { describe, expect, it } from 'vitest'
+import { createRuntimeDependencies } from './runtime-deps'
+import type { BridgeDisclosureOperation } from './projection/bridge-client'
+import type { RuntimeConnection } from './runtime'
+import type { FinanceSyncSql } from './storage/pg'
 
-const MINIMAL_VALID_CONNECTION: RuntimeConnection = {
-  provider: "plaid",
-  connectionId: "item-1",
-  deploymentId: "dep-1",
-  accessToken: "access-sandbox-abc123",
-  localOwnerId: "owner-uuid",
-  sourceResourceIncarnationId: "00000000-0000-0000-0000-000000000001",
-  accountIds: ["acc-1"],
-  wealthfolioAccountIds: { "acc-1": "wf-acc-1" },
-  accessGeneration: 1,
-};
+const CONNECTION: RuntimeConnection = {
+  provider: 'plaid',
+  connectionId: 'item-1',
+  deploymentId: 'dep-1',
+  clientId: 'client-test',
+  clientSecret: 'secret-test',
+  accessToken: 'access-test',
+  localOwnerId: 'urn:wealthfolio:test#owner',
+  sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
+  accountIds: ['acc-1'],
+  wealthfolioAccountIds: { 'acc-1': 'wf-acc-1' },
+  providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT',
+}
+const { accessToken: CONNECTION_ACCESS_TOKEN, clientId: CONNECTION_CLIENT_ID, clientSecret: CONNECTION_CLIENT_SECRET, ...CONNECTION_METADATA } = CONNECTION
 
-const noopSql = {} as FinanceSyncSql;
-
-// ── Mock tagged-template SQL (postgres compat) for projectPending tests ──
-function mockSql(cfg: {
-  pendingRows?: Array<{ id: string; connection_id?: string; payload: unknown; attempts?: number }>;
-}) {
-  const recordedUpdates: string[] = [];
-  const state = new Map((cfg.pendingRows ?? []).map((row) => [row.id, {
-    ...row,
-    state: "pending",
-    attempts: row.attempts ?? 0,
-    projectionCount: 0,
-  }]));
-  let fetchCount = 0;
-  const fn = function (
-    strings: TemplateStringsArray | readonly string[],
-    ..._values: unknown[]
-  ): Promise<Record<string, unknown>[]> {
-    const sqlText = Array.isArray(strings) ? strings.join("?") : String(strings);
-    if (/SELECT.*(projection_outbox|attempts)/i.test(sqlText)) {
-      return Promise.resolve(
-        (cfg.pendingRows ?? []).map((r) => ({
-          id: r.id,
-          connection_id: r.connection_id ?? "conn-default",
-          payload: r.payload,
-          attempts: r.attempts ?? 0,
-        })),
-      );
-    }
-    if (/UPDATE.*projection_outbox/i.test(sqlText)) {
-      recordedUpdates.push(sqlText);
-      const id = _values.find((value): value is string => typeof value === "string" && state.has(value));
-      const row = id === undefined ? undefined : state.get(id);
-      if (row) {
-        row.attempts += 1;
-        if (/state = 'delivered'/i.test(sqlText)) {
-          row.state = "delivered";
-          row.projectionCount += 1;
-        } else if (/state = 'dead_letter'/i.test(sqlText)) {
-          row.state = "dead_letter";
-        } else {
-          row.state = "pending";
-        }
-      }
-    }
-    return Promise.resolve([]);
-  };
-  (fn as unknown as Record<string, unknown>).json = (v: unknown) => JSON.stringify(v);
+function env(overrides: Record<string, string | undefined> = {}) {
   return {
-    sql: fn as unknown as FinanceSyncSql,
-    updates: () => [...recordedUpdates],
-    state: () => [...state.values()],
-    fetchCount: () => fetchCount,
-    countFetch: () => { fetchCount += 1; },
-  };
+    FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([CONNECTION_METADATA]),
+    FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'item-1': {
+      accessToken: CONNECTION_ACCESS_TOKEN, clientId: CONNECTION_CLIENT_ID, clientSecret: CONNECTION_CLIENT_SECRET,
+    } }),
+    FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com',
+    FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge',
+    FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts',
+    FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test',
+    FINANCE_SYNC_BRIDGE_TOKEN: 'token-test',
+    ...overrides,
+  }
 }
 
-describe("G8 fail-closed startup — createRuntimeDependencies", () => {
-  it("succeeds without credential validation when no connections configured", () => {
-    const deps = createRuntimeDependencies(noopSql, "dep-1", {});
-    expect(deps).toBeDefined();
-    expect(typeof deps.loadConnections).toBe("function");
-  });
+function binding(fields: readonly string[]): string {
+  const encoder = new TextEncoder()
+  return `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
+}
 
-  it("succeeds when FINANCE_SYNC_CONNECTIONS_JSON is empty array", () => {
-    const deps = createRuntimeDependencies(noopSql, "dep-1", {
-      FINANCE_SYNC_CONNECTIONS_JSON: "[]",
-    });
-    expect(deps).toBeDefined();
-  });
+function receipt(op: BridgeDisclosureOperation) {
+  const operation = op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : op.kind === 'CurrentStateUpsert' ? 'current_state_upsert' : 'projection_fence'
+  const successor = op.lifecycleSuccessorId ?? null
+  const semanticHash = op.kind === 'CurrentStateUpsert' ? op.semanticHash ?? null : null
+  return {
+    deploymentId: op.deploymentId,
+    accountId: op.accountId,
+    subject: op.subject,
+    idempotencyKey: op.idempotencyKey,
+    accessGeneration: op.accessGeneration,
+    operation,
+    resourceId: op.resourceId,
+    lifecycleSuccessorId: successor,
+    outcome: 'Accepted',
+    bindingVersion: 3,
+    semanticHash,
+    receiptBinding: binding([
+      op.deploymentId, op.subject, op.idempotencyKey, String(op.accessGeneration), operation,
+      op.resourceId, op.accountId, successor === null ? '0' : '1', successor ?? '', 'accepted',
+      semanticHash === null ? '0' : '1', semanticHash ?? '',
+    ]),
+  }
+}
 
-  it("succeeds when FINANCE_SYNC_CONNECTIONS_JSON is set to empty string", () => {
-    const deps = createRuntimeDependencies(noopSql, "dep-1", {
-      FINANCE_SYNC_CONNECTIONS_JSON: "",
-    });
-    expect(deps).toBeDefined();
-  });
+function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attempts: number }) {
+  let state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' = 'pending'
+  let attempts = row.attempts
+  const queries: string[] = []
+  const enqueued: BridgeDisclosureOperation[] = []
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const text = strings.join('?')
+    if (/INSERT\s+INTO\s+projection_outbox/i.test(text)) {
+      const payload = values.find(value => value !== null && typeof value === 'object' && 'kind' in value) as BridgeDisclosureOperation | undefined
+      if (payload) enqueued.push(payload)
+    }
+    queries.push(text)
+    if (/count\(\*\)/i.test(text)) {
+      const count = /state\s*=\s*'dead_letter'/i.test(text)
+        ? Number(state === 'dead_letter')
+        : Number(state === 'pending' || state === 'dead_letter')
+      return [{ count }]
+    }
+    if (/SELECT\s+id,\s*payload,\s*attempts/i.test(text)) {
+      return state === 'pending' || state === 'uncertain' ? [{ ...row, attempts, state }] : []
+    }
+    if (/UPDATE\s+projection_outbox/i.test(text)) {
+      attempts += 1
+      if (/state = 'delivered'/i.test(text)) state = 'delivered'
+      if (/state = 'uncertain'/i.test(text)) state = 'uncertain'
+      if (/state = 'dead_letter'/i.test(text)) state = 'dead_letter'
+    }
+    return []
+  }) as unknown as FinanceSyncSql
+  ;(sql as unknown as { begin: (fn: (tx: FinanceSyncSql) => Promise<unknown>) => Promise<unknown> }).begin = fn => fn(sql)
+  ;(sql as unknown as { json: (value: unknown) => unknown }).json = value => value
+  return { sql, state: () => state, attempts: () => attempts, queries, enqueued }
+}
 
-  it("throws at creation time when connections configured but FINANCE_SYNC_PLAID_URL missing", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([MINIMAL_VALID_CONNECTION]),
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "Plaid endpoint and credentials are required for configured connections",
-    );
-  });
-
-  it("throws at creation time when connections configured but FINANCE_SYNC_PLAID_CLIENT_ID missing", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([MINIMAL_VALID_CONNECTION]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "secret-1",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "Plaid endpoint and credentials are required for configured connections",
-    );
-  });
-
-  it("throws at creation time when connections configured but FINANCE_SYNC_PLAID_SECRET missing", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([MINIMAL_VALID_CONNECTION]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "Plaid endpoint and credentials are required for configured connections",
-    );
-  });
-
-  it("throws at creation time when connections configured but FINANCE_SYNC_BRIDGE_URL missing", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([MINIMAL_VALID_CONNECTION]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "FINANCE_SYNC_BRIDGE_URL is required for configured connections",
-    );
-  });
-
-  it("succeeds at creation time when all required credentials present", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([
-        MINIMAL_VALID_CONNECTION,
-        { ...MINIMAL_VALID_CONNECTION, connectionId: "item-2" },
-      ]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-      FINANCE_SYNC_BRIDGE_URL: "https://bridge.example.com",
-    };
-    const deps = createRuntimeDependencies(noopSql, "dep-1", env);
-    expect(deps).toBeDefined();
-  });
-
-  it("returns configured connections from loadConnections", async () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([MINIMAL_VALID_CONNECTION]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-      FINANCE_SYNC_BRIDGE_URL: "https://bridge.example.com",
-    };
-    const deps = createRuntimeDependencies(noopSql, "dep-1", env);
-    const conns = await deps.loadConnections("dep-1");
-    expect(conns).toHaveLength(1);
-    expect(conns[0].connectionId).toBe("item-1");
-    expect(conns[0].deploymentId).toBe("dep-1");
-  });
-
-  // === G8 cross-deployment fail-closed invariant tests ===
-
-  it("throws when a connection is missing deploymentId", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([
-        { ...MINIMAL_VALID_CONNECTION, deploymentId: undefined },
-      ]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-      FINANCE_SYNC_BRIDGE_URL: "https://bridge.example.com",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "connection deploymentId is required",
-    );
-  });
-
-  it("throws when a connection has deploymentId not matching createRuntimeDependencies parameter", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([
-        { ...MINIMAL_VALID_CONNECTION, deploymentId: "other-deployment" },
-      ]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-      FINANCE_SYNC_BRIDGE_URL: "https://bridge.example.com",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "connection deploymentId mismatch",
-    );
-  });
-
-  it("throws when one connection has deploymentId mismatch among valid ones", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([
-        MINIMAL_VALID_CONNECTION,
-        { ...MINIMAL_VALID_CONNECTION, connectionId: "item-2", deploymentId: "wrong-dep" },
-      ]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-      FINANCE_SYNC_BRIDGE_URL: "https://bridge.example.com",
-    };
-    expect(() => createRuntimeDependencies(noopSql, "dep-1", env)).toThrow(
-      "connection deploymentId mismatch",
-    );
-  });
-
-  it("succeeds when all connections have correct deploymentId matching the parameter", () => {
-    const env = {
-      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([
-        MINIMAL_VALID_CONNECTION,
-        { ...MINIMAL_VALID_CONNECTION, connectionId: "item-2" },
-      ]),
-      FINANCE_SYNC_PLAID_URL: "https://plaid.example.com",
-      FINANCE_SYNC_PLAID_CLIENT_ID: "client-1",
-      FINANCE_SYNC_PLAID_SECRET: "secret-1",
-      FINANCE_SYNC_BRIDGE_URL: "https://bridge.example.com",
-    };
-    const deps = createRuntimeDependencies(noopSql, "dep-1", env);
-    expect(deps).toBeDefined();
-  });
-});
-
-// ── G8 projection dead-letter vertical slice ───────────────────────────
-describe("G8 projection dead-letter — projectPending", () => {
-  it("delivers only a complete receipt bound to the operation and authorized subject", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({
-      outcome: "Accepted", operation: "activity_upsert", subject: "owner",
-      idempotencyKey: "k-valid", resourceId: "r-valid", accessGeneration: 1,
-    }), { status: 200 })) as typeof fetch;
-    try {
-      const { sql, updates } = mockSql({ pendingRows: [{ id: "id-valid", connection_id: "conn-1", payload: {
-        idempotencyKey: "k-valid", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r-valid",
-      }, attempts: 0 }] });
-      const deps = createRuntimeDependencies(sql, "dep-1", {
-        FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture",
-      });
-      const result = await deps.projectPending();
-      expect(result.delivered).toBe(1);
-      expect(updates().some((u) => /delivered/i.test(u))).toBe(true);
-    } finally { globalThis.fetch = originalFetch; }
-  });
+describe('createRuntimeDependencies startup validation', () => {
+  it('allows an explicitly empty connection set', () => {
+    expect(createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', { FINANCE_SYNC_CONNECTIONS_JSON: '[]' })).toBeDefined()
+  })
 
   it.each([
-    ["malformed", {}],
-    ["wrong operation", { operation: "account_delete" }],
-    ["wrong subject", { subject: "urn:other#owner" }],
-    ["wrong idempotency", { idempotencyKey: "other-key" }],
-    ["wrong resource", { resourceId: "other-resource" }],
-    ["wrong generation", { accessGeneration: 2 }],
-    ["rejected", { outcome: "Rejected" }],
-  ] as const)("fails closed for %s with one fetch, one retry, and no projection", async (_name, responsePatch) => {
-    const originalFetch = globalThis.fetch;
-    let fetches = 0;
-    globalThis.fetch = (async () => {
-      fetches += 1;
-      const response = Object.keys(responsePatch).length === 0
-        ? {}
-        : { outcome: "Accepted", operation: "activity_upsert", subject: "owner", idempotencyKey: "matrix-key", resourceId: "matrix-resource", accessGeneration: 1, ...responsePatch };
-      return new Response(JSON.stringify(response), { status: 200 });
-    }) as typeof fetch;
+    ['non-HTTPS Plaid URL', { FINANCE_SYNC_PLAID_URL: 'http://sandbox.plaid.com' }, /HTTPS/],
+    ['unapproved Plaid host', { FINANCE_SYNC_PLAID_URL: 'https://plaid.example.test' }, /not allowed/],
+    ['missing bridge allowlist', { FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: undefined }, /ALLOWED_HOSTS/],
+    ['missing bridge token', { FINANCE_SYNC_BRIDGE_TOKEN: undefined }, /BRIDGE_TOKEN/],
+  ] as const)('fails closed for %s', (_name, patch, message) => {
+    expect(() => createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', env(patch))).toThrow(message)
+  })
+
+  it('rejects non-qualified subjects and incomplete account mappings', () => {
+    const badSubject = { ...CONNECTION_METADATA, localOwnerId: 'owner' }
+    expect(() => createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', env({
+      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([badSubject]),
+    }))).toThrow('issuer-qualified')
+    const badMapping = { ...CONNECTION_METADATA, wealthfolioAccountIds: {} }
+    expect(() => createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', env({
+      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([badMapping]),
+    }))).toThrow('every provider account')
+  })
+})
+
+describe('checkpoint generation identity', () => {
+  it('uses provider generation in checkpoint reads, writes, and conflict identity', async () => {
+    const queries: string[] = []
+    const sql = (async (strings: TemplateStringsArray) => {
+      queries.push(strings.join('?'))
+      return []
+    }) as unknown as FinanceSyncSql
+    ;(sql as unknown as { begin: (fn: (tx: FinanceSyncSql) => Promise<unknown>) => Promise<unknown> }).begin = fn => fn(sql)
+    const deps = createRuntimeDependencies(sql, 'dep-1', env())
+    await expect(deps.loadCheckpoint(CONNECTION)).resolves.toBeNull()
+    await deps.saveCheckpoint(CONNECTION, 'cursor-1')
+    expect(queries.find(query => /SELECT cursor FROM sync_checkpoints/i.test(query))).toMatch(/provider_generation/i)
+    expect(queries.find(query => /INSERT INTO sync_checkpoints/i.test(query)))
+      .toMatch(/ON CONFLICT \(deployment_id, connection_id, provider_generation\)/i)
+  })
+})
+
+describe('persistAndEnqueue current-state contract', () => {
+  it('enqueues transaction activity unchanged plus one atomic complete current-state payload', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000099', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 })
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+    const common = {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      hashSpecificationVersion: 1, observedAt: '2026-07-18T00:00:00.000Z',
+    } as const
+    await deps.persistAndEnqueue(CONNECTION, [
+      { ...common, providerVersion: 'plaid:txn:t-1', semanticHash: 'a'.repeat(64), domain: 'cash_ledger', payload: { transactionId: 't-1', accountId: 'acc-1', amount: '5', currency: 'USD', date: '2026-07-18' } },
+      { ...common, providerVersion: 'plaid:balance:acc-1', semanticHash: 'b'.repeat(64), domain: 'cash_ledger', payload: { accountId: 'acc-1', currentBalance: '95', currency: 'USD', asOfDate: '2026-07-18' } },
+    ])
+    expect(fixture.enqueued.map(operation => operation.kind)).toEqual(['ActivityUpsert', 'CurrentStateUpsert'])
+    expect(fixture.enqueued[1].currentState).toEqual({
+      accountId: 'wf-acc-1', providerConnectionId: 'item-1', providerIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerGeneration: 1, observedAt: '2026-07-18T00:00:00.000Z', revision: 1784332800000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '95', liabilityBalance: '0', positions: [],
+    })
+    expect(fixture.enqueued[1].semanticHash).toMatch(/^[a-f0-9]{64}$/)
+    expect(fixture.queries.filter(query => /INSERT\s+INTO\s+projection_outbox/i.test(query))
+      .every(query => /provider_generation/i.test(query))).toBe(true)
+  })
+})
+
+describe('projectPending transaction and receipt contract', () => {
+  const operation: BridgeDisclosureOperation = {
+    deploymentId: 'dep-1',
+    accountId: 'wf-acc-1',
+    subject: CONNECTION.localOwnerId,
+    idempotencyKey: 'key-1',
+    accessGeneration: 1,
+    kind: 'ActivityDelete',
+    resourceId: 'resource-1',
+  }
+
+  it('claims inside a transaction and marks only a completely bound receipt delivered', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000010', payload: operation, attempts: 0 })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify(receipt(operation)), { status: 200 })) as typeof fetch
     try {
-      const fixture = mockSql({ pendingRows: [{ id: `id-matrix-${_name}`, connection_id: "conn-matrix", payload: { idempotencyKey: "matrix-key", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert" as const, resourceId: "matrix-resource" }, attempts: 0 }] });
-      const deps = createRuntimeDependencies(fixture.sql, "dep-1", { FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture" });
-      const result = await deps.projectPending();
-      expect(fetches).toBe(1);
-      expect(result.delivered).toBe(0);
-      expect(result.failed).toBe(1);
-      expect(fixture.state()[0].state).toBe("pending");
-      expect(fixture.state()[0].projectionCount).toBe(0);
-      expect(fixture.updates().filter((u) => /UPDATE.*projection_outbox/i.test(u))).toHaveLength(1);
-    } finally { globalThis.fetch = originalFetch; }
-  });
-
-  it("rejects a malformed successful response and retries instead of delivering", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({}), { status: 200 })) as typeof fetch;
-    try {
-      const { sql, updates } = mockSql({ pendingRows: [{ id: "id-malformed", connection_id: "conn-1", payload: {
-        idempotencyKey: "k-malformed", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r-malformed",
-      }, attempts: 0 }] });
-      const deps = createRuntimeDependencies(sql, "dep-1", {
-        FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture",
-      });
-      const result = await deps.projectPending();
-      expect(result.delivered).toBe(0);
-      expect(result.failed).toBe(1);
-      expect(updates().some((u) => /delivered/i.test(u))).toBe(false);
-    } finally { globalThis.fetch = originalFetch; }
-  });
-
-  it("rejects delivery when the configured credential subject differs from the request subject", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({
-      outcome: "Accepted", operation: "activity_upsert", subject: "different-owner",
-      idempotencyKey: "k-cross", resourceId: "r-cross", accessGeneration: 1,
-    }), { status: 200 })) as typeof fetch;
-    try {
-    const { sql, updates } = mockSql({ pendingRows: [{ id: "id-cross", connection_id: "conn-1", payload: {
-      idempotencyKey: "k-cross", subject: "other-owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r-cross",
-    }, attempts: 0 }] });
-    const deps = createRuntimeDependencies(sql, "dep-1", {
-      FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture",
-    });
-    const result = await deps.projectPending();
-    expect(result.delivered).toBe(0);
-    expect(result.failed).toBe(1);
-    expect(updates().some((u) => /delivered/i.test(u))).toBe(false);
-    } finally { globalThis.fetch = originalFetch; }
-  });
-
-  it("requires a bridge token and sends authenticated subject-bound delivery", async () => {
-    const seen: Request[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input, init) => { seen.push(new Request(input, init)); return new Response(JSON.stringify({ outcome: "Accepted", operation: "activity_upsert", subject: "owner", idempotencyKey: "k-auth", resourceId: "r", accessGeneration: 1 }), { status: 200 }); }) as typeof fetch;
-    try {
-      const { sql } = mockSql({ pendingRows: [{ id: "id-auth", connection_id: "conn-1", payload: { idempotencyKey: "k-auth", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r" }, attempts: 0 }] });
-      const deps = createRuntimeDependencies(sql, "dep-1", { FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture" });
-      await deps.projectPending();
-      expect(seen[0].headers.get("authorization")).toBe("Bearer token-fixture");
-      expect(await seen[0].json()).toMatchObject({ subject: "owner", kind: "ActivityUpsert" });
-    } finally { globalThis.fetch = originalFetch; }
-  });
-
-  it("sends the canonical snake_case bridge request with PascalCase kind", async () => {
-    const seen: Request[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input, init) => { seen.push(new Request(input, init)); return new Response(JSON.stringify({ outcome: "Accepted", operation: "activity_upsert", subject: "owner", idempotencyKey: "k-wire", resourceId: "r", accessGeneration: 1 }), { status: 200 }); }) as typeof fetch;
-    try {
-      const { sql } = mockSql({ pendingRows: [{ id: "id-wire", connection_id: "conn-1", payload: { idempotencyKey: "k-wire", subject: "owner", accessGeneration: 1, kind: "ActivityUpsert", resourceId: "r", activity: { accountId: "a", activityType: "DEPOSIT", status: "CLEARED", activityDate: "2026-07-16", amount: "1", currency: "USD" } }, attempts: 0 }] });
-      const deps = createRuntimeDependencies(sql, "dep-1", { FINANCE_SYNC_BRIDGE_URL: "http://bridge.test", FINANCE_SYNC_BRIDGE_TOKEN: "token-fixture" });
-      await deps.projectPending();
-      expect(await seen[0].json()).toEqual({ idempotency_key: "k-wire", subject: "owner", access_generation: 1, kind: "ActivityUpsert", resource_id: "r", activity: { account_id: "a", activity_type: "DEPOSIT", status: "CLEARED", activity_date: "2026-07-16", amount: "1", currency: "USD" } });
-    } finally { globalThis.fetch = originalFetch; }
-  });
-
-  it("dead-letters an outbox item when attempts reach MAX_PROJECTION_DELIVERY_ATTEMPTS", async () => {
-    const pendingId = "00000000-0000-0000-0000-000000000001";
-    const pendingPayload = { idempotencyKey: "key-exhausted", subject: "owner", kind: "ActivityUpsert", accessGeneration: 1 };
-
-    const { sql, updates } = mockSql({
-      pendingRows: [{ id: pendingId, payload: pendingPayload, attempts: 2 }],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-1", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending();
-
-    expect(result.delivered).toBe(0);
-    expect(result.failed).toBe(1);
-
-    const deadUpdate = updates().find((u) => /dead_letter/i.test(u));
-    expect(deadUpdate).toBeDefined();
-    expect(deadUpdate).toContain("dead_letter");
-    expect(deadUpdate).toContain("dead_letter_reason");
-  });
-
-  it("does NOT dead-letter an outbox item below the retry threshold", async () => {
-    const pendingId = "00000000-0000-0000-0000-000000000002";
-    const pendingPayload = { idempotencyKey: "key-retry", subject: "owner", kind: "ActivityUpsert", accessGeneration: 1 };
-
-    const { sql, updates } = mockSql({
-      pendingRows: [{ id: pendingId, payload: pendingPayload, attempts: 1 }],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-1", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending();
-
-    expect(result.delivered).toBe(0);
-    expect(result.failed).toBe(1);
-
-    const deadUpdate = updates().find((u) => /dead_letter/i.test(u));
-    expect(deadUpdate).toBeUndefined();
-
-    const retryUpdate = updates().find((u) => /attempts/i.test(u));
-    expect(retryUpdate).toBeDefined();
-  });
-});
-
-// ── G8 auditability vertical slice — syncCycleAudit ────────────────────
-describe("G8 auditability — syncCycleAudit", () => {
-  it("returns empty syncCycleAudit when no pending rows exist", async () => {
-    const { sql } = mockSql({ pendingRows: [] });
-
-    const deps = createRuntimeDependencies(sql, "dep-1", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending() as { delivered: number; failed: number; syncCycleAudit: SyncCycleAuditEntry[] };
-
-    expect(result.syncCycleAudit).toEqual([]);
-  });
-
-  it("returns empty syncCycleAudit when bridge URL is not configured", async () => {
-    const { sql } = mockSql({
-      pendingRows: [{ id: "id-1", connection_id: "conn-1", payload: {}, attempts: 0 }],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-1", {});
-
-    const result = await deps.projectPending() as { delivered: number; failed: number; syncCycleAudit: SyncCycleAuditEntry[] };
-
-    expect(result.delivered).toBe(0);
-    expect(result.failed).toBe(0);
-    expect(result.syncCycleAudit).toEqual([]);
-  });
-
-  it("emits dead_letter audit entry with deploymentId, connectionId, outcome, count when retries exhausted", async () => {
-    const { sql } = mockSql({
-      pendingRows: [
-        { id: "id-dl-1", connection_id: "conn-plaid-1", payload: { idempotencyKey: "k1" }, attempts: 2 },
-      ],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-g8", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending() as { delivered: number; failed: number; syncCycleAudit: SyncCycleAuditEntry[] };
-
-    expect(result.syncCycleAudit).toHaveLength(1);
-    expect(result.syncCycleAudit[0].deploymentId).toBe("dep-g8");
-    expect(result.syncCycleAudit[0].connectionId).toBe("conn-plaid-1");
-    expect(result.syncCycleAudit[0].outcome).toBe("dead_letter");
-    expect(result.syncCycleAudit[0].count).toBe(1);
-  });
-
-  it("emits retry audit entry when delivery fails below retry threshold", async () => {
-    const { sql } = mockSql({
-      pendingRows: [
-        { id: "id-rt-1", connection_id: "conn-plaid-2", payload: { idempotencyKey: "k2" }, attempts: 1 },
-      ],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-g8", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending() as { delivered: number; failed: number; syncCycleAudit: SyncCycleAuditEntry[] };
-
-    expect(result.syncCycleAudit).toHaveLength(1);
-    expect(result.syncCycleAudit[0].deploymentId).toBe("dep-g8");
-    expect(result.syncCycleAudit[0].connectionId).toBe("conn-plaid-2");
-    expect(result.syncCycleAudit[0].outcome).toBe("retry");
-    expect(result.syncCycleAudit[0].count).toBe(1);
-  });
-
-  it("aggregates counts per connectionId per outcome across multiple rows", async () => {
-    const { sql } = mockSql({
-      pendingRows: [
-        { id: "id-a-1", connection_id: "conn-shared", payload: { idempotencyKey: "k3" }, attempts: 2 },
-        { id: "id-a-2", connection_id: "conn-shared", payload: { idempotencyKey: "k4" }, attempts: 2 },
-        { id: "id-a-3", connection_id: "conn-other", payload: { idempotencyKey: "k5" }, attempts: 1 },
-      ],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-g8", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending() as { delivered: number; failed: number; syncCycleAudit: SyncCycleAuditEntry[] };
-
-    // conn-shared has 2 dead_letter items, conn-other has 1 retry
-    expect(result.syncCycleAudit).toHaveLength(2);
-
-    const sharedDl = result.syncCycleAudit.find(
-      (e) => e.connectionId === "conn-shared" && e.outcome === "dead_letter",
-    );
-    expect(sharedDl).toBeDefined();
-    expect(sharedDl!.count).toBe(2);
-
-    const otherRetry = result.syncCycleAudit.find(
-      (e) => e.connectionId === "conn-other" && e.outcome === "retry",
-    );
-    expect(otherRetry).toBeDefined();
-    expect(otherRetry!.count).toBe(1);
-  });
-
-  it("audit entries contain ONLY redacted fields — no tokens, payloads, account identifiers, or financial amounts", async () => {
-    const { sql } = mockSql({
-      pendingRows: [
-        { id: "id-redact-1", connection_id: "conn-redact", payload: { idempotencyKey: "k6" }, attempts: 2 },
-      ],
-    });
-
-    const deps = createRuntimeDependencies(sql, "dep-redact", {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
-    });
-
-    const result = await deps.projectPending() as { delivered: number; failed: number; syncCycleAudit: SyncCycleAuditEntry[] };
-
-    const audits = result.syncCycleAudit;
-    expect(audits).toHaveLength(1);
-    const entry = audits[0];
-
-    // Allowed fields
-    expect(entry).toHaveProperty("deploymentId");
-    expect(entry).toHaveProperty("connectionId");
-    expect(entry).toHaveProperty("outcome");
-    expect(entry).toHaveProperty("count");
-
-    // Forbidden sensitive fields — MUST NOT exist
-    const forbidden = ["accessToken", "accountIds", "wealthfolioAccountIds", "payload", "amount", "localOwnerId", "sourceResourceIncarnationId"] as const;
-    for (const key of forbidden) {
-      expect(entry).not.toHaveProperty(key);
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(fixture.state()).toBe('delivered')
+      expect(fixture.queries.some(query => /FOR UPDATE SKIP LOCKED/i.test(query))).toBe(true)
+      expect(fixture.queries.filter(query => /projection_outbox/i.test(query))
+        .every(query => /provider_generation/i.test(query))).toBe(true)
+    } finally {
+      globalThis.fetch = originalFetch
     }
+  })
 
-    // Value types
-    expect(typeof entry.deploymentId).toBe("string");
-    expect(typeof entry.connectionId).toBe("string");
-    expect(["delivered", "retry", "dead_letter"]).toContain(entry.outcome);
-    expect(typeof entry.count).toBe("number");
-    expect(entry.count).toBeGreaterThan(0);
-  });
-});
+  it('fences a successful commit with an invalid receipt as uncertain', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000011', payload: operation, attempts: 2 })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({ outcome: 'Accepted' }), { status: 200 })) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('uncertain')
+      expect(fixture.attempts()).toBe(3)
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('uncertain')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { CanonicalDomain } from '../../domain'
+import { merchantContext } from '../shared/merchant-context'
 
 // ─── Domain mapping ────────────────────────────────────────────────────────────
 
@@ -22,7 +23,10 @@ export function snaptradeResourceKind(resource: {
 // ─── SnapTrade raw API shapes ───────────────────────────────────────────────────
 
 export interface SnapTradeRawSymbol {
-  readonly symbol?: string | { readonly symbol?: string }
+  readonly id?: string
+  readonly universal_symbol_id?: string
+  readonly universal_symbol?: { readonly id?: string }
+  readonly symbol?: string | { readonly id?: string; readonly symbol?: string }
   readonly ticker?: string
   readonly name?: string
   readonly currency?: { readonly code?: string }
@@ -80,7 +84,7 @@ export interface SnapTradeTransport {
   /** Fetch all brokerage accounts with their positions (holdings). */
   fetchAccounts(): Promise<readonly SnapTradeRawAccount[]>
 
-  /** Fetch activities for a date range. Returns array directly or wrapped in { data: [...] }. */
+  /** Fetch the documented bounded activity date range. */
   fetchActivities(startDate: string, endDate: string): Promise<readonly SnapTradeRawActivity[] | { readonly data: readonly SnapTradeRawActivity[] }>
 }
 
@@ -95,6 +99,7 @@ export interface SnapTradeSyncConfig {
   /** ISO date string for the start of the activity window. */
   readonly activitiesStartDate?: string
   readonly activitiesEndDate?: string
+  readonly maxActivityRows?: number
 }
 
 export interface ObservationOutput {
@@ -117,6 +122,8 @@ export interface SnapTradeSyncResult {
   readonly accountsFetched: number
   readonly holdingsObserved: number
   readonly activitiesObserved: number
+  readonly activityPasses: number
+  readonly complete: boolean
 }
 
 export interface SnapTradeNormalizedAccount {
@@ -132,6 +139,7 @@ export interface SnapTradeNormalizedAccount {
 
 export interface SnapTradeNormalizedHolding {
   readonly accountId: string
+  readonly providerAssetId: string | null
   readonly symbol: string
   readonly name: string | null
   readonly units: string
@@ -159,6 +167,8 @@ export interface SnapTradeNormalizedActivity {
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 const HASH_SPEC_VERSION = 1
+const DEFAULT_MAX_ACTIVITY_ROWS = 10_000
+const ACTIVITY_STABILITY_PASSES = 2
 
 function sha256(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex')
@@ -327,6 +337,8 @@ export function normalizeHoldings(
 
     return {
       accountId,
+      providerAssetId: pos.symbol?.id ?? (typeof pos.symbol?.symbol === 'object' ? pos.symbol.symbol.id : undefined)
+        ?? pos.symbol?.universal_symbol_id ?? pos.symbol?.universal_symbol?.id ?? null,
       symbol,
       name: name ?? symbol,
       units,
@@ -407,6 +419,7 @@ export async function runSnapTradeSync(
   let accountsFetched = 0
   let holdingsObserved = 0
   let activitiesObserved = 0
+  let complete = true
 
   // 1. Fetch accounts with positions
   let rawAccounts: readonly SnapTradeRawAccount[]
@@ -414,7 +427,7 @@ export async function runSnapTradeSync(
     rawAccounts = await transport.fetchAccounts()
     accountsFetched = rawAccounts.length
   } catch {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0 }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: false }
   }
 
   // Filter to configured account IDs if provided
@@ -425,7 +438,7 @@ export async function runSnapTradeSync(
 
   // Short-circuit: no accounts, nothing to sync
   if (rawAccounts.length === 0) {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0 }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: true }
   }
 
   // 2. Process each account
@@ -471,6 +484,7 @@ export async function runSnapTradeSync(
       const domain: CanonicalDomain = h.instrumentTypeTag === 'cash' ? 'cash_ledger' : 'holding'
       const payload = {
         accountId: h.accountId,
+        providerAssetId: h.providerAssetId,
         symbol: h.symbol,
         name: h.name,
         units: h.units,
@@ -505,11 +519,27 @@ export async function runSnapTradeSync(
   const startDate = config.activitiesStartDate ?? new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)
   const endDate = config.activitiesEndDate ?? new Date().toISOString().slice(0, 10)
 
+  let activityPasses = 0
   try {
-    const actPayload = await transport.fetchActivities(startDate, endDate)
-    const normActivities = normalizeActivities(actPayload)
+    // The documented user-level endpoint has a bounded date window but no
+    // cursor parameter. Require two identical bounded snapshots instead of
+    // guessing undocumented pagination fields or accepting a moving partial run.
+    const maxRows = config.maxActivityRows ?? DEFAULT_MAX_ACTIVITY_ROWS
+    if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error('invalid activity bound')
+    let stableActivities: SnapTradeNormalizedActivity[] | null = null
+    let stableSignature: string | null = null
+    for (let pass = 0; pass < ACTIVITY_STABILITY_PASSES; pass++) {
+      const actPayload = await transport.fetchActivities(startDate, endDate)
+      activityPasses++
+      const normalized = normalizeActivities(actPayload)
+      if (normalized.length > maxRows) throw new Error('activity bound exceeded')
+      const signature = sha256(JSON.stringify([...normalized].sort((a, b) => a.id.localeCompare(b.id))))
+      if (stableSignature !== null && signature !== stableSignature) throw new Error('activity snapshot unstable')
+      stableActivities = normalized
+      stableSignature = signature
+    }
 
-    for (const a of normActivities) {
+    for (const a of stableActivities ?? []) {
       activities.push(a)
       activitiesObserved++
 
@@ -523,6 +553,12 @@ export async function runSnapTradeSync(
         currency: a.currency,
         date: a.date,
         description: a.description,
+        merchantContext: merchantContext({
+          provider: 'snaptrade', rawDescription: a.description, merchantDisplay: a.description,
+          activityType: a.type,
+          // Explicit brokerage provenance keeps these semantics out of household spending categorisation.
+          providerHint: { lane: 'brokerage', symbol: a.symbol },
+        }),
       }
       const semanticPayload = [
         config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
@@ -543,7 +579,8 @@ export async function runSnapTradeSync(
       })
     }
   } catch {
-    // Activities fetch failure is tolerated — accounts/holdings data still returned
+    // Never promote the restart cursor for a partial provider snapshot.
+    complete = false
   }
 
   return {
@@ -554,5 +591,7 @@ export async function runSnapTradeSync(
     accountsFetched,
     holdingsObserved,
     activitiesObserved,
+    activityPasses,
+    complete,
   }
 }

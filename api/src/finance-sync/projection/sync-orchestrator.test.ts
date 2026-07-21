@@ -27,20 +27,32 @@ describe('Sync orchestrator', () => {
         },
       },
       bridgeTransport: {
-        commit: async (op) => ({
-          subject: op.subject,
-          idempotencyKey: op.idempotencyKey,
-          accessGeneration: op.accessGeneration,
-          operation: op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : 'projection_fence',
-          resourceId: op.resourceId,
-          outcome: 'Accepted',
-        }),
+        commit: async (op) => {
+          const operation = op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : 'projection_fence'
+          const successor = op.lifecycleSuccessorId ?? null
+          const fields = [op.deploymentId, op.subject, op.idempotencyKey, String(op.accessGeneration), operation, op.resourceId, op.accountId, successor === null ? '0' : '1', successor ?? '', 'accepted', '0', '']
+          const encoder = new TextEncoder()
+          return {
+            deploymentId: op.deploymentId,
+            accountId: op.accountId,
+            subject: op.subject,
+            idempotencyKey: op.idempotencyKey,
+            accessGeneration: op.accessGeneration,
+            operation,
+            resourceId: op.resourceId,
+            lifecycleSuccessorId: successor,
+            outcome: 'Accepted',
+            bindingVersion: 3,
+            semanticHash: null,
+            receiptBinding: `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`,
+          }
+        },
       },
     }
 
     const result = await runPlaidSyncSession(session)
     expect(result.provider).toBe('plaid')
-    expect(result.observationsCount).toBe(1)
+    expect(result.observationsCount).toBe(2) // transaction plus complete balance fact
     expect(result.committedCount).toBe(1)
     expect(result.errors.length).toBe(0)
     expect(result.newCursor).toBe('done')
@@ -67,7 +79,7 @@ describe('Sync orchestrator', () => {
       bridgeTransport: { commit: async () => { throw new Error('should not be called') } },
     }
     const result = await runPlaidSyncSession(session)
-    expect(result.observationsCount).toBe(1)
+    expect(result.observationsCount).toBe(2) // transaction plus complete balance fact
     expect(result.committedCount).toBe(0)
     expect(result.errors.length).toBe(1)
     expect(result.errors[0]).toContain('No Wealthfolio mapping')

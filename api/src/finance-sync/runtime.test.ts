@@ -1,30 +1,35 @@
 import { describe, expect, it, vi } from 'vitest'
 import { runConfiguredSyncCycle, type SyncRuntimeDependencies } from './runtime'
 
+const plaidConnection = (connectionId: string, accessToken: string, accountId = 'a') => ({
+  provider: 'plaid' as const, connectionId, deploymentId: 'd', clientId: 'client', clientSecret: 'secret', accessToken,
+  localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
+  accountIds: [accountId], wealthfolioAccountIds: { [accountId]: 'wf-a' }, providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT',
+})
+
 describe('configured sync runtime', () => {
   it('persists observations, enqueues bridge work, projects it, and advances its cursor only after success', async () => {
     const calls: string[] = []
     const deps: SyncRuntimeDependencies = {
-      loadConnections: async () => [{ provider: 'plaid', connectionId: 'item-1', deploymentId: 'd', accessToken: 'token', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', accountIds: ['a'], wealthfolioAccountIds: { a: 'wf-a' }, accessGeneration: 1 }],
+      loadConnections: async () => [plaidConnection('item-1', 'token')],
       loadCheckpoint: async () => null,
       runProvider: async (_connection, cursor) => ({ nextCursor: cursor === null ? 'cursor-1' : cursor, observations: [{ deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', providerVersion: 'v1', semanticHash: 'a'.repeat(64), hashSpecificationVersion: 1, domain: 'cash_ledger', observedAt: '2026-07-11T00:00:00.000Z', payload: { accountId: 'a', amount: '12.50', currency: 'USD', date: '2026-07-11' } }] }),
-      persistObservations: async (observations) => { calls.push(`persist:${observations.length}`); return observations },
-      enqueue: async (observations) => { calls.push(`enqueue:${observations.length}`) },
+      persistAndEnqueue: async (_connection, observations) => { calls.push(`persist+enqueue:${observations.length}`); return observations.length },
       projectPending: async () => { calls.push('project'); return { delivered: 1, failed: 0 } },
       saveCheckpoint: async (_connection, cursor) => { calls.push(`checkpoint:${cursor}`) },
     }
     const result = await runConfiguredSyncCycle('d', deps)
     expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0 })
-    expect(calls).toEqual(['persist:1', 'enqueue:1', 'project', 'checkpoint:cursor-1'])
+    expect(calls).toEqual(['persist+enqueue:1', 'project', 'checkpoint:cursor-1'])
   })
 
   it('redacts provider failures from operational logs', async () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {})
     const deps: SyncRuntimeDependencies = {
-      loadConnections: async () => [{ provider: 'plaid', connectionId: 'sensitive-connection', deploymentId: 'd', accessToken: 'sensitive-token', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', accountIds: ['sensitive-account'], wealthfolioAccountIds: { 'sensitive-account': 'wf-a' }, accessGeneration: 1 }],
+      loadConnections: async () => [plaidConnection('sensitive-connection', 'sensitive-token', 'sensitive-account')],
       loadCheckpoint: async () => null,
       runProvider: async () => { throw new Error('provider payload sensitive-token sensitive-account') },
-      persistObservations: async () => [], enqueue: async () => {},
+      persistAndEnqueue: async () => 0,
       projectPending: async () => ({ delivered: 0, failed: 0 }),
       saveCheckpoint: async () => {},
     }
@@ -40,10 +45,10 @@ describe('configured sync runtime', () => {
   it('does not advance a cursor when projection fails', async () => {
     let checkpointed = false
     const deps: SyncRuntimeDependencies = {
-      loadConnections: async () => [{ provider: 'plaid', connectionId: 'item-1', deploymentId: 'd', accessToken: 'token', localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001', accountIds: ['a'], wealthfolioAccountIds: { a: 'wf-a' }, accessGeneration: 1 }],
+      loadConnections: async () => [plaidConnection('item-1', 'token')],
       loadCheckpoint: async () => null,
       runProvider: async () => ({ nextCursor: 'cursor-1', observations: [] }),
-      persistObservations: async () => [], enqueue: async () => {},
+      persistAndEnqueue: async () => 0,
       projectPending: async () => ({ delivered: 0, failed: 1 }),
       saveCheckpoint: async () => { checkpointed = true },
     }

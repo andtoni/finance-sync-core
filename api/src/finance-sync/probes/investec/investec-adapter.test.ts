@@ -17,6 +17,10 @@ function makeTransport(txns: Record<string, unknown>[], nextCursor?: string): In
   }
 }
 
+function transactionObservations(result: Awaited<ReturnType<typeof runInvestecAdapter>>) {
+  return result.observations.filter(observation => observation.providerVersion.startsWith('investec:txn:'))
+}
+
 describe('Investec adapter G5', () => {
   it('maps to cash_ledger', () => expect(investecResourceKind()).toBe('cash_ledger'))
 
@@ -43,20 +47,20 @@ describe('Investec adapter G5', () => {
   it('produces observations for posted transactions only', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'A' }], undefined))
-    expect(r.observations.length).toBe(1)
+    expect(transactionObservations(r)).toHaveLength(1)
   })
 
   it('quarantines postedOrder=0 as provisional', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'POSTED', postedOrder: 0, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'P' }], undefined))
-    expect(r.observations.length).toBe(0)
+    expect(transactionObservations(r)).toHaveLength(0)
     expect(r.quarantine[0].reason).toBe('POSTED_ORDER_ZERO_PROVISIONAL')
   })
 
   it('skips pending without quarantine', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'PENDING', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10' }], undefined))
-    expect(r.observations.length).toBe(0)
+    expect(transactionObservations(r)).toHaveLength(0)
     expect(r.quarantine.length).toBe(0)
   })
 
@@ -65,7 +69,7 @@ describe('Investec adapter G5', () => {
       { uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10' },
       { uuid: 't2', status: 'POSTED', postedOrder: 2, type: 'CREDIT', amount: 50, postingDate: '2026-07-11' },
     ], undefined))
-    const amounts = r.observations.map(o => Number((o.payload as any).amount))
+    const amounts = transactionObservations(r).map(o => Number((o.payload as any).amount))
     expect(amounts[0]).toBeLessThan(0)
     expect(amounts[1]).toBeGreaterThan(0)
   })
@@ -86,7 +90,7 @@ describe('Investec adapter G5', () => {
   it('redacts accountRef in payload', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'R' }], undefined))
-    for (const obs of r.observations) {
+    for (const obs of transactionObservations(r)) {
       expect((obs.payload as any).accountRef).toMatch(/^\u2026\d{4}$/)
     }
   })
@@ -94,8 +98,9 @@ describe('Investec adapter G5', () => {
   it('preserves raw accountId in payload', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'P' }], undefined))
-    expect((r.observations[0].payload as any).accountId).toBeDefined()
-    expect((r.observations[0].payload as any).accountRef).toMatch(/^\u2026/)
+    const [transaction] = transactionObservations(r)
+    expect((transaction.payload as any).accountId).toBeDefined()
+    expect((transaction.payload as any).accountRef).toMatch(/^\u2026/)
   })
 
   it('handles single page completion', async () => {
@@ -136,9 +141,43 @@ describe('Investec adapter G5', () => {
     expect((r.quarantine[0] as any).transactionRef).toBeUndefined()
   })
 
+  it('retains validated provider decimal strings without Number/toFixed truncation', async () => {
+    const transport = makeTransport([
+      { uuid: 'precise', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: '123456789.123456789123456789', postingDate: '2026-07-10' },
+    ], undefined)
+    transport.getBalance = async () => ({ currency: 'ZAR', currentBalance: '987654321.987654321987654321' })
+    const r = await runInvestecAdapter(BASE_CONFIG, transport)
+    expect(r.observations.find(item => item.domain === 'balance')?.payload.currentBalance).toBe('987654321.987654321987654321')
+    expect(transactionObservations(r)[0].payload.amount).toBe('-123456789.123456789123456789')
+  })
+
   it('handles empty response', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport([], undefined))
-    expect(r.observations.length).toBe(0)
+    expect(transactionObservations(r)).toHaveLength(0)
+    expect(r.observations).toHaveLength(1) // complete current-balance snapshot
     expect(r.paginationComplete).toBe(true)
   })
+})
+
+it('timestamps changed same-day balances at successful fetch time so the newer state can replace', async () => {
+  let currentBalance = '10'
+  const transport = {
+    listAccounts: async () => [{ accountId: 'account-1', productName: 'Private Bank' }],
+    getBalance: async () => ({ currency: 'ZAR', currentBalance }),
+    getTransactionPage: async () => ({ transactions: [] }),
+  }
+  const config = {
+    deploymentId: 'dep', localOwnerId: 'issuer#owner',
+    sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
+    fromDate: '2026-01-01', toDate: '2026-07-18', eligibleProductNames: ['Private Bank'],
+  }
+  const first = await runInvestecAdapter(config, transport)
+  await new Promise(resolve => setTimeout(resolve, 2))
+  currentBalance = '11'
+  const second = await runInvestecAdapter(config, transport)
+  const firstBalance = first.observations.find(item => item.domain === 'balance')!
+  const secondBalance = second.observations.find(item => item.domain === 'balance')!
+  expect(firstBalance.observedAt).not.toBe('2026-07-18T00:00:00.000Z')
+  expect(Date.parse(secondBalance.observedAt)).toBeGreaterThan(Date.parse(firstBalance.observedAt))
+  expect(secondBalance.semanticHash).not.toBe(firstBalance.semanticHash)
 })

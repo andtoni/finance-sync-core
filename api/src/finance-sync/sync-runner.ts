@@ -6,6 +6,18 @@ import { runConfiguredSyncCycle } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
 import { parseServiceConfig } from './service-config'
+import { financeSyncHealth } from './health'
+import {
+  createPlaidConnectTransport,
+  createSnapTradeConnectTransport,
+  FinanceSyncConnectControl,
+} from './connect-control'
+import { createFinanceSyncHttpHandler } from './connect-http'
+import { PostgresConnectSessionStore } from './connect-session-store'
+import { createOpenBaoPlaidTokenWriter, createOpenBaoProviderSecretReader } from './openbao-secret-store'
+import { PostgresOnboardingRepository } from './onboarding-repository'
+import { createNativeProviderOnboarding } from './server-onboarding'
+import { createProviderTransportFactories } from './provider-runtime'
 
 interface CliArgs { help?: boolean; once?: boolean }
 function parseArgs(argv = process.argv): CliArgs { return { help: argv.includes('--help') || argv.includes('-h'), once: argv.includes('--once') } }
@@ -13,35 +25,67 @@ async function main() {
   const args = parseArgs()
   if (args.help) { console.log(`Finance Sync Runner
 
-Runs configured read-only providers to canonical observations and a bridge outbox.
-FINANCE_SYNC_CONNECTIONS_JSON is optional; without it, the runner performs migrations/readiness only.
+Runs admitted read-only provider accounts from PostgreSQL to canonical observations and a bridge outbox.
+Provider credentials are resolved through server-side OpenBao Agent references; environment metadata is not runtime authority.
 --once runs one complete sync cycle and exits.`); return }
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
-  const deps = createRuntimeDependencies(sql, config.deploymentId); let databaseReady = false; let cycleReady = false; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
+  const secretReader = createOpenBaoProviderSecretReader(process.env)
+  const tokenWriter = createOpenBaoPlaidTokenWriter(process.env)
+  const deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
+  const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
+  const snaptrade = createSnapTradeConnectTransport(process.env)
+  const nativeOnboarding = createNativeProviderOnboarding({
+    env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
+  })
+  const connect = new FinanceSyncConnectControl({
+    deploymentId: config.deploymentId,
+    connections: () => deps.loadConnections(config.deploymentId),
+    plaid: createPlaidConnectTransport({
+      env: process.env, secretReader,
+      secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
+    }),
+    snaptrade,
+    secretStore: tokenWriter,
+    nativeOnboarding,
+    sessionStore: new PostgresConnectSessionStore(sql),
+    onboarding,
+    onPlaidConnected: input => onboarding.recordConnection({
+      subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
+      secretReference: input.secretReference, accounts: input.accounts,
+    }),
+  })
+  let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {
     try {
       const result = await runConfiguredSyncCycle(config.deploymentId, deps)
-      cycleReady = result.failures === 0
-      if (cycleReady) console.log('Finance Sync cycle completed:', result)
-      else console.error('Finance Sync cycle completed with failures:', result)
+      connectionCount = result.connections
+      cycleReady = result.connections > 0 && result.failures === 0
+      if (result.connections === 0) console.log('FINANCE_SYNC_DISABLED')
+      else if (cycleReady) console.log('FINANCE_SYNC_CYCLE_OK')
+      else console.error('FINANCE_SYNC_CYCLE_FAILED')
     } catch {
       cycleReady = false
       // Never print provider/transport errors: SDK errors can contain secrets or financial payloads.
-      console.error('Finance Sync cycle failed')
+      console.error('FINANCE_SYNC_CYCLE_FAILED')
     }
   }
   const replay = async () => {
     try { await sql`SELECT 1`; databaseReady = true }
-    catch { databaseReady = false; console.error('Finance Sync database readiness failed') }
+    catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
   }
   try {
-    console.log('Running Finance Sync migrations...'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay(); await cycle()
-    if (args.once) { if (!databaseReady || !cycleReady) process.exitCode = 1; return }
-    const server = createServer((request, response) => { if (request.url !== '/health') return void response.writeHead(404).end(); const ready = databaseReady && cycleReady; response.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: ready, service: 'finance-sync' })) })
+    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay(); await cycle()
+    if (args.once) { if (!databaseReady || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
+    const handler = createFinanceSyncHttpHandler({
+      controlToken: config.controlToken,
+      connect,
+      health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount); return { status: body.ok ? 200 : 503, body } },
+    })
+    const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })
-    console.log(`Finance Sync health endpoint listening on :${config.healthPort}`)
+    console.log('FINANCE_SYNC_HEALTH_LISTENING')
     const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); if (!stopping) schedule() }, config.intervalMs) }; schedule()
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); await sql.end() }
 }
-main().catch(error => { console.error('Finance Sync runner failed:', error); process.exit(1) })
+main().catch(() => { console.error('FINANCE_SYNC_RUNNER_FAILED'); process.exit(1) })

@@ -6,7 +6,8 @@ import { createRuntimeDependencies } from "../runtime-deps";
 
 const url = process.env.FINANCE_SYNC_TEST_DATABASE_URL;
 const suite = url ? describe : describe.skip;
-const DEPLOYMENT_ID = "g2-integrity-test";
+const RUN_ID = `${process.pid}-${Date.now()}`;
+const DEPLOYMENT_ID = `g2-integrity-test-${RUN_ID}`;
 
 let sql: ReturnType<typeof postgres> | undefined;
 
@@ -71,14 +72,14 @@ suite("G2: raw_observations append-only enforcement", () => {
 
     // ASSERT — DELETE must be rejected by the append-only trigger
     await expect(
-      sql`DELETE FROM raw_observations WHERE observation_id = ${OBSERVATION_ID}`
+      sql`DELETE FROM raw_observations WHERE deployment_id = ${DEPLOYMENT_ID} AND observation_id = ${OBSERVATION_ID}`
     ).rejects.toThrow(/raw observations are append-only/i);
 
     // Verify the row was NOT deleted
     const [{ cnt }] = await sql`
       SELECT COUNT(*)::int AS cnt
       FROM raw_observations
-      WHERE observation_id = ${OBSERVATION_ID}
+      WHERE deployment_id = ${DEPLOYMENT_ID} AND observation_id = ${OBSERVATION_ID}
     `;
     expect(cnt).toBe(1);
   });
@@ -109,7 +110,7 @@ suite("G2: raw_observations append-only enforcement", () => {
 
     // DELETE should now succeed
     const delResult = await sql`
-      DELETE FROM raw_observations WHERE observation_id = ${OBSERVATION_ID}
+      DELETE FROM raw_observations WHERE deployment_id = ${DEPLOYMENT_ID} AND observation_id = ${OBSERVATION_ID}
     `;
     // postgres returns an array with one element containing `count`
     expect(delResult.length).toBe(0); // no RETURNING, so empty result set
@@ -118,7 +119,7 @@ suite("G2: raw_observations append-only enforcement", () => {
     const [{ cnt: afterDelete }] = await sql`
       SELECT COUNT(*)::int AS cnt
       FROM raw_observations
-      WHERE observation_id = ${OBSERVATION_ID}
+      WHERE deployment_id = ${DEPLOYMENT_ID} AND observation_id = ${OBSERVATION_ID}
     `;
     expect(afterDelete).toBe(0);
 
@@ -140,7 +141,7 @@ suite("G2: raw_observations append-only enforcement", () => {
     `;
 
     await expect(
-      sql`DELETE FROM raw_observations WHERE observation_id = ${OBSERVATION_ID}`
+      sql`DELETE FROM raw_observations WHERE deployment_id = ${DEPLOYMENT_ID} AND observation_id = ${OBSERVATION_ID}`
     ).rejects.toThrow(/raw observations are append-only/i);
   });
 });
@@ -150,7 +151,7 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
   it("transitions a pending outbox item to dead_letter state after MAX_PROJECTION_DELIVERY_ATTEMPTS failures", async () => {
     sql = postgres(url!, { connect_timeout: 3, prepare: false });
 
-    const deadLetterDeploymentId = "g8-dead-letter-test";
+    const deadLetterDeploymentId = `g8-dead-letter-test-${RUN_ID}`;
     process.env.FINANCE_SYNC_DEPLOYMENT_ID = deadLetterDeploymentId;
 
     const directory = resolve(import.meta.dirname, "../../../finance-sync-migrations");
@@ -199,18 +200,35 @@ suite("G8: projection_outbox dead-letter after retry exhaustion", () => {
     };
     await sql`
       INSERT INTO projection_outbox
-        (deployment_id, local_owner_id, connection_id, idempotency_key, payload, attempts)
+        (deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload, attempts)
       VALUES
-        (${deadLetterDeploymentId}, 'test-owner', 'test-conn', 'dlq-int-key-1',
+        (${deadLetterDeploymentId}, 'test-owner', 'test-conn', 1, 'dlq-int-key-1',
          ${JSON.stringify(outboxPayload)}, 2)
     `;
 
-    // Create runtime deps with a bridge URL guaranteed to fail (loopback with no listener)
+    const connection = { provider: 'plaid' as const, connectionId: 'test-conn', deploymentId: deadLetterDeploymentId, clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test', localOwnerId: 'urn:test#owner', sourceResourceIncarnationId: 'a0000000-0000-0000-0000-000000000030', accountIds: ['test-account'], wealthfolioAccountIds: { 'test-account': 'test-account' }, providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT' };
+    const { accessToken: _accessToken, clientId: _clientId, clientSecret: _clientSecret, ...connectionMetadata } = connection;
+    // Fully configured, allowlisted HTTPS endpoint guaranteed to refuse the connection.
     const deps = createRuntimeDependencies(sql, deadLetterDeploymentId, {
-      FINANCE_SYNC_BRIDGE_URL: "http://127.0.0.1:1",
+      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([connectionMetadata]),
+      FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify({ 'test-conn': {
+        accessToken: connection.accessToken, clientId: connection.clientId, clientSecret: connection.clientSecret,
+      } }),
+      FINANCE_SYNC_PLAID_URL: "https://sandbox.plaid.com",
+      FINANCE_SYNC_BRIDGE_URL: "https://127.0.0.1:1",
+      FINANCE_SYNC_BRIDGE_RECEIPT_URL: "https://127.0.0.1:1/receipts",
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: "127.0.0.1",
+      FINANCE_SYNC_BRIDGE_TOKEN: "test-token",
     });
 
-    const result = await deps.projectPending();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response('{"error":"rejected"}', { status: 400 })) as typeof fetch;
+    let result;
+    try {
+      result = await deps.projectPending(connection);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
 
     expect(result.delivered).toBe(0);
     expect(result.failed).toBe(1);
