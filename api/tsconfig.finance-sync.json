@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/finance-sync",
+    "scripts/plan_finance_sync_history.ts",
+    "scripts/plan_finance_sync_history.test.ts",
+    "scripts/apply_finance_sync_history.ts",
+    "scripts/apply_finance_sync_history.test.ts"
+  ]
+}

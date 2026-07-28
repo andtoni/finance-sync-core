@@ -89,7 +89,7 @@ function snapTradeAccounts(value: Awaited<ReturnType<ReturnType<ProviderTranspor
   }))
 }
 
-/** Server-only discovery using named OpenBao bundles. No secret or provider identity enters from HTTP. */
+/** Server-only discovery using named Infisical bundles. No secret or provider identity enters from HTTP. */
 export function createNativeProviderOnboarding(input: {
   readonly env: ProviderRuntimeEnv
   readonly secretStore: ProviderSecretReader

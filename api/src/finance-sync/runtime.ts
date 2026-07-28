@@ -13,13 +13,13 @@ interface RuntimeConnectionBase {
   readonly providerGeneration: number
   /** Wealthfolio grant epoch used only for receiver bridge authorization. */
   readonly receiverAccessGeneration: number
-  /** Non-secret OpenBao slot reference for active-connection allocation exclusion. */
+  /** Non-secret Infisical slot reference for active-connection allocation exclusion. */
   readonly secretReference: string
 }
 
 export interface PlaidRuntimeConnection extends RuntimeConnectionBase {
   readonly provider: 'plaid'
-  /** All Plaid credentials are resolved from the durable OpenBao bundle. */
+  /** All Plaid credentials are resolved from the durable Infisical bundle. */
   readonly clientId: string
   readonly clientSecret: string
   readonly accessToken: string

@@ -441,7 +441,7 @@ export function createSnapTradeConnectTransport(env: ProviderRuntimeEnv = proces
   }
 }
 
-/** Production remains fail-closed until the exact OpenBao writer slot policy is approved. */
+/** Production remains fail-closed until the exact Infisical writer slot policy is approved. */
 export const unavailableProviderSecretStore: ProviderSecretStore = {
   available: false,
   allowedSlots: [],
