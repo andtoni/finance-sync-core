@@ -100,6 +100,8 @@ export interface SnapTradeSyncConfig {
   readonly activitiesStartDate?: string
   readonly activitiesEndDate?: string
   readonly maxActivityRows?: number
+  /** Immutable admission mappings. When supplied, unmapped holdings are quarantined and block completion. */
+  readonly assetMappings?: Readonly<Record<string, string>>
 }
 
 export interface ObservationOutput {
@@ -124,6 +126,7 @@ export interface SnapTradeSyncResult {
   readonly activitiesObserved: number
   readonly activityPasses: number
   readonly complete: boolean
+  readonly quarantinedAssetIds: readonly string[]
 }
 
 export interface SnapTradeNormalizedAccount {
@@ -155,6 +158,8 @@ export interface SnapTradeNormalizedHolding {
 export interface SnapTradeNormalizedActivity {
   readonly id: string
   readonly accountId: string | null
+  /** SnapTrade's stable security id, required to pass an admitted asset mapping. */
+  readonly providerAssetId: string | null
   readonly type: string
   readonly symbol: string | null
   readonly units: string | null
@@ -199,6 +204,11 @@ function toIsoDate(raw: string | null | undefined): string {
   } catch {
     return new Date().toISOString()
   }
+}
+
+function providerAssetId(sym: SnapTradeRawSymbol | undefined): string | null {
+  if (!sym) return null
+  return sym.id ?? (typeof sym.symbol === 'object' ? sym.symbol?.id : undefined) ?? sym.universal_symbol_id ?? sym.universal_symbol?.id ?? null
 }
 
 function extractSymbol(sym: SnapTradeRawSymbol | undefined): string | null {
@@ -383,6 +393,7 @@ export function normalizeActivities(
     out.push({
       id: 'snaptrade:' + a.id,
       accountId: a.account?.id ?? a.account?.number ?? null,
+      providerAssetId: providerAssetId(a.symbol ?? undefined),
       type: kind,
       symbol,
       units,
@@ -420,6 +431,7 @@ export async function runSnapTradeSync(
   let holdingsObserved = 0
   let activitiesObserved = 0
   let complete = true
+  const quarantinedAssetIds = new Set<string>()
 
   // 1. Fetch accounts with positions
   let rawAccounts: readonly SnapTradeRawAccount[]
@@ -427,7 +439,7 @@ export async function runSnapTradeSync(
     rawAccounts = await transport.fetchAccounts()
     accountsFetched = rawAccounts.length
   } catch {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: false }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched: 0, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: false, quarantinedAssetIds: [] }
   }
 
   // Filter to configured account IDs if provided
@@ -438,7 +450,7 @@ export async function runSnapTradeSync(
 
   // Short-circuit: no accounts, nothing to sync
   if (rawAccounts.length === 0) {
-    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: true }
+    return { accounts: [], holdings: [], activities: [], observations, accountsFetched, holdingsObserved: 0, activitiesObserved: 0, activityPasses: 0, complete: true, quarantinedAssetIds: [] }
   }
 
   // 2. Process each account
@@ -478,6 +490,13 @@ export async function runSnapTradeSync(
     // Emit holding observations (holdings + cash positions)
     const normHoldings = normalizeHoldings(rawAcct)
     for (const h of normHoldings) {
+      const mappedAssetId = h.providerAssetId && config.assetMappings?.[h.providerAssetId]
+      if (config.assetMappings && !mappedAssetId) {
+        // Unknown securities never become a guessed Wealthfolio asset or a checkpoint-eligible snapshot.
+        quarantinedAssetIds.add(h.providerAssetId ?? `unidentified:${h.accountId}:${h.symbol}`)
+        complete = false
+        continue
+      }
       holdings.push(h)
       holdingsObserved++
 
@@ -485,6 +504,7 @@ export async function runSnapTradeSync(
       const payload = {
         accountId: h.accountId,
         providerAssetId: h.providerAssetId,
+        ...(mappedAssetId ? { wealthfolioAssetId: mappedAssetId } : {}),
         symbol: h.symbol,
         name: h.name,
         units: h.units,
@@ -540,12 +560,21 @@ export async function runSnapTradeSync(
     }
 
     for (const a of stableActivities ?? []) {
+      const requiresAssetMapping = a.symbol !== null
+      const mappedAssetId = a.providerAssetId && config.assetMappings?.[a.providerAssetId]
+      if (config.assetMappings && requiresAssetMapping && !mappedAssetId) {
+        quarantinedAssetIds.add(a.providerAssetId ?? `unidentified:activity:${a.accountId ?? 'unknown'}:${a.id}`)
+        complete = false
+        continue
+      }
       activities.push(a)
       activitiesObserved++
 
       const payload = {
         sourceId: a.id,
         accountId: a.accountId,
+        providerAssetId: a.providerAssetId,
+        ...(mappedAssetId ? { wealthfolioAssetId: mappedAssetId } : {}),
         type: a.type,
         symbol: a.symbol,
         units: a.units,
@@ -562,7 +591,7 @@ export async function runSnapTradeSync(
       }
       const semanticPayload = [
         config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-        'brokerage_activity', a.id, a.type, a.amount, a.currency, a.date,
+        'brokerage_activity', a.id, a.providerAssetId ?? '', a.type, a.amount, a.currency, a.date,
       ].join('\x00')
       const semanticHash = sha256(semanticPayload)
 
@@ -593,5 +622,6 @@ export async function runSnapTradeSync(
     activitiesObserved,
     activityPasses,
     complete,
+    quarantinedAssetIds: Object.freeze([...quarantinedAssetIds].sort()),
   }
 }

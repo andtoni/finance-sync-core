@@ -91,6 +91,10 @@ export function createFinanceSyncHttpHandler(input: {
           assetMappings: body.assetMappings as { providerAssetId: string; wealthfolioAssetId: string }[],
         }))
       }
+      const disconnect = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/([^/]+)$/)
+      if (request.method === 'DELETE' && disconnect) {
+        return send(response, 200, await input.connect.disconnect(rawSubject, decodeURIComponent(disconnect[1]), decodeURIComponent(disconnect[2])))
+      }
       const start = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/start$/)
       if (request.method === 'POST' && start) {
         return send(response, 200, await input.connect.start(rawSubject, decodeURIComponent(start[1])))

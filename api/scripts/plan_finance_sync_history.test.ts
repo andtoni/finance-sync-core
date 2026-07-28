@@ -28,10 +28,18 @@ describe('historical Finance Sync migration planner', () => {
     expect(manifest.mode).toBe('dry-run')
     expect(manifest.ledger).toHaveLength(2)
     expect(manifest.ledger.every(row => row.activityType === 'WITHDRAWAL' && row.cutoverWatermark === mappings.accountMappings[0].cutoverWatermark)).toBe(true)
-    expect(manifest.learningEvidence.map(x => x.authority).sort()).toEqual(['historical_hint', 'user_confirmed'])
+    expect(manifest.learningEvidence.map(x => x.authority).sort()).toEqual(['historical_hint', 'historical_hint'])
     expect(manifest.learningEvidence[0]).toMatchObject({ accountId: 'canonical-a', taxonomyId: 'tax-1', categoryId: 'cat-food', merchantKeyVersion: 1, normalizationVersion: 1, labelCount: 2, agreementState: 'agreement' })
     expect(manifest.overlapCandidates).toHaveLength(1)
     expect(manifest.rollback.ledgerIdentities).toEqual(manifest.ledger.map(x => x.identity))
+  })
+
+  it('uses explicit reviewed authority rather than source provenance and requires three agreeing labels', async () => {
+    const row = { ...base, sourceId: 'lm-reviewed', accountRef: 'lm-a', categoryRef: '10', userConfirmedCategory: true, labelCount: 3 }
+    const accepted = await planFinanceSyncHistory({ tarn: reader([]), lunchMoney: reader([row]) }, { importRunId: 'reviewed-lm', ...mappings })
+    expect(accepted.learningEvidence[0]).toMatchObject({ authority: 'user_confirmed', agreementState: 'agreement', labelCount: 3 })
+    const conflict = await planFinanceSyncHistory({ tarn: reader([]), lunchMoney: reader([{ ...row, agreementState: 'conflict' as const }]) }, { importRunId: 'conflict-lm', ...mappings })
+    expect(conflict.learningEvidence[0]?.authority).toBe('historical_hint')
   })
 
   it('fails closed on missing explicit semantics and ambiguous mappings', async () => {

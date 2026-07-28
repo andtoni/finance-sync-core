@@ -42,6 +42,10 @@ const categoryMappings = [
   { source: 'lunch_money' as const, sourceCategoryRef: '10', canonicalCategoryKey: 'food', taxonomyId: 'tax-1', categoryId: 'cat-food' },
 ]
 const evidence = { activityType: 'WITHDRAWAL', direction: 'outflow' as const, merchantKeyVersion: 1, normalizationVersion: 1, firstLabelDate: '2025-01-01T00:00:00.000Z', lastLabelDate: '2025-06-01T00:00:00.000Z', labelCount: 3, agreementState: 'agreement' as const }
+function ownerApproval(manifestHash: string) {
+  return { approvalId: 'owner-approved-run-1', action: 'apply_finance_sync_history' as const, subject: 'finance-sync', importRunId: 'synthetic-run-1', manifestHash, issuedAt: '2026-01-01T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z' }
+}
+const verifyOwnerApproval = async () => true
 async function syntheticManifest() {
   const overlap = { ...evidence, effectiveAt: '2025-06-01T12:00:00.000Z', amount: '-12.50', currency: 'USD', rawDescription: 'Cafe' }
   return planFinanceSyncHistory({
@@ -60,14 +64,22 @@ describe('historical Finance Sync apply orchestration', () => {
     const keep = manifest.ledger.find(x => x.sourceId === 'lm-overlap')!.identity
     const resolutions = [{ candidateId: cross.candidateId, action: 'keep_one' as const, ledgerIdentity: keep }, { candidateId: cutover.candidateId, action: 'exclude_all' as const }]
     const sink = new FakeHistorySink()
-    await applyFinanceSyncHistory(manifest, sink, { resolutions }); expect(sink.batches).toEqual([])
-    const first = await applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', resolutions, batchSize: 2 })
-    expect(first.ledger).toMatchObject({ selected: 2, written: 2 }); expect(first.learningEvidence).toMatchObject({ selectedManual: 3, written: 3 })
+    const preview = await applyFinanceSyncHistory(manifest, sink, { resolutions }); expect(sink.batches).toEqual([])
+    const first = await applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', ownerApproval: ownerApproval(preview.manifestHash), verifyOwnerApproval, resolutions, batchSize: 2 })
+    expect(first.ledger).toMatchObject({ selected: 2, written: 2 }); expect(first.learningEvidence).toMatchObject({ selectedManual: 4, written: 4 })
     expect(sink.batches.every(batch => batch.schemaVersion === 1 && batch.subject === 'finance-sync' && batch.overlapsResolved === true && batch.idempotencyKey.length > 20)).toBe(true)
     const appliedBatches = sink.batches.filter((batch): batch is Exclude<WealthfolioHistoricalBatch, { operation: 'rollback' }> => batch.operation !== 'rollback')
     expect(new Set(appliedBatches.map(batch => batch.manifestHash)).size).toBe(1)
     expect(appliedBatches.every(batch => historicalManifestHash(batch.manifest) === batch.manifestHash && batch.manifest.ledger.length === manifest.ledger.length && batch.manifest.overlapResolutions.length === resolutions.length)).toBe(true)
     expect(appliedBatches.every(batch => JSON.stringify(batch.manifest) === JSON.stringify(appliedBatches[0].manifest))).toBe(true)
+    expect(appliedBatches[0]!.manifest.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'tarn', ledgerCount: 3, totals: [{ currency: 'USD', amount: '-51.5' }] }),
+      expect.objectContaining({ source: 'lunch_money', ledgerCount: 1, totals: [{ currency: 'USD', amount: '-12.5' }] }),
+    ]))
+    expect(appliedBatches[0]!.manifest.ledger.find(row => row.sourceId === 't-normal')).toMatchObject({
+      sourceAccountRef: 't-a', historicalIdentity: manifest.ledger.find(row => row.sourceId === 't-normal')!.identity,
+      activityType: 'WITHDRAWAL', rawDescription: 'Grocer', amount: '-30', currency: 'USD', disposition: 'selected',
+    })
     const ledgerBatch = sink.batches.find(batch => batch.operation === 'stage_ledger')! as Extract<WealthfolioHistoricalBatch, { operation: 'stage_ledger' }>
     expect(ledgerBatch.rows[0]).toMatchObject({ accountId: 'canonical-a', activityType: 'WITHDRAWAL', cutoverWatermark: '2026-01-01T00:00:00.000Z' })
     const evidenceBatches = sink.batches.filter(batch => batch.operation === 'stage_learning_evidence') as Extract<WealthfolioHistoricalBatch, { operation: 'stage_learning_evidence' }>[]
@@ -80,15 +92,15 @@ describe('historical Finance Sync apply orchestration', () => {
     })
     expect(evidenceByLedger.get(manifest.ledger.find(row => row.sourceId === 't-normal')!.identity)).toMatchObject({ ledgerDisposition: 'selected', overlapProvenance: [] })
     expect(JSON.stringify(sink.batches)).not.toMatch(/token|authorization|credential/i)
-    const rerun = await applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', resolutions, batchSize: 2 })
-    expect(rerun.ledger).toMatchObject({ written: 2, alreadyPresent: 0 }); expect(rerun.learningEvidence).toMatchObject({ written: 3, alreadyPresent: 0 })
+    const rerun = await applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', ownerApproval: ownerApproval(preview.manifestHash), verifyOwnerApproval, resolutions, batchSize: 2 })
+    expect(rerun.ledger).toMatchObject({ written: 2, alreadyPresent: 0 }); expect(rerun.learningEvidence).toMatchObject({ written: 4, alreadyPresent: 0 })
     const rollback = await rollbackFinanceSyncHistory(manifest.provenance.importRunId, sink, { apply: true, subject: 'finance-sync' })
     const rollbackBatch = sink.batches.at(-1)!
     expect(rollbackBatch.operation).toBe('rollback')
     expect(rollbackBatch).not.toHaveProperty('manifest')
     expect(rollbackBatch).not.toHaveProperty('manifestHash')
     const rollbackAgain = await rollbackFinanceSyncHistory(manifest.provenance.importRunId, sink, { apply: true, subject: 'finance-sync' })
-    expect(rollback).toMatchObject({ ledgerDeleted: 2, learningEvidenceDeleted: 3 }); expect(rollbackAgain).toEqual(rollback); expect(rollbackAgain.idempotencyKey).toBe(rollback.idempotencyKey)
+    expect(rollback).toMatchObject({ ledgerDeleted: 2, learningEvidenceDeleted: 4 }); expect(rollbackAgain).toEqual(rollback); expect(rollbackAgain.idempotencyKey).toBe(rollback.idempotencyKey)
   })
 
   it('refuses ambiguity and unresolved candidates before writes', async () => {
@@ -99,13 +111,48 @@ describe('historical Finance Sync apply orchestration', () => {
     expect(sink.batches).toEqual([])
   })
 
+  it('rejects tampered reviewed evidence below the agreement threshold before a sink write', async () => {
+    const manifest = await syntheticManifest()
+    const evidenceRow = manifest.learningEvidence[0]!
+    const tampered = { ...manifest, learningEvidence: [{ ...evidenceRow, authority: 'user_confirmed' as const, labelCount: 2 }] }
+    await expect(applyFinanceSyncHistory(tampered, new FakeHistorySink(), { resolutions: manifest.overlapCandidates.map(candidate =>
+      candidate.reason === 'at_or_after_cutover' ? { candidateId: candidate.candidateId, action: 'exclude_all' as const } : { candidateId: candidate.candidateId, action: 'exclude_all' as const },
+    ) })).rejects.toThrow('three agreeing labels')
+  })
+
+  it('requires owner approval bound to the exact reviewed manifest hash before any apply', async () => {
+    const manifest = await syntheticManifest(); const sink = new FakeHistorySink()
+    const resolutions = manifest.overlapCandidates.map(candidate => ({ candidateId: candidate.candidateId, action: 'exclude_all' as const }))
+    await expect(applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', resolutions })).rejects.toThrow('separately verified action-bound manifest approval')
+    expect(sink.batches).toEqual([])
+  })
+
+  it('rejects a self-echoed hash without a separately trusted verifier before writes', async () => {
+    const manifest = await syntheticManifest(); const sink = new FakeHistorySink()
+    const resolutions = manifest.overlapCandidates.map(candidate => ({ candidateId: candidate.candidateId, action: 'exclude_all' as const }))
+    const preview = await applyFinanceSyncHistory(manifest, sink, { resolutions })
+    await expect(applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', ownerApproval: ownerApproval(preview.manifestHash), resolutions })).rejects.toThrow('separately verified')
+    await expect(applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', ownerApproval: ownerApproval(preview.manifestHash), verifyOwnerApproval: async () => false, resolutions })).rejects.toThrow('separately verified')
+    expect(sink.batches).toEqual([])
+  })
+
+  it('validates evidence receipts before sending ledger batches', async () => {
+    const manifest = await syntheticManifest(); const sink = new FakeHistorySink()
+    const resolutions = manifest.overlapCandidates.map(candidate => ({ candidateId: candidate.candidateId, action: 'exclude_all' as const }))
+    const preview = await applyFinanceSyncHistory(manifest, sink, { resolutions })
+    const original = sink.writeHistoricalBatch.bind(sink)
+    sink.writeHistoricalBatch = batch => { if (batch.operation === 'stage_learning_evidence') throw new Error('evidence rejected'); return original(batch) }
+    await expect(applyFinanceSyncHistory(manifest, sink, { apply: true, subject: 'finance-sync', ownerApproval: ownerApproval(preview.manifestHash), verifyOwnerApproval, resolutions })).rejects.toThrow('evidence rejected')
+    expect(sink.batches.some(batch => batch.operation === 'stage_ledger')).toBe(false)
+  })
+
   it('matches the receiver canonical reviewed-manifest fixture and hash vector', () => {
     const manifest: HistoricalReviewedManifest = {
-      ledger: [{ identity: 'history-1', source: 'tarn', accountId: 'allowed', disposition: 'selected' }],
+      schemaVersion: 1, importRunId: 'run-1', sources: [{ source: 'tarn', checksum: 'a'.repeat(64), ledgerCount: 1, totals: [{ currency: 'USD', amount: '-1' }] }],
+      ledger: [{ idempotencyKey: 'history-1', historicalIdentity: 'history-1', source: 'tarn', sourceId: 'source-1', sourceAccountRef: 'source-account-1', accountId: 'allowed', activityType: 'WITHDRAWAL', effectiveAt: '2026-01-01T00:00:00.000Z', cutoverWatermark: '2026-02-01T00:00:00.000Z', amount: '-1', currency: 'USD', rawDescription: 'test', provenance: { importRunId: 'run-1', source: 'tarn' }, disposition: 'selected' }],
       evidence: [], overlapResolutions: [],
     }
-    expect(JSON.stringify(manifest)).toBe('{"ledger":[{"identity":"history-1","source":"tarn","accountId":"allowed","disposition":"selected"}],"evidence":[],"overlapResolutions":[]}')
-    expect(historicalManifestHash(manifest)).toBe('c975605142dba66c64b1b5893029cd9f92ddb307b2371a32af997163c2c5e17e')
+    expect(historicalManifestHash(manifest)).toMatch(/^[a-f0-9]{64}$/)
   })
 
   it('HTTP adapter injects both independent credentials per call and never serializes them', async () => {

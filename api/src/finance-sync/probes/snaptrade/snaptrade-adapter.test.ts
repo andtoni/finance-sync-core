@@ -233,6 +233,7 @@ describe('normalizeActivities', () => {
       'snaptrade:act-3',
     ])
     expect(result.map(r => r.type)).toEqual(['dividend', 'buy', 'contribution'])
+    expect(result[0]?.providerAssetId).toBeNull()
   })
 
   it('accepts the paginated { data: [...] } wrapper', () => {
@@ -310,6 +311,29 @@ describe('runSnapTradeSync', () => {
     expect(domains.filter(d => d === 'holding').length).toBe(2) // VTI and SCHB
     expect(domains.filter(d => d === 'cash_ledger').length).toBe(1) // CASH
     expect(domains.filter(d => d === 'brokerage_activity').length).toBe(3)
+  })
+
+  it('quarantines unmapped synthetic assets and permits only explicit immutable mappings', async () => {
+    const result = await runSnapTradeSync({ ...DEFAULT_CONFIG, assetMappings: { 'asset-vti': 'wf-vti' } }, mockTransport([{
+      ...ACCOUNT_FIXTURE,
+      positions: [{ ...ACCOUNT_FIXTURE.positions![0]!, symbol: { ...ACCOUNT_FIXTURE.positions![0]!.symbol!, id: 'asset-vti' } },
+        { ...ACCOUNT_FIXTURE.positions![1]!, symbol: { ...ACCOUNT_FIXTURE.positions![1]!.symbol!, id: 'asset-cash' } }],
+    }], []))
+    expect(result.complete).toBe(false)
+    expect(result.quarantinedAssetIds).toEqual(['asset-cash'])
+    expect(result.holdings.map(holding => holding.providerAssetId)).toEqual(['asset-vti'])
+    expect(result.observations.find(observation => observation.payload.providerAssetId === 'asset-vti')?.payload).toMatchObject({ wealthfolioAssetId: 'wf-vti' })
+  })
+
+  it('preserves activity asset IDs and quarantines unmapped activity observations', async () => {
+    const activities = [{ ...ACTIVITIES_FIXTURE[0]!, symbol: { ...ACTIVITIES_FIXTURE[0]!.symbol!, id: 'asset-vti' } }]
+    const result = await runSnapTradeSync({ ...DEFAULT_CONFIG, assetMappings: { 'asset-holding': 'wf-holding' } }, mockTransport([{
+      ...ACCOUNT_FIXTURE, positions: [{ ...ACCOUNT_FIXTURE.positions![0]!, symbol: { ...ACCOUNT_FIXTURE.positions![0]!.symbol!, id: 'asset-holding' } }],
+    }], activities))
+    expect(result.activitiesObserved).toBe(0)
+    expect(result.complete).toBe(false)
+    expect(result.quarantinedAssetIds).toContain('asset-vti')
+    expect(result.observations.some(observation => observation.providerVersion.includes('activity:'))).toBe(false)
   })
 
   it('filters to configured account IDs', async () => {

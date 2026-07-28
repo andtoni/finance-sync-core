@@ -172,7 +172,7 @@ export async function planFinanceSyncHistory(
         canonicalCategoryKey: category.canonicalCategoryKey, taxonomyId: category.taxonomyId, categoryId: category.categoryId,
         direction: row.direction, activityType, providerContext: row.providerContext ?? null,
         firstLabelDate, lastLabelDate, labelCount, agreementState: row.agreementState,
-        authority: source === 'tarn' && row.userConfirmedCategory === true ? 'user_confirmed' : 'historical_hint',
+        authority: row.userConfirmedCategory === true && row.agreementState === 'agreement' && labelCount >= 3 ? 'user_confirmed' : 'historical_hint',
         provenance: { importRunId: options.importRunId, source, sourceCategoryRef: row.categoryRef },
       })
     }

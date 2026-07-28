@@ -57,19 +57,23 @@ export interface HistoricalLearningEvidenceWrite {
 }
 
 export interface HistoricalReviewedManifest {
-  readonly ledger: readonly {
-    readonly identity: string
+  readonly schemaVersion: 1
+  readonly importRunId: string
+  /** Immutable source coverage, including excluded ledger rows. */
+  readonly sources: readonly {
     readonly source: HistoricalSource
-    readonly accountId: string
+    readonly checksum: string
+    readonly ledgerCount: number
+    readonly totals: readonly { readonly currency: string; readonly amount: string }[]
+  }[]
+  /** Every ledger field is approval-bound, including rows excluded by overlap review. */
+  readonly ledger: readonly (HistoricalLedgerWrite & {
+    readonly sourceAccountRef: string
+    readonly provenance: { readonly importRunId: string; readonly source: HistoricalSource }
     readonly disposition: 'selected' | 'excluded'
-  }[]
-  readonly evidence: readonly {
-    readonly identity: string
-    readonly source: HistoricalSource
-    readonly accountId: string
-    readonly authority: 'user_confirmed'
-    readonly payloadDigest: string
-  }[]
+  })[]
+  /** Full reviewed evidence payloads, rather than a lossy digest-only summary. */
+  readonly evidence: readonly HistoricalLearningEvidenceWrite[]
   readonly overlapResolutions: readonly HistoricalLearningEvidenceWrite['overlapProvenance'][number][]
 }
 
@@ -103,15 +107,32 @@ export interface WealthfolioHistorySink {
   writeHistoricalBatch(batch: WealthfolioHistoricalBatch): MaybePromise<WealthfolioHistoricalBatchReceipt>
 }
 
+export interface HistoricalOwnerApproval {
+  readonly approvalId: string
+  readonly action: 'apply_finance_sync_history'
+  readonly subject: string
+  readonly importRunId: string
+  readonly manifestHash: string
+  readonly issuedAt: string
+  readonly expiresAt: string
+}
+export type HistoricalOwnerApprovalVerifier = (approval: HistoricalOwnerApproval, manifest: HistoricalReviewedManifest) => MaybePromise<boolean>
+
 export interface HistoricalApplyOptions {
   readonly apply?: boolean
   readonly subject?: string
+  /** Separately obtained owner evidence; caller hashes alone are not approvals. */
+  readonly ownerApproval?: HistoricalOwnerApproval
+  /** Trusted verifier supplied by the owner-approval authority. */
+  readonly verifyOwnerApproval?: HistoricalOwnerApprovalVerifier
   readonly resolutions?: readonly HistoricalCandidateResolution[]
   readonly batchSize?: number
 }
 export interface HistoricalApplyResult {
   readonly mode: 'dry-run' | 'applied'
   readonly importRunId: string
+  /** Exact canonical reviewed-manifest hash that owner approval must name for apply. */
+  readonly manifestHash: string
   readonly ledger: { readonly manifest: number; readonly selected: number; readonly excluded: number; readonly written: number; readonly alreadyPresent: number; readonly checksum: string }
   readonly learningEvidence: { readonly manifest: number; readonly selectedManual: number; readonly excludedHints: number; readonly written: number; readonly alreadyPresent: number; readonly checksum: string }
 }
@@ -182,7 +203,7 @@ function validateManifest(manifest: HistoricalMigrationManifest): Map<string, Ca
     const category = categories.get(mappingKey(row.provenance.source, row.provenance.sourceCategoryRef))
     if (!category || category.canonicalCategoryKey !== row.canonicalCategoryKey || category.taxonomyId !== row.taxonomyId || category.categoryId !== row.categoryId) throw new Error(`missing or ambiguous category mapping for evidence: ${row.identity}`)
     if (!row.accountId.trim() || !row.activityType.trim() || !row.merchantKey.trim() || row.labelCount < 1 || !Number.isSafeInteger(row.labelCount)) throw new Error(`invalid strict evidence fields: ${row.identity}`)
-    if (row.authority === 'user_confirmed' && row.provenance.source !== 'tarn') throw new Error(`non-Tarn evidence cannot be authoritative: ${row.identity}`)
+    if (row.authority === 'user_confirmed' && (row.agreementState !== 'agreement' || row.labelCount < 3)) throw new Error(`authoritative evidence requires three agreeing labels: ${row.identity}`)
   }
   const candidates = uniqueBy(manifest.overlapCandidates, row => row.candidateId, 'overlap candidate')
   const cutoffCovered = new Set<string>()
@@ -246,22 +267,47 @@ function reviewedManifest(
       excludedLedgerIdentities: candidate.ledgerIdentities.filter(identity => identity !== selectedLedgerIdentity).sort(),
     }
   }).sort((a, b) => a.candidateId.localeCompare(b.candidateId))
+  const sourceSummaries = (['tarn', 'lunch_money'] as const).map(source => {
+    const rows = manifest.ledger.filter(row => row.source === source).sort((a, b) => a.identity.localeCompare(b.identity))
+    const totals = new Map<string, string>()
+    for (const row of rows) totals.set(row.currency, addDecimal(totals.get(row.currency) ?? '0', row.amount))
+    return Object.freeze({ source, checksum: createHash('sha256').update(canonicalJson(rows), 'utf8').digest('hex'), ledgerCount: rows.length,
+      totals: Object.freeze([...totals].map(([currency, amount]) => Object.freeze({ currency, amount })).sort((a, b) => a.currency.localeCompare(b.currency))) })
+  })
   return Object.freeze({
+    schemaVersion: 1 as const, importRunId: manifest.provenance.importRunId, sources: Object.freeze(sourceSummaries),
     ledger: Object.freeze(manifest.ledger.map(row => Object.freeze({
-      identity: row.identity, source: row.source, accountId: row.canonicalAccountId,
+      ...ledgerWrite(row), sourceAccountRef: row.sourceAccountRef, provenance: row.provenance,
       disposition: excluded.has(row.identity) ? 'excluded' as const : 'selected' as const,
-    })).sort((a, b) => a.identity.localeCompare(b.identity))),
-    evidence: Object.freeze([]),
-    overlapResolutions: Object.freeze(overlapResolutions),
+    })).sort((a, b) => a.historicalIdentity.localeCompare(b.historicalIdentity))),
+    evidence: Object.freeze([]), overlapResolutions: Object.freeze(overlapResolutions),
   })
 }
+function addDecimal(left: string, right: string): string {
+  const parse = (value: string) => { const [whole, fraction = ''] = value.replace(/^\+/, '').split('.'); return { negative: whole.startsWith('-'), whole: (whole.replace('-', '') || '0'), fraction } }
+  const a = parse(left); const b = parse(right); const scale = Math.max(a.fraction.length, b.fraction.length)
+  const integer = (value: { negative: boolean; whole: string; fraction: string }) => BigInt(`${value.negative ? '-' : ''}${value.whole}${value.fraction.padEnd(scale, '0')}`)
+  const total = integer(a) + integer(b); const negative = total < 0n; const digits = (negative ? -total : total).toString().padStart(scale + 1, '0')
+  const whole = scale ? digits.slice(0, -scale) : digits; const fraction = scale ? digits.slice(-scale).replace(/0+$/, '') : ''
+  return `${negative ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`
+}
+async function validateOwnerApproval(approval: HistoricalOwnerApproval | undefined, verifier: HistoricalOwnerApprovalVerifier | undefined, subject: string, importRunId: string, manifestHash: string, manifest: HistoricalReviewedManifest): Promise<void> {
+  if (!approval || !verifier || !approval.approvalId.trim() || approval.action !== 'apply_finance_sync_history'
+    || approval.subject !== subject || approval.importRunId !== importRunId || approval.manifestHash !== manifestHash
+    || Number.isNaN(Date.parse(approval.issuedAt)) || Number.isNaN(Date.parse(approval.expiresAt))
+    || Date.parse(approval.issuedAt) > Date.now() || Date.parse(approval.expiresAt) <= Date.now()) {
+    throw new Error('separately verified action-bound manifest approval is required')
+  }
+  if (!await verifier(approval, manifest)) throw new Error('separately verified action-bound manifest approval is required')
+}
+
 function evidenceWrite(
   row: Evidence,
   candidates: Map<string, Candidate>,
   resolutions: ReadonlyMap<string, HistoricalCandidateResolution>,
   excluded: ReadonlySet<string>,
 ): HistoricalLearningEvidenceWrite {
-  if (row.authority !== 'user_confirmed' || row.provenance.source !== 'tarn') throw new Error('historical hints cannot be written as authoritative evidence')
+  if (row.authority !== 'user_confirmed' || row.agreementState !== 'agreement' || row.labelCount < 3) throw new Error('historical evidence is not authoritative')
   const overlapProvenance = [...candidates.values()].filter(candidate => candidate.ledgerIdentities.includes(row.ledgerIdentity)).map(candidate => {
     const resolution = resolutions.get(candidate.candidateId)
     if (!resolution) throw new Error(`missing reviewed resolution for evidence: ${row.identity}`)
@@ -320,23 +366,21 @@ export async function applyFinanceSyncHistory(manifest: HistoricalMigrationManif
   const manifestWithoutEvidence = reviewedManifest(manifest, candidates, resolutions, excluded)
   const canonicalManifest: HistoricalReviewedManifest = Object.freeze({
     ...manifestWithoutEvidence,
-    evidence: Object.freeze(evidenceRows.map(row => Object.freeze({
-      identity: row.idempotencyKey, source: row.source, accountId: row.accountId,
-      authority: 'user_confirmed' as const,
-      payloadDigest: createHash('sha256').update(canonicalJson(row), 'utf8').digest('hex'),
-    })).sort((a, b) => a.identity.localeCompare(b.identity))),
+    evidence: Object.freeze(evidenceRows.map(row => Object.freeze(row)).sort((a, b) => a.idempotencyKey.localeCompare(b.idempotencyKey))),
   })
   const manifestHash = historicalManifestHash(canonicalManifest)
   let ledgerReceipt = { written: 0, alreadyPresent: 0 }; let evidenceReceipt = { written: 0, alreadyPresent: 0 }
   if (options.apply === true) {
     const subject = requiredSubject(options.subject)
-    ledgerReceipt = await writeBatches(ledgerRows, 'stage_ledger', batchSize, subject, importRunId, canonicalManifest, manifestHash, sink)
+    await validateOwnerApproval(options.ownerApproval, options.verifyOwnerApproval, subject, importRunId, manifestHash, canonicalManifest)
+    // Evidence is accepted and receipt-validated before any financial ledger batch is sent.
     evidenceReceipt = await writeBatches(evidenceRows, 'stage_learning_evidence', batchSize, subject, importRunId, canonicalManifest, manifestHash, sink)
+    ledgerReceipt = await writeBatches(ledgerRows, 'stage_ledger', batchSize, subject, importRunId, canonicalManifest, manifestHash, sink)
     const idempotencyKey = `hist_finalize_v1_${digest([importRunId, manifestHash])}`
     const finalize = await sink.writeHistoricalBatch({ schemaVersion: 1, subject, importRunId, idempotencyKey, dryRun: false, overlapsResolved: true, operation: 'finalize', manifestHash, manifest: canonicalManifest })
     validateReceipt(finalize, importRunId, ledgerRows.length + evidenceRows.length, checksum([...ledgerRows, ...evidenceRows].map(row => row.idempotencyKey)))
   }
-  return { mode: options.apply === true ? 'applied' : 'dry-run', importRunId,
+  return { mode: options.apply === true ? 'applied' : 'dry-run', importRunId, manifestHash,
     ledger: { manifest: manifest.ledger.length, selected: ledgerRows.length, excluded: excluded.size, ...ledgerReceipt, checksum: checksum(ledgerRows.map(row => row.idempotencyKey)) },
     learningEvidence: { manifest: manifest.learningEvidence.length, selectedManual: evidenceRows.length, excludedHints: manifest.learningEvidence.length - evidenceRows.length, ...evidenceReceipt, checksum: checksum(evidenceRows.map(row => row.idempotencyKey)) },
   }

@@ -158,6 +158,28 @@ export class PostgresOnboardingRepository {
     })
   }
 
+  /** Local revocation is generation-fenced and never calls a provider write API. */
+  async revoke(subject: string, provider: string, connectionId: string): Promise<boolean> {
+    return await this.sql.begin(async transaction => {
+      const tx = transaction as unknown as FinanceSyncSql
+      const connection = await tx<{ connectionId: string }[]>`
+        UPDATE provider_connections
+        SET provider_generation = provider_generation + 1, state = 'disabled', disabled_at = now()
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${subject}
+          AND provider = ${provider} AND connection_id = ${connectionId}::uuid AND state <> 'disabled'
+        RETURNING connection_id::text AS "connectionId"
+      `
+      if (connection.length !== 1) return false
+      await tx`
+        UPDATE provider_account_admissions SET revoked_at = now(), baseline_state = 'pending',
+          baseline_verified_at = NULL, baseline_fingerprint = NULL
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${subject}
+          AND connection_id = ${connection[0]!.connectionId}::uuid AND revoked_at IS NULL
+      `
+      return true
+    })
+  }
+
   async reconciliationStatus(subject: string, provider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata | null> {
     return this.status(this.sql, subject, provider, connectionId, providerAccountId)
   }

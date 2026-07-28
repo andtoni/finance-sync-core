@@ -32,6 +32,7 @@ beforeEach(async () => {
           receiverAccessGeneration: input.receiverAccessGeneration, baselineStatus: 'verified',
           baselineDigest: input.databaseStateDigest, assetMappingDigest: 'sha256:empty' }
       },
+      revoke: async (boundSubject, provider, connectionId) => boundSubject === subject && provider === 'plaid' && connectionId === 'connection-1',
       reconciliationStatus: async () => ({ wealthfolioAccountId: 'wf-1', providerGeneration: 3,
         receiverAccessGeneration: 7, baselineStatus: 'verified', baselineDigest: 'sha256:baseline', assetMappingDigest: 'sha256:empty' }),
     },
@@ -121,6 +122,14 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(relink.status).toBe(200)
     expect(admitted.at(-1)).toMatchObject({ subject, provider: 'plaid', providerGeneration: 3,
       baselineKind: 'relink', priorProviderGeneration: 2, databaseStateDigest: relinkDigest })
+  })
+
+  it('disconnects a subject-bound provider without exposing a 501 path', async () => {
+    const response = await fetch(`${base}/control/v1/provider-connections/plaid/connection-1`, { method: 'DELETE', headers: headers() })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ provider: 'plaid', status: 'disconnected', message: 'Provider connection was disconnected.' })
+    const absent = await fetch(`${base}/control/v1/provider-connections/mercury/connection-1`, { method: 'DELETE', headers: headers() })
+    expect(absent.status).toBe(404)
   })
 
   it('does not accept a subject from query or JSON', async () => {

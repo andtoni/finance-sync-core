@@ -77,6 +77,7 @@ export interface ConnectControlDependencies {
       receiverAccessGeneration: number; baselineKind: 'empty' | 'relink'; priorProviderGeneration?: number
       assetMappings: readonly ProviderAssetMapping[]
     }): Promise<AdmissionMetadata>
+    revoke(subject: string, provider: string, connectionId: string): Promise<boolean>
     reconciliationStatus(subject: string, provider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata | null>
   }
   readonly onPlaidConnected?: (input: {
@@ -329,10 +330,17 @@ export class FinanceSyncConnectControl {
     return metadata
   }
 
-  async disconnect(rawSubject: string, rawProvider: string): Promise<never> {
-    subject(rawSubject)
-    provider(rawProvider)
-    throw new ConnectControlError(501, 'provider revocation is not implemented')
+  async disconnect(rawSubject: string, rawProvider: string, connectionId: string): Promise<Record<string, string>> {
+    const boundSubject = subject(rawSubject)
+    const selected = provider(rawProvider)
+    if (!this.deps.onboarding || !connectionId || connectionId.length > 512 || connectionId.includes('\0')) throw new ConnectControlError(400, 'invalid provider connection')
+    try {
+      if (!await this.deps.onboarding.revoke(boundSubject, selected, connectionId)) throw new ConnectControlError(404, 'provider connection not found')
+      return { provider: selected, status: 'disconnected', message: 'Provider connection was disconnected.' }
+    } catch (error) {
+      if (error instanceof ConnectControlError) throw error
+      throw new ConnectControlError(503, 'provider disconnect failed')
+    }
   }
 }
 

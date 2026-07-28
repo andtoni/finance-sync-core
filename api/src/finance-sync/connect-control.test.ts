@@ -254,10 +254,13 @@ describe('Finance Sync Connect control plane', () => {
     expect(deps.secretStore.storePlaidAccessToken).toHaveBeenCalledWith(expect.objectContaining({ secretReference: 'PLAID_SLOT_A' }))
   })
 
-  it('fails disconnect closed for every allowlisted provider', async () => {
-    const control = new FinanceSyncConnectControl(dependencies())
-    for (const provider of CONNECT_PROVIDERS) {
-      await expect(control.disconnect(subjectA, provider)).rejects.toEqual(expect.objectContaining<Partial<ConnectControlError>>({ status: 501 }))
-    }
+  it('generation-fences local disconnects without a provider write', async () => {
+    const revoke = vi.fn(async (boundSubject: string, provider: string, connectionId: string) => boundSubject === subjectA && provider === 'plaid' && connectionId === 'connection-1')
+    const control = new FinanceSyncConnectControl(dependencies({ onboarding: {
+      listPending: vi.fn(), admit: vi.fn(), revoke, reconciliationStatus: vi.fn(),
+    } }))
+    await expect(control.disconnect(subjectA, 'plaid', 'connection-1')).resolves.toMatchObject({ provider: 'plaid', status: 'disconnected' })
+    expect(revoke).toHaveBeenCalledWith(subjectA, 'plaid', 'connection-1')
+    await expect(control.disconnect(subjectA, 'mercury', 'connection-1')).rejects.toMatchObject({ status: 404 })
   })
 })
