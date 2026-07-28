@@ -71,9 +71,17 @@ export interface SyncRuntimeDependencies {
   saveCheckpoint(connection: RuntimeConnection, cursor: string | null): Promise<void>
 }
 export interface SyncCycleResult { readonly connections: number; readonly observations: number; readonly delivered: number; readonly failures: number }
+export interface SyncCycleControls { readonly providersEnabled: boolean; readonly projectionEnabled: boolean }
 
-/** Read-only provider ingestion. Cursor promotion happens only after its outbox is fully delivered. */
-export async function runConfiguredSyncCycle(deploymentId: string, deps: SyncRuntimeDependencies): Promise<SyncCycleResult> {
+const enabledByDefault: SyncCycleControls = Object.freeze({ providersEnabled: true, projectionEnabled: true })
+
+/** Read-only provider ingestion. With projection enabled, cursor promotion waits for full outbox delivery. */
+export async function runConfiguredSyncCycle(
+  deploymentId: string,
+  deps: SyncRuntimeDependencies,
+  controls: SyncCycleControls = enabledByDefault,
+): Promise<SyncCycleResult> {
+  if (!controls.providersEnabled) return { connections: 0, observations: 0, delivered: 0, failures: 0 }
   const connections = await deps.loadConnections(deploymentId)
   let observations = 0; let delivered = 0; let failures = 0
   for (const connection of connections) {
@@ -82,6 +90,11 @@ export async function runConfiguredSyncCycle(deploymentId: string, deps: SyncRun
       const cursor = await deps.loadCheckpoint(connection)
       const run = await deps.runProvider(connection, cursor)
       const inserted = await deps.persistAndEnqueue(connection, run.observations)
+      if (!controls.projectionEnabled) {
+        observations += inserted
+        await deps.saveCheckpoint(connection, run.nextCursor)
+        continue
+      }
       const projection = await deps.projectPending(connection)
       observations += inserted; delivered += projection.delivered; failures += projection.failed
       if (projection.failed === 0) await deps.saveCheckpoint(connection, run.nextCursor)

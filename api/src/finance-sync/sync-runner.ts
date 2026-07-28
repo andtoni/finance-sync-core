@@ -29,35 +29,48 @@ Runs admitted read-only provider accounts from PostgreSQL to canonical observati
 Provider credentials are resolved through scoped server-side Infisical machine identities; environment metadata is not runtime authority.
 --once runs one complete sync cycle and exits.`); return }
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
-  const secretReader = createInfisicalProviderSecretReader(process.env)
-  const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
-  const deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
-  const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
-  const snaptrade = createSnapTradeConnectTransport(process.env)
-  const nativeOnboarding = createNativeProviderOnboarding({
-    env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
-  })
-  const connect = new FinanceSyncConnectControl({
-    deploymentId: config.deploymentId,
-    connections: () => deps.loadConnections(config.deploymentId),
-    plaid: createPlaidConnectTransport({
-      env: process.env, secretReader,
-      secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
-    }),
-    snaptrade,
-    secretStore: tokenWriter,
-    nativeOnboarding,
-    sessionStore: new PostgresConnectSessionStore(sql),
-    onboarding,
-    onPlaidConnected: input => onboarding.recordConnection({
-      subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
-      secretReference: input.secretReference, accounts: input.accounts,
-    }),
-  })
+  let deps: ReturnType<typeof createRuntimeDependencies> | undefined
+  let connect: FinanceSyncConnectControl | undefined
+  if (config.providersEnabled) {
+    const secretReader = createInfisicalProviderSecretReader(process.env)
+    const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
+    deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
+    const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
+    const snaptrade = createSnapTradeConnectTransport(process.env)
+    const nativeOnboarding = createNativeProviderOnboarding({
+      env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
+    })
+    connect = new FinanceSyncConnectControl({
+      deploymentId: config.deploymentId,
+      connections: () => deps!.loadConnections(config.deploymentId),
+      plaid: createPlaidConnectTransport({
+        env: process.env, secretReader,
+        secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
+      }),
+      snaptrade,
+      secretStore: tokenWriter,
+      nativeOnboarding,
+      sessionStore: new PostgresConnectSessionStore(sql),
+      onboarding,
+      onPlaidConnected: input => onboarding.recordConnection({
+        subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
+        secretReference: input.secretReference, accounts: input.accounts,
+      }),
+    })
+  }
   let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {
+    if (!config.providersEnabled) {
+      connectionCount = 0
+      cycleReady = false
+      console.log('FINANCE_SYNC_RUNTIME_DISABLED')
+      return
+    }
     try {
-      const result = await runConfiguredSyncCycle(config.deploymentId, deps)
+      const result = await runConfiguredSyncCycle(config.deploymentId, deps!, {
+        providersEnabled: config.providersEnabled,
+        projectionEnabled: config.projectionEnabled,
+      })
       connectionCount = result.connections
       cycleReady = result.connections > 0 && result.failures === 0
       if (result.connections === 0) console.log('FINANCE_SYNC_DISABLED')
@@ -78,13 +91,15 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     if (args.once) { if (!databaseReady || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
+      providersEnabled: config.providersEnabled,
       connect,
       health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount); return { status: body.ok ? 200 : 503, body } },
     })
     const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })
     console.log('FINANCE_SYNC_HEALTH_LISTENING')
-    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); if (!stopping) schedule() }, config.intervalMs) }; schedule()
+    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); if (!stopping) schedule() }, config.intervalMs) }
+    if (config.schedulesEnabled) schedule()
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); await sql.end() }
 }

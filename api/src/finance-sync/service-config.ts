@@ -6,6 +6,10 @@ export interface FinanceSyncServiceConfig {
   readonly deploymentId: string
   readonly healthPort: number
   readonly intervalMs: number
+  readonly providersEnabled: boolean
+  readonly schedulesEnabled: boolean
+  readonly importsEnabled: boolean
+  readonly projectionEnabled: boolean
   readonly controlToken: string
 }
 
@@ -30,12 +34,23 @@ function positiveInteger(value: string | undefined, fallback: number, name: stri
   return parsed
 }
 
+function strictBoolean(value: string | undefined, name: string): boolean {
+  if (value === undefined) return false
+  if (value === 'true') return true
+  if (value === 'false') return false
+  throw new Error(`${name} must be true or false`)
+}
+
 export function parseServiceConfig(env: NodeJS.ProcessEnv): FinanceSyncServiceConfig {
   return {
     databaseUrl: required(env, 'FINANCE_SYNC_DATABASE_URL'),
     deploymentId: required(env, 'FINANCE_SYNC_DEPLOYMENT_ID'),
     healthPort: positiveInteger(env.FINANCE_SYNC_HEALTH_PORT, 8080, 'FINANCE_SYNC_HEALTH_PORT'),
     intervalMs: positiveInteger(env.FINANCE_SYNC_INTERVAL_MS, 30_000, 'FINANCE_SYNC_INTERVAL_MS'),
+    providersEnabled: strictBoolean(env.FINANCE_SYNC_PROVIDERS_ENABLED, 'FINANCE_SYNC_PROVIDERS_ENABLED'),
+    schedulesEnabled: strictBoolean(env.FINANCE_SYNC_SCHEDULES_ENABLED, 'FINANCE_SYNC_SCHEDULES_ENABLED'),
+    importsEnabled: strictBoolean(env.FINANCE_SYNC_IMPORTS_ENABLED, 'FINANCE_SYNC_IMPORTS_ENABLED'),
+    projectionEnabled: strictBoolean(env.FINANCE_SYNC_PROJECTION_ENABLED, 'FINANCE_SYNC_PROJECTION_ENABLED'),
     controlToken: controlToken(env),
   }
 }

@@ -21,6 +21,10 @@ describe('Finance Sync service configuration', () => {
       deploymentId: required.FINANCE_SYNC_DEPLOYMENT_ID,
       healthPort: 8080,
       intervalMs: 30_000,
+      providersEnabled: false,
+      schedulesEnabled: false,
+      importsEnabled: false,
+      projectionEnabled: false,
       controlToken: 'dedicated-control-token',
     })
   })
@@ -37,5 +41,18 @@ describe('Finance Sync service configuration', () => {
 
   it.each(['0', '-1', 'not-a-number', '1.5'])('rejects invalid interval %s', (interval) => {
     expect(() => parseServiceConfig({ ...required, FINANCE_SYNC_INTERVAL_MS: interval })).toThrow('FINANCE_SYNC_INTERVAL_MS must be a positive integer')
+  })
+
+  it('accepts only explicit true/false runtime controls', () => {
+    expect(parseServiceConfig({
+      ...required,
+      FINANCE_SYNC_PROVIDERS_ENABLED: 'true',
+      FINANCE_SYNC_SCHEDULES_ENABLED: 'true',
+      FINANCE_SYNC_IMPORTS_ENABLED: 'true',
+      FINANCE_SYNC_PROJECTION_ENABLED: 'true',
+    })).toMatchObject({ providersEnabled: true, schedulesEnabled: true, importsEnabled: true, projectionEnabled: true })
+    for (const key of ['FINANCE_SYNC_PROVIDERS_ENABLED', 'FINANCE_SYNC_SCHEDULES_ENABLED', 'FINANCE_SYNC_IMPORTS_ENABLED', 'FINANCE_SYNC_PROJECTION_ENABLED']) {
+      expect(() => parseServiceConfig({ ...required, [key]: '1' })).toThrow(`${key} must be true or false`)
+    }
   })
 })

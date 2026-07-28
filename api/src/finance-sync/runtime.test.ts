@@ -23,6 +23,42 @@ describe('configured sync runtime', () => {
     expect(calls).toEqual(['persist+enqueue:1', 'project', 'checkpoint:cursor-1'])
   })
 
+  it('does not load connections, call providers, or project when providers are disabled', async () => {
+    const loadConnections = vi.fn()
+    const runProvider = vi.fn()
+    const projectPending = vi.fn()
+    const deps: SyncRuntimeDependencies = {
+      loadConnections,
+      loadCheckpoint: vi.fn(),
+      runProvider,
+      persistAndEnqueue: vi.fn(),
+      projectPending,
+      saveCheckpoint: vi.fn(),
+    }
+
+    await expect(runConfiguredSyncCycle('d', deps, { providersEnabled: false, projectionEnabled: false }))
+      .resolves.toEqual({ connections: 0, observations: 0, delivered: 0, failures: 0 })
+    expect(loadConnections).not.toHaveBeenCalled()
+    expect(runProvider).not.toHaveBeenCalled()
+    expect(projectPending).not.toHaveBeenCalled()
+  })
+
+  it('persists provider observations without bridge projection when projection is disabled', async () => {
+    const calls: string[] = []
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [plaidConnection('item-1', 'token')],
+      loadCheckpoint: async () => null,
+      runProvider: async () => ({ nextCursor: 'cursor-1', observations: [] }),
+      persistAndEnqueue: async () => { calls.push('persist+enqueue'); return 0 },
+      projectPending: async () => { calls.push('project'); return { delivered: 0, failed: 0 } },
+      saveCheckpoint: async () => { calls.push('checkpoint') },
+    }
+
+    await expect(runConfiguredSyncCycle('d', deps, { providersEnabled: true, projectionEnabled: false }))
+      .resolves.toEqual({ connections: 1, observations: 0, delivered: 0, failures: 0 })
+    expect(calls).toEqual(['persist+enqueue', 'checkpoint'])
+  })
+
   it('redacts provider failures from operational logs', async () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {})
     const deps: SyncRuntimeDependencies = {

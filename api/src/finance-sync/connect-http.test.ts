@@ -38,7 +38,7 @@ beforeEach(async () => {
     },
     onPlaidConnected: async () => undefined,
   })
-  const handler = createFinanceSyncHttpHandler({ controlToken, connect, health: () => ({ status: 200, body: { ok: true } }) })
+  const handler = createFinanceSyncHttpHandler({ controlToken, providersEnabled: true, connect, health: () => ({ status: 200, body: { ok: true } }) })
   server = createServer((request, response) => { void handler(request, response) })
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const address = server.address()
@@ -130,6 +130,43 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(await response.json()).toEqual({ provider: 'plaid', status: 'disconnected', message: 'Provider connection was disconnected.' })
     const absent = await fetch(`${base}/control/v1/provider-connections/mercury/connection-1`, { method: 'DELETE', headers: headers() })
     expect(absent.status).toBe(404)
+  })
+
+  it('fails closed for every authenticated control mutation without constructing a control when providers are disabled', async () => {
+    const disabledHandler = createFinanceSyncHttpHandler({
+      controlToken,
+      providersEnabled: false,
+      health: () => ({ status: 200, body: { ok: true } }),
+    })
+    const disabledServer = createServer((request, response) => { void disabledHandler(request, response) })
+    await new Promise<void>((resolve, reject) => { disabledServer.once('error', reject); disabledServer.listen(0, '127.0.0.1', resolve) })
+    const address = disabledServer.address()
+    if (!address || typeof address === 'string') throw new Error('disabled server did not bind')
+    const disabledBase = `http://127.0.0.1:${address.port}`
+    try {
+      const requests = [
+        ['/control/v1/provider-connections', { method: 'GET' }],
+        ['/control/v1/provider-connections/plaid/accounts', { method: 'GET' }],
+        ['/control/v1/provider-connections/plaid/admissions/connection-1/account-1', { method: 'GET' }],
+        ['/control/v1/provider-connections/plaid/admit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
+        ['/control/v1/provider-connections/plaid/start', { method: 'POST' }],
+        ['/control/v1/provider-connections/plaid/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ publicToken: 'token', continuationToken: 'token' }) }],
+        ['/control/v1/provider-connections/plaid/connection-1', { method: 'DELETE' }],
+        ['/control/v1/provider-connections/investec/start', { method: 'POST' }],
+        ['/control/v1/provider-connections/mercury/start', { method: 'POST' }],
+        ['/control/v1/provider-connections/snaptrade/start', { method: 'POST' }],
+      ] as const
+      for (const [path, init] of requests) {
+        const response = await fetch(`${disabledBase}${path}`, { ...init, headers: headers('headers' in init ? init.headers : {}) })
+        expect(response.status).toBe(503)
+        expect(await response.json()).toEqual({ error: 'provider_control_disabled' })
+      }
+      const health = await fetch(`${disabledBase}/health`)
+      expect(health.status).toBe(200)
+      expect(await health.json()).toEqual({ ok: true })
+    } finally {
+      await new Promise<void>(resolve => disabledServer.close(() => resolve()))
+    }
   })
 
   it('does not accept a subject from query or JSON', async () => {

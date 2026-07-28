@@ -38,7 +38,8 @@ async function jsonBody(request: IncomingMessage): Promise<Record<string, unknow
 
 export function createFinanceSyncHttpHandler(input: {
   readonly controlToken: string
-  readonly connect: FinanceSyncConnectControl
+  readonly providersEnabled: boolean
+  readonly connect?: FinanceSyncConnectControl
   readonly health: () => { readonly status: number; readonly body: unknown }
 }) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -54,20 +55,23 @@ export function createFinanceSyncHttpHandler(input: {
     if (!authorization?.startsWith(prefix) || !tokenMatches(authorization.slice(prefix.length), input.controlToken)) {
       return send(response, 401, { error: 'unauthorized' })
     }
+    if (!input.providersEnabled) return send(response, 503, { error: 'provider_control_disabled' })
+    if (!input.connect) return send(response, 503, { error: 'provider_control_disabled' })
     const rawSubject = request.headers['x-authenticated-subject']
     if (typeof rawSubject !== 'string' || !rawSubject) return send(response, 400, { error: 'request_failed' })
+    const connect = input.connect
 
     try {
       if (request.method === 'GET' && path === '/control/v1/provider-connections') {
-        return send(response, 200, await input.connect.list(rawSubject))
+        return send(response, 200, await connect.list(rawSubject))
       }
       const accounts = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/accounts$/)
       if (request.method === 'GET' && accounts) {
-        return send(response, 200, await input.connect.pendingAccounts(rawSubject, decodeURIComponent(accounts[1])))
+        return send(response, 200, await connect.pendingAccounts(rawSubject, decodeURIComponent(accounts[1])))
       }
       const admissionStatus = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/admissions\/([^/]+)\/([^/]+)$/)
       if (request.method === 'GET' && admissionStatus) {
-        return send(response, 200, await input.connect.admissionStatus(rawSubject,
+        return send(response, 200, await connect.admissionStatus(rawSubject,
           decodeURIComponent(admissionStatus[1]), decodeURIComponent(admissionStatus[2]), decodeURIComponent(admissionStatus[3])))
       }
       const admit = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/admit$/)
@@ -81,7 +85,7 @@ export function createFinanceSyncHttpHandler(input: {
           || !Array.isArray(body.assetMappings)) {
           throw new ConnectControlError(400, 'invalid admission request')
         }
-        return send(response, 200, await input.connect.admit(rawSubject, decodeURIComponent(admit[1]), {
+        return send(response, 200, await connect.admit(rawSubject, decodeURIComponent(admit[1]), {
           authenticatedSubject: body.authenticatedSubject as string,
           connectionId: body.connectionId as string, providerAccountId: body.providerAccountId as string,
           wealthfolioAccountId: body.wealthfolioAccountId as string, databaseStateDigest: body.databaseStateDigest as string,
@@ -93,18 +97,18 @@ export function createFinanceSyncHttpHandler(input: {
       }
       const disconnect = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/([^/]+)$/)
       if (request.method === 'DELETE' && disconnect) {
-        return send(response, 200, await input.connect.disconnect(rawSubject, decodeURIComponent(disconnect[1]), decodeURIComponent(disconnect[2])))
+        return send(response, 200, await connect.disconnect(rawSubject, decodeURIComponent(disconnect[1]), decodeURIComponent(disconnect[2])))
       }
       const start = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/start$/)
       if (request.method === 'POST' && start) {
-        return send(response, 200, await input.connect.start(rawSubject, decodeURIComponent(start[1])))
+        return send(response, 200, await connect.start(rawSubject, decodeURIComponent(start[1])))
       }
       if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/complete') {
         const body = await jsonBody(request)
         if (typeof body.publicToken !== 'string' || !body.publicToken || typeof body.continuationToken !== 'string' || !body.continuationToken) {
           throw new ConnectControlError(400, 'completion tokens are required')
         }
-        return send(response, 200, await input.connect.completePlaid(rawSubject, body.publicToken, body.continuationToken))
+        return send(response, 200, await connect.completePlaid(rawSubject, body.publicToken, body.continuationToken))
       }
       return send(response, 404, { error: 'not_found' })
     } catch (error) {
