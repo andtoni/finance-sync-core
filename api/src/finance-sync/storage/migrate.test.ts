@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -41,6 +41,14 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/active\.connection_id::text = po\.connection_id/i);
     expect(sql).toMatch(/active\.wealthfolio_account_id = po\.payload->>'accountId'/i);
     expect(sql).toMatch(/pc\.provider_generation = active\.provider_generation/i);
+  });
+
+  it("repairs stale runtime connection identities that include the provider account suffix", () => {
+    const sql = readFileSync(resolve(root, "0012_runtime_connection_receiver_rebind.sql"), "utf8");
+    expect(sql).toMatch(/po\.connection_id LIKE active\.connection_id::text \|\| ':%'/i);
+    expect(sql).toMatch(/active\.wealthfolio_account_id = po\.payload->>'accountId'/i);
+    expect(sql).toMatch(/dead_letter_reason = 'BRIDGE_HTTP_REJECTED'/i);
+    expect(sql).toMatch(/state = 'pending'/i);
   });
 
   it("rejects checksum drift", () => {

@@ -177,7 +177,8 @@ export class PostgresOnboardingRepository {
               ON pc.deployment_id = active.deployment_id AND pc.local_owner_id = active.local_owner_id
               AND pc.connection_id = active.connection_id
             WHERE active.deployment_id = po.deployment_id AND active.local_owner_id = po.local_owner_id
-              AND active.connection_id::text = po.connection_id
+              AND (active.connection_id::text = po.connection_id
+                OR po.connection_id LIKE active.connection_id::text || ':%')
               AND active.wealthfolio_account_id = po.payload->>'accountId'
               AND active.revoked_at IS NULL AND pc.disabled_at IS NULL
               AND active.provider_generation = po.provider_generation

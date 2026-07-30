@@ -130,7 +130,7 @@ suite('provider generation durable fences with PostgreSQL', () => {
     await sql!`INSERT INTO projection_outbox
       (deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload,
        state, attempts, last_error, dead_lettered_at, dead_letter_reason)
-      VALUES (${rebindDeployment}, ${subject}, ${first.connectionId}, 1, ${oldKey},
+      VALUES (${rebindDeployment}, ${subject}, ${`${first.connectionId}:${providerAccountId}`}, 1, ${oldKey},
         ${sql!.json({ idempotencyKey: oldKey, subject, accountId: wealthfolioAccountId, accessGeneration: 1 })},
         'dead_letter', 3, 'BRIDGE_HTTP_REJECTED', now(), 'BRIDGE_HTTP_REJECTED')`
 
