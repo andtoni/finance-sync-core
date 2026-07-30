@@ -120,6 +120,23 @@ describe('four-provider runtime configuration', () => {
     }
   })
 
+  it('advances the Investec transaction upper bound to the poll date', async () => {
+    const connection = parseRuntimeConnections(runtimeEnv(), 'dep-1').find(item => item.provider === 'investec')
+    if (!connection || connection.provider !== 'investec') throw new Error('missing Investec fixture')
+    let requestedWindow: { fromDate: string; toDate: string } | undefined
+    const injected = factories()
+    injected.investec = () => ({
+      listAccounts: async () => [{ accountId: 'account-1', productName: 'Private Bank' }],
+      getBalance: async () => ({ currency: 'ZAR', currentBalance: 1 }),
+      getTransactionPage: async (_accountId, window) => { requestedWindow = window; return { transactions: [] } },
+    })
+    await runRuntimeProvider(connection, null, injected)
+    expect(requestedWindow).toEqual({
+      fromDate: '2026-01-01',
+      toDate: new Date().toISOString().slice(0, 10),
+    })
+  })
+
   it('dispatches every provider through injected read-only transports with bounded restart cursors', async () => {
     const parsed = parseRuntimeConnections(runtimeEnv(), 'dep-1')
     const results = await Promise.all(parsed.map(connection => runRuntimeProvider(connection, null, factories())))

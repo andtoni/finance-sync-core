@@ -78,10 +78,10 @@ describe('Bridge client', () => {
       semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '42.50', currency: 'USD', date: '2026-07-11', name: 'AMAZON' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'wf-acc-uuid-1')
-    expect(op.activity).toMatchObject({ accountId: 'wf-acc-uuid-1', amount: '42.5', activityType: 'WITHDRAWAL', status: 'POSTED' })
+    expect(op.activity).toMatchObject({ accountId: 'wf-acc-uuid-1', amount: '42.5', activityType: 'WITHDRAWAL', status: 'POSTED', notes: 'AMAZON' })
   })
 
-  it('carries merchant context without projecting a provider hint as notes or category', () => {
+  it('projects the provider merchant display as notes without projecting category hints', () => {
     const merchantContext = { merchantKeyVersion: 1, normalizationVersion: 1, rawDescription: 'RAW', merchantDisplay: 'Merchant', merchantKey: 'v1:key', direction: 'outflow', activityType: null, providerHint: { personalFinanceCategory: { primary: 'FOOD' } }, provenance: { source: 'provider_observation', provider: 'plaid' } }
     const op = cashObservationToBridge({
       deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
@@ -89,8 +89,8 @@ describe('Bridge client', () => {
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'acc-1')
     expect(op.activity?.merchantContext).toEqual(merchantContext)
-    expect(op.activity).not.toHaveProperty('notes')
-    expect(bridgeOperationToWire(op)).toMatchObject({ activity: { merchant_context: { merchant_key: 'v1:key', merchant_key_version: 1, normalization_version: 1 } } })
+    expect(op.activity?.notes).toBe('Merchant')
+    expect(bridgeOperationToWire(op)).toMatchObject({ activity: { notes: 'Merchant', merchant_context: { merchant_key: 'v1:key', merchant_key_version: 1, normalization_version: 1 } } })
     expect(Object.keys((bridgeOperationToWire(op).activity as Record<string, unknown>).merchant_context as object)).toEqual(['merchant_key', 'merchant_key_version', 'normalization_version'])
   })
 
@@ -100,7 +100,7 @@ describe('Bridge client', () => {
       semanticHash: 'aaa', payload: { transactionId: 't1', amount: '-100.00', currency: 'USD', date: '2026-07-11', name: 'SALARY' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'acc-1')
-    expect(op.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '100' })
+    expect(op.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '100', notes: 'SALARY' })
   })
 
   it.each(['0', '-0'])('fails closed for a zero Plaid amount (%s)', amount => {

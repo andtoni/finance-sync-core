@@ -8,10 +8,10 @@ const observation = (payload: Record<string, unknown>, domain = 'cash_ledger') =
 
 describe('provider-aware correction and removal projection', () => {
   it('normalizes direct-bank ledger signs without applying Plaid signs', () => {
-    const debit = providerObservationToBridge('mercury', observation({ transactionId: 't-1', accountId: 'a', amount: '-12.50', currency: 'USD', date: '2026-07-18' }), 1, 'wf-a')
-    const credit = providerObservationToBridge('investec', observation({ transactionId: 't-2', accountId: 'a', amount: '20.00', currency: 'ZAR', date: '2026-07-18' }), 1, 'wf-a')
-    expect(debit?.activity).toMatchObject({ activityType: 'WITHDRAWAL', amount: '12.5' })
-    expect(credit?.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '20' })
+    const debit = providerObservationToBridge('mercury', observation({ transactionId: 't-1', accountId: 'a', amount: '-12.50', currency: 'USD', date: '2026-07-18', merchantContext: { merchantDisplay: 'Supplier' } }), 1, 'wf-a')
+    const credit = providerObservationToBridge('investec', observation({ transactionId: 't-2', accountId: 'a', amount: '20.00', currency: 'ZAR', date: '2026-07-18', description: 'Salary' }), 1, 'wf-a')
+    expect(debit?.activity).toMatchObject({ activityType: 'WITHDRAWAL', amount: '12.5', notes: 'Supplier' })
+    expect(credit?.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '20', notes: 'Salary' })
   })
 
   it('maps SnapTrade activity kinds while leaving holdings canonical-only', () => {

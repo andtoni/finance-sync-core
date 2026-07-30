@@ -109,10 +109,16 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
   let pagesPolled = 0
   let paginationComplete = true
   let nextCursor: string | null = null
+  const seenAccountIds = new Set<string>()
 
   for (const account of allAccounts) {
-    if (admittedAccounts && !admittedAccounts.has(account.accountId)) continue
-    if (!account.productName || !eligibleSet.has(account.productName)) continue
+    if (seenAccountIds.has(account.accountId)) continue
+    seenAccountIds.add(account.accountId)
+    if (admittedAccounts) {
+      if (!admittedAccounts.has(account.accountId)) continue
+    } else if (!account.productName || !eligibleSet.has(account.productName)) {
+      continue
+    }
     const accountRef = redact(account.accountId)
     const balance = await transport.getBalance(account.accountId)
     // Capture the successful fetch instant. The configured transaction window

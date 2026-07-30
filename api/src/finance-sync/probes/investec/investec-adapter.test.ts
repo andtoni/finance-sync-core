@@ -30,6 +30,26 @@ describe('Investec adapter G5', () => {
     expect(r.accounts[0].currency).toBe('ZAR')
   })
 
+  it('deduplicates provider rows and lets explicit admission own product eligibility', async () => {
+    const t = makeTransport([
+      { uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'A' },
+    ])
+    t.listAccounts = async () => [
+      { accountId: 'acc-cash-123456789', productName: 'PrimeSaver' },
+      { accountId: 'acc-cash-123456789', productName: 'PrimeSaver' },
+    ]
+    let balances = 0
+    let transactionPages = 0
+    t.getBalance = async () => { balances++; return { currency: 'ZAR', currentBalance: 25000 } }
+    t.getTransactionPage = async () => { transactionPages++; return { transactions: [{ uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'A' }] } }
+
+    const r = await runInvestecAdapter({ ...BASE_CONFIG, accountIds: ['acc-cash-123456789'] }, t)
+    expect(r.accounts).toHaveLength(1)
+    expect(transactionObservations(r)).toHaveLength(1)
+    expect(balances).toBe(1)
+    expect(transactionPages).toBe(1)
+  })
+
   it('skips ineligible products', async () => {
     const t = makeTransport([], undefined)
     t.listAccounts = async () => [{ accountId: 'x', productName: 'Home Loan' }]

@@ -189,6 +189,21 @@ export function idempotencyKey(
   return createHash('sha256').update(framed, 'utf8').digest('hex').slice(0, 40)
 }
 
+function providerDescription(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const context = isRecord(payload.merchantContext) ? payload.merchantContext : undefined
+  const candidates = [
+    context?.merchantDisplay,
+    context?.rawDescription,
+    payload.description,
+    payload.counterpartyName,
+    payload.name,
+    payload.bankDescription,
+    payload.reference,
+  ]
+  const description = candidates.find(value => typeof value === 'string' && value.trim().length > 0)
+  return typeof description === 'string' ? description.trim().slice(0, 512) : undefined
+}
+
 export function cashObservationToBridge(
   observation: {
     readonly deploymentId: string
@@ -221,6 +236,9 @@ export function cashObservationToBridge(
       observation.sourceResourceIncarnationId,
       accountId,
       resourceId,
+      // Re-project existing provider facts once when their display description
+      // becomes part of the native activity payload.
+      'merchant-notes-v1',
     ]),
     subject,
     accessGeneration,
@@ -244,6 +262,7 @@ export function cashObservationToBridge(
       activityDate: (p.date as string) ?? observation.observedAt.slice(0, 10),
       amount: String(Math.abs(plaidAmount)),
       currency: p.currency,
+      ...(providerDescription(p) === undefined ? {} : { notes: providerDescription(p) }),
       ...(isRecord(p.merchantContext) ? { merchantContext: p.merchantContext } : {}),
     },
   }

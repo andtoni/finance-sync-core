@@ -314,7 +314,12 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
       return { observations: run.observations, nextCursor: run.nextCursor }
     }
     case 'investec': {
-      const run = await runInvestecAdapter({ ...connection }, factories.investec(connection))
+      const run = await runInvestecAdapter({
+        ...connection,
+        // The credential bundle defines the historical lower bound. The upper
+        // bound must advance with every poll rather than freezing at onboarding.
+        toDate: new Date().toISOString().slice(0, 10),
+      }, factories.investec(connection))
       if (!run.paginationComplete) throw new Error('Investec pagination did not complete')
       return { observations: run.observations, nextCursor: null }
     }
