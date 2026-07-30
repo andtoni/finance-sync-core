@@ -379,7 +379,8 @@ export function createPlaidConnectTransport(input: { readonly env: ProviderRunti
   return {
     async createLinkToken(boundSubject) {
       const value = await post('/link/token/create', {
-        user: { client_user_id: boundSubject }, client_name: 'Finance Sync', products: ['transactions', 'liabilities'],
+        user: { client_user_id: boundSubject }, client_name: 'Finance Sync', products: ['transactions'],
+        additional_consented_products: ['liabilities', 'investments'],
         country_codes: ['US'], language: 'en',
       })
       if (typeof value.link_token !== 'string' || !value.link_token) throw new ConnectControlError(502, 'provider returned an invalid response')

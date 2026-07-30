@@ -89,7 +89,7 @@ describe('Finance Sync Connect control plane', () => {
     expect(release).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', token: 'continuation-token' })
   })
 
-  it('requests Plaid transactions and liabilities and validates discovered account metadata', async () => {
+  it('requires Plaid transactions and requests liabilities and investments as additional consent', async () => {
     const requests: Record<string, unknown>[] = []
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
@@ -110,7 +110,8 @@ describe('Finance Sync Connect control plane', () => {
     await expect(transport!.listAccounts('access-token')).resolves.toEqual([
       { providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', mask: '1234', assets: [] },
     ])
-    expect(requests[0]?.products).toEqual(['transactions', 'liabilities'])
+    expect(requests[0]?.products).toEqual(['transactions'])
+    expect(requests[0]?.additional_consented_products).toEqual(['liabilities', 'investments'])
   })
 
   it('forces SnapTrade portal authorization to read-only and validates the official redirect', async () => {

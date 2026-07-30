@@ -113,6 +113,60 @@ suite('provider generation durable fences with PostgreSQL', () => {
         ${sql.json({ idempotencyKey, subject })})`).resolves.toHaveLength(0)
   })
 
+  it('rebases earlier active admissions and rejected outbox work when a later account advances receiver access', async () => {
+    const rebindDeployment = `${deploymentId}-receiver-rebind`
+    const repository = new PostgresOnboardingRepository(sql!, rebindDeployment)
+    await repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: `${providerConnectionId}-first`,
+      secretReference: 'RECEIVER_REBIND_PLAID', accounts: [account],
+    })
+    const [first] = await repository.listPending(subject, 'plaid')
+    await repository.admit({
+      subject, provider: 'plaid', connectionId: first.connectionId, providerAccountId,
+      wealthfolioAccountId, databaseStateDigest: digest, providerGeneration: 1,
+      receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+    })
+    const oldKey = `receiver-rebind-${runId}`
+    await sql!`INSERT INTO projection_outbox
+      (deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload,
+       state, attempts, last_error, dead_lettered_at, dead_letter_reason)
+      VALUES (${rebindDeployment}, ${subject}, ${first.connectionId}, 1, ${oldKey},
+        ${sql!.json({ idempotencyKey: oldKey, subject, accountId: wealthfolioAccountId, accessGeneration: 1 })},
+        'dead_letter', 3, 'BRIDGE_HTTP_REJECTED', now(), 'BRIDGE_HTTP_REJECTED')`
+
+    const secondProviderAccountId = 'provider-account-second'
+    const secondWealthfolioAccountId = 'wealthfolio-account-second'
+    await repository.recordConnection({
+      subject, provider: 'mercury', providerConnectionId: `${providerConnectionId}-second`,
+      secretReference: 'RECEIVER_REBIND_MERCURY', accounts: [{ ...account, providerAccountId: secondProviderAccountId }],
+    })
+    const [second] = await repository.listPending(subject, 'mercury')
+    await repository.admit({
+      subject, provider: 'mercury', connectionId: second.connectionId,
+      providerAccountId: secondProviderAccountId, wealthfolioAccountId: secondWealthfolioAccountId,
+      databaseStateDigest: digest, providerGeneration: 1, receiverAccessGeneration: 2,
+      baselineKind: 'empty', assetMappings: [],
+    })
+
+    const generations = await sql!`
+      SELECT wealthfolio_account_id, receiver_access_generation
+      FROM provider_account_admissions
+      WHERE deployment_id = ${rebindDeployment} AND revoked_at IS NULL
+      ORDER BY wealthfolio_account_id`
+    expect(generations).toEqual([
+      { wealthfolio_account_id: wealthfolioAccountId, receiver_access_generation: 2 },
+      { wealthfolio_account_id: secondWealthfolioAccountId, receiver_access_generation: 2 },
+    ])
+    const [rebound] = await sql!`
+      SELECT state, attempts, last_error, dead_letter_reason,
+        (payload->>'accessGeneration')::int AS access_generation
+      FROM projection_outbox WHERE deployment_id = ${rebindDeployment} AND idempotency_key = ${oldKey}`
+    expect(rebound).toEqual({
+      state: 'pending', attempts: 0, last_error: null,
+      dead_letter_reason: null, access_generation: 2,
+    })
+  })
+
   it('rolls back a post-write onboarding failure without replacing the old active slot or generation', async () => {
     const failureDeployment = `${deploymentId}-post-write`
     const failureProviderConnection = `${providerConnectionId}-post-write`

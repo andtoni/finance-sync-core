@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -30,6 +30,17 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/ALTER COLUMN selected_secret_reference SET NOT NULL/i);
     expect(sql).toMatch(/provider_connect_sessions_live_slot_idx/i);
     expect(sql).toMatch(/selected_secret_reference\)\s*WHERE released_at IS NULL/i);
+  });
+
+  it("rebinds active admissions and unresolved bridge work to the latest receiver access generation", () => {
+    const sql = readFileSync(resolve(root, "0011_receiver_access_generation_rebind.sql"), "utf8");
+    expect(sql).toMatch(/max\(paa\.receiver_access_generation\)/i);
+    expect(sql).toMatch(/UPDATE provider_account_admissions paa[\s\S]*receiver_access_generation = latest\.receiver_access_generation/i);
+    expect(sql).toMatch(/jsonb_set\([\s\S]*'\{accessGeneration\}'/i);
+    expect(sql).toMatch(/dead_letter_reason = 'BRIDGE_HTTP_REJECTED'/i);
+    expect(sql).toMatch(/active\.connection_id::text = po\.connection_id/i);
+    expect(sql).toMatch(/active\.wealthfolio_account_id = po\.payload->>'accountId'/i);
+    expect(sql).toMatch(/pc\.provider_generation = active\.provider_generation/i);
   });
 
   it("rejects checksum drift", () => {

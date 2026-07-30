@@ -140,6 +140,50 @@ export class PostgresOnboardingRepository {
           AND provider_account_admissions.wealthfolio_account_id = EXCLUDED.wealthfolio_account_id
         RETURNING provider_account_id
       `
+      await tx`
+        UPDATE provider_connections SET state = 'active'
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND connection_id = ${input.connectionId}::uuid AND provider = ${input.provider}
+          AND provider_generation = ${input.providerGeneration}
+      `
+      // Wealthfolio access generation is deployment-wide, not account-local. Granting
+      // another account advances it for every still-authorized account, so retain one
+      // generation across all active admissions for this subject.
+      await tx`
+        UPDATE provider_account_admissions paa
+        SET receiver_access_generation = ${input.receiverAccessGeneration}
+        FROM provider_connections pc
+        WHERE paa.deployment_id = ${this.deploymentId} AND paa.local_owner_id = ${input.subject}
+          AND paa.revoked_at IS NULL AND paa.receiver_access_generation < ${input.receiverAccessGeneration}
+          AND pc.deployment_id = paa.deployment_id AND pc.local_owner_id = paa.local_owner_id
+          AND pc.connection_id = paa.connection_id AND pc.disabled_at IS NULL
+          AND pc.provider_generation = paa.provider_generation
+      `
+      // Rebind only unresolved operations for accounts that remain actively admitted.
+      // Their idempotency keys do not include access generation, and no prior receipt
+      // exists, so the payload can safely retry at the newly granted generation.
+      await tx`
+        UPDATE projection_outbox po
+        SET payload = jsonb_set(po.payload, '{accessGeneration}', to_jsonb(${input.receiverAccessGeneration}::bigint), false),
+          state = 'pending', attempts = 0, last_error = NULL,
+          dead_lettered_at = NULL, dead_letter_reason = NULL
+        WHERE po.deployment_id = ${this.deploymentId} AND po.local_owner_id = ${input.subject}
+          AND po.state IN ('pending', 'uncertain', 'dead_letter')
+          AND (po.payload->>'accessGeneration')::bigint < ${input.receiverAccessGeneration}
+          AND (po.state <> 'dead_letter' OR po.dead_letter_reason = 'BRIDGE_HTTP_REJECTED')
+          AND EXISTS (
+            SELECT 1 FROM provider_account_admissions active
+            JOIN provider_connections pc
+              ON pc.deployment_id = active.deployment_id AND pc.local_owner_id = active.local_owner_id
+              AND pc.connection_id = active.connection_id
+            WHERE active.deployment_id = po.deployment_id AND active.local_owner_id = po.local_owner_id
+              AND active.connection_id::text = po.connection_id
+              AND active.wealthfolio_account_id = po.payload->>'accountId'
+              AND active.revoked_at IS NULL AND pc.disabled_at IS NULL
+              AND active.provider_generation = po.provider_generation
+              AND pc.provider_generation = active.provider_generation
+          )
+      `
       const metadata = await this.status(tx, input.subject, input.provider, input.connectionId, input.providerAccountId)
       if (!metadata || metadata.wealthfolioAccountId !== input.wealthfolioAccountId
         || metadata.providerGeneration !== input.providerGeneration
@@ -148,12 +192,6 @@ export class PostgresOnboardingRepository {
         || metadata.assetMappingDigest !== mappingDigest) {
         throw new Error(admitted.length === 0 ? 'admission conflicts with committed mapping' : 'provider account is not discoverable')
       }
-      await tx`
-        UPDATE provider_connections SET state = 'active'
-        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
-          AND connection_id = ${input.connectionId}::uuid AND provider = ${input.provider}
-          AND provider_generation = ${input.providerGeneration}
-      `
       return metadata
     })
   }
