@@ -94,7 +94,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
   }
   try {
-    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../../finance-sync-migrations')); await replay(); await cycle()
+    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay(); await cycle()
     if (args.once) { if (!databaseReady || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
