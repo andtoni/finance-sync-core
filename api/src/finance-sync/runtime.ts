@@ -44,12 +44,16 @@ export interface MercuryRuntimeConnection extends RuntimeConnectionBase {
   readonly maxPagesPerAccount?: number
 }
 
+export type SnapTradeAuthMode = 'personal' | 'commercial'
+
 export interface SnapTradeRuntimeConnection extends RuntimeConnectionBase {
   readonly provider: 'snaptrade'
   readonly clientId: string
   readonly consumerKey: string
-  readonly userId: string
-  readonly userSecret: string
+  /** Personal keys identify the SnapTrade user and omit subordinate credentials. */
+  readonly authMode: SnapTradeAuthMode
+  readonly userId?: string
+  readonly userSecret?: string
   readonly assetMappings: Readonly<Record<string, string>>
   readonly activitiesStartDate?: string
   readonly activitiesEndDate?: string

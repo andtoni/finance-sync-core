@@ -4,7 +4,7 @@ import { runInvestecAdapter, type InvestecTransport } from './probes/investec/in
 import { runMercurySync, type MercuryTransport } from './probes/mercury/mercury-adapter'
 import { runSnapTradeSync, type SnapTradeTransport } from './probes/snaptrade/snaptrade-adapter'
 import type { ProviderName } from './probes/provider-registry'
-import type { RuntimeConnection, ProviderRun } from './runtime'
+import type { RuntimeConnection, ProviderRun, SnapTradeAuthMode } from './runtime'
 import { readExclusiveInput } from './secret-input'
 
 const PROVIDERS = new Set<ProviderName>(['investec', 'mercury', 'plaid', 'snaptrade'])
@@ -142,9 +142,14 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
           if (!providerAssetId || typeof wealthfolioAssetId !== 'string' || !wealthfolioAssetId) throw new Error('invalid SnapTrade asset mapping')
           assetMappings[providerAssetId] = wealthfolioAssetId
         }
+        const rawAuthMode = c.authMode
+        const authMode: SnapTradeAuthMode = rawAuthMode === undefined ? 'commercial' : rawAuthMode === 'personal' || rawAuthMode === 'commercial'
+          ? rawAuthMode : (() => { throw new Error('connection authMode is invalid') })()
+        const userId = authMode === 'commercial' ? string(c, 'userId') : optionalString(c, 'userId')
+        const userSecret = authMode === 'commercial' ? string(c, 'userSecret') : optionalString(c, 'userSecret')
         return {
-          ...common, provider, clientId: string(c, 'clientId'), consumerKey: string(c, 'consumerKey'), userId: string(c, 'userId'),
-          userSecret: string(c, 'userSecret'), assetMappings: Object.freeze(assetMappings),
+          ...common, provider, clientId: string(c, 'clientId'), consumerKey: string(c, 'consumerKey'), authMode,
+          ...(userId ? { userId } : {}), ...(userSecret ? { userSecret } : {}), assetMappings: Object.freeze(assetMappings),
           activitiesStartDate: optionalString(c, 'activitiesStartDate'), activitiesEndDate: optionalString(c, 'activitiesEndDate'),
         }
       }
@@ -284,7 +289,16 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
     snaptrade(connection) {
       const base = endpoint(env.FINANCE_SYNC_SNAPTRADE_URL, 'https://api.snaptrade.com/api/v1', 'snaptrade')
       const request = async (path: '/holdings' | '/activities', extra: Record<string, string> = {}) => {
-        const params = { clientId: connection.clientId, timestamp: String(Math.floor(Date.now() / 1000)), userId: connection.userId, userSecret: connection.userSecret, ...extra }
+        const params: Record<string, string> = {
+          clientId: connection.clientId,
+          timestamp: String(Math.floor(Date.now() / 1000)),
+          ...extra,
+        }
+        if (connection.authMode === 'commercial') {
+          if (!connection.userId || !connection.userSecret) throw new Error('SnapTrade commercial credentials are incomplete')
+          params.userId = connection.userId
+          params.userSecret = connection.userSecret
+        }
         const query = new URLSearchParams(Object.fromEntries(Object.entries(params).sort(([a], [b]) => a.localeCompare(b)))).toString()
         const signedPath = `/api/v1${path}`
         return json(await fetch(new URL(`${path.slice(1)}?${query}`, `${base.toString().replace(/\/+$/, '')}/`), {

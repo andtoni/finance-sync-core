@@ -20,10 +20,55 @@ import { readExclusiveInput } from './secret-input'
 import { loadDurableRuntimeConnections, type ProviderSecretResolver } from './durable-connections'
 import { unavailableProviderSecretStore } from './connect-control'
 import { assembleCurrentState } from './projection/current-state'
+import {
+  createFixtureRuntime,
+  fixtureAuthorityRows,
+  fixtureModeEnabled,
+  FIXTURE_OWNER_SUBJECT,
+} from './fixture-runtime'
 
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
 const MAX_PROJECTION_BATCH = 25
 const PLAID_HOSTS = new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com'])
+
+async function ensureFixtureAuthority(sql: FinanceSyncSql, deploymentId: string): Promise<void> {
+  for (const row of fixtureAuthorityRows) {
+    await sql`
+      INSERT INTO provider_principals (
+        deployment_id, local_owner_id, provider, provider_principal_id, provider_subject_id
+      ) VALUES (
+        ${deploymentId}, ${FIXTURE_OWNER_SUBJECT}, ${row.provider}, ${row.providerPrincipalId}::uuid, ${row.providerConnectionId}
+      ) ON CONFLICT DO NOTHING
+    `
+    await sql`
+      INSERT INTO connection_incarnations (
+        deployment_id, local_owner_id, connection_incarnation_id, provider_principal_id,
+        provider_connection_id, incarnation
+      ) VALUES (
+        ${deploymentId}, ${FIXTURE_OWNER_SUBJECT}, ${row.connectionIncarnationId}::uuid,
+        ${row.providerPrincipalId}::uuid, ${row.providerConnectionId}, 1
+      ) ON CONFLICT DO NOTHING
+    `
+    await sql`
+      INSERT INTO account_incarnations (
+        deployment_id, local_owner_id, account_incarnation_id, connection_incarnation_id,
+        provider_account_id, incarnation
+      ) VALUES (
+        ${deploymentId}, ${FIXTURE_OWNER_SUBJECT}, ${row.accountIncarnationId}::uuid,
+        ${row.connectionIncarnationId}::uuid, ${row.accountId}, 1
+      ) ON CONFLICT DO NOTHING
+    `
+    await sql`
+      INSERT INTO resource_incarnations (
+        deployment_id, local_owner_id, source_resource_incarnation_id, account_incarnation_id,
+        resource_kind, provider_resource_id, incarnation
+      ) VALUES (
+        ${deploymentId}, ${FIXTURE_OWNER_SUBJECT}, ${row.sourceResourceIncarnationId}::uuid,
+        ${row.accountIncarnationId}::uuid, 'fixture', ${row.accountId}, 1
+      ) ON CONFLICT DO NOTHING
+    `
+  }
+}
 
 export interface SyncCycleAuditEntry {
   readonly deploymentId: string
@@ -40,7 +85,7 @@ interface RuntimeEnv extends ProviderRuntimeEnv {
   readonly FINANCE_SYNC_BRIDGE_TOKEN_FILE?: string
 }
 
-function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: ReadonlySet<string>): URL {
+function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: ReadonlySet<string>, allowFixtureHttp = false): URL {
   if (!raw) throw new Error(`${name} is required for configured connections`)
   let url: URL
   try {
@@ -48,7 +93,8 @@ function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: R
   } catch {
     throw new Error(`${name} must be a valid URL`)
   }
-  if (url.protocol !== 'https:' || url.username || url.password) throw new Error(`${name} must be an HTTPS URL without credentials`)
+  const fixtureHttp = allowFixtureHttp && url.protocol === 'http:' && url.hostname === '127.0.0.1'
+  if ((!fixtureHttp && url.protocol !== 'https:') || url.username || url.password) throw new Error(`${name} must be an HTTPS URL without credentials`)
   if (!allowedHosts.has(url.hostname.toLowerCase())) throw new Error(`${name} host is not allowed`)
   return url
 }
@@ -109,11 +155,14 @@ export function createRuntimeDependencies(
   receiptLookup?: BridgeReceiptLookup,
   secretResolver: ProviderSecretResolver = unavailableProviderSecretStore,
 ): SyncRuntimeDependencies {
+  const fixture = fixtureModeEnabled(env as NodeJS.ProcessEnv)
+  const fixtureRuntime = fixture ? createFixtureRuntime(deploymentId, env as NodeJS.ProcessEnv) : undefined
+
   // Legacy metadata is parsed only as a startup validation aid for existing
   // deployments/tests. It is never returned by loadConnections; PostgreSQL is
   // the sole runtime admission authority.
   const legacyValidationOnly = parseRuntimeConnections(env, deploymentId)
-  const factories = transportFactories ?? createProviderTransportFactories(env)
+  const factories = transportFactories ?? fixtureRuntime?.factories ?? createProviderTransportFactories(env)
   for (const connection of legacyValidationOnly) {
     if (connection.provider === 'plaid') factories.plaid(connection)
     else if (connection.provider === 'investec') factories.investec(connection)
@@ -127,13 +176,18 @@ export function createRuntimeDependencies(
     env.FINANCE_SYNC_BRIDGE_TOKEN, env.FINANCE_SYNC_BRIDGE_TOKEN_FILE]
   if (bridgeInputs.some(Boolean)) {
     const allowedBridgeHosts = bridgeHosts(env)
-    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts)
-    bridgeReceiptUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts)
+    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture)
+    bridgeReceiptUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts, fixture)
     bridgeToken = readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
   }
 
   return {
     loadConnections: async () => {
+      if (fixtureRuntime) {
+        await ensureFixtureAuthority(sql, deploymentId)
+        if (!bridgeUrl || !bridgeReceiptUrl || !bridgeToken) throw new Error('bridge configuration is required for fixture connections')
+        return fixtureRuntime.connections
+      }
       const connections = await loadDurableRuntimeConnections(sql, deploymentId, secretResolver)
       if (connections.length > 0 && (!bridgeUrl || !bridgeReceiptUrl || !bridgeToken)) throw new Error('bridge configuration is required for admitted connections')
       return connections

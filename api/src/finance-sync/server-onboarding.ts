@@ -3,7 +3,7 @@ import { assertIssuerQualifiedSubject } from './projection/bridge-client'
 import type { DiscoveredAccount, PostgresOnboardingRepository } from './onboarding-repository'
 import { discoverInvestecAccounts } from './probes/investec/investec-adapter'
 import type { ProviderRuntimeEnv, ProviderTransportFactories } from './provider-runtime'
-import type { InvestecRuntimeConnection, MercuryRuntimeConnection, SnapTradeRuntimeConnection } from './runtime'
+import type { InvestecRuntimeConnection, MercuryRuntimeConnection, SnapTradeAuthMode, SnapTradeRuntimeConnection } from './runtime'
 
 export type NativeOnboardingProvider = 'investec' | 'mercury' | 'snaptrade'
 export type NativeOnboardingResult =
@@ -37,6 +37,12 @@ function optionalPositive(bundle: Readonly<Record<string, unknown>>, name: strin
   if (value === undefined) return undefined
   if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`native onboarding bundle ${name} is invalid`)
   return value as number
+}
+function snapTradeAuthMode(bundle: Readonly<Record<string, unknown>>): SnapTradeAuthMode {
+  const value = bundle.authMode
+  if (value === undefined || value === 'commercial') return 'commercial'
+  if (value === 'personal') return 'personal'
+  throw new Error('native onboarding bundle authMode is invalid')
 }
 function strings(bundle: Readonly<Record<string, unknown>>, name: string): readonly string[] {
   const value = bundle[name]
@@ -135,9 +141,12 @@ export function createNativeProviderOnboarding(input: {
         accounts = mercuryAccounts(await input.factories.mercury(connection).fetchAccounts())
         configuration = { ...(connection.since ? { since: connection.since } : {}), ...(connection.maxPagesPerAccount ? { maxPagesPerAccount: connection.maxPagesPerAccount } : {}) }
       } else {
+        const authMode = snapTradeAuthMode(bundle)
+        const userId = authMode === 'commercial' ? requiredString(bundle, 'userId') : optionalString(bundle, 'userId')
+        const userSecret = authMode === 'commercial' ? requiredString(bundle, 'userSecret') : optionalString(bundle, 'userSecret')
         const connection: SnapTradeRuntimeConnection = {
           ...common(provider, subject), provider: 'snaptrade', clientId: requiredString(bundle, 'clientId'), consumerKey: requiredString(bundle, 'consumerKey'),
-          userId: requiredString(bundle, 'userId'), userSecret: requiredString(bundle, 'userSecret'), assetMappings: {},
+          authMode, ...(userId ? { userId } : {}), ...(userSecret ? { userSecret } : {}), assetMappings: {},
           activitiesStartDate: optionalString(bundle, 'activitiesStartDate'), activitiesEndDate: optionalString(bundle, 'activitiesEndDate'),
         }
         accounts = snapTradeAccounts(await input.factories.snaptrade(connection).fetchAccounts())

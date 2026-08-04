@@ -428,15 +428,22 @@ export function createSnapTradeConnectTransport(env: ProviderRuntimeEnv = proces
   const base = endpoint(env.FINANCE_SYNC_SNAPTRADE_URL, 'https://api.snaptrade.com/api/v1', new Set(['api.snaptrade.com']), 'SnapTrade')
   return {
     async createRedirectUri(connection) {
-      const params = {
+      const params: Record<string, string> = {
         clientId: connection.clientId, connectionType: 'read', timestamp: String(Math.floor(Date.now() / 1000)),
-        userId: connection.userId, userSecret: connection.userSecret,
+      }
+      if (connection.authMode === 'commercial') {
+        if (!connection.userId || !connection.userSecret) throw new ConnectControlError(502, 'SnapTrade commercial credentials are incomplete')
+        params.userId = connection.userId
+        params.userSecret = connection.userSecret
       }
       const query = new URLSearchParams(Object.fromEntries(Object.entries(params).sort(([a], [b]) => a.localeCompare(b)))).toString()
       const path = '/api/v1/snapTrade/login'
-      const signature = createHmac('sha256', connection.consumerKey).update(canonicalJson({ content: {}, path, query })).digest('base64')
+      // SnapTrade treats an empty login request as a null body. Signing and
+      // sending `{}` produces a misleading 401 signature error, especially
+      // for Personal API keys.
+      const signature = createHmac('sha256', connection.consumerKey).update(canonicalJson({ content: null, path, query })).digest('base64')
       const value = await responseJson(await fetchImpl(new URL(`snapTrade/login?${query}`, `${base.toString().replace(/\/+$/, '')}/`), {
-        method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json', signature }, body: '{}',
+        method: 'POST', redirect: 'error', headers: { signature },
       }))
       const redirectUri = value.redirectURI ?? value.redirect_uri
       if (typeof redirectUri !== 'string' || !redirectUri) throw new ConnectControlError(502, 'provider returned an invalid response')

@@ -18,6 +18,7 @@ import { createInfisicalPlaidTokenWriter, createInfisicalProviderSecretReader } 
 import { PostgresOnboardingRepository } from './onboarding-repository'
 import { createNativeProviderOnboarding } from './server-onboarding'
 import { createProviderTransportFactories } from './provider-runtime'
+import { fixtureModeEnabled } from './fixture-runtime'
 
 interface CliArgs { help?: boolean; once?: boolean }
 function parseArgs(argv = process.argv): CliArgs { return { help: argv.includes('--help') || argv.includes('-h'), once: argv.includes('--once') } }
@@ -32,31 +33,37 @@ Provider credentials are resolved through scoped server-side Infisical machine i
   let deps: ReturnType<typeof createRuntimeDependencies> | undefined
   let connect: FinanceSyncConnectControl | undefined
   if (config.providersEnabled) {
-    const secretReader = createInfisicalProviderSecretReader(process.env)
-    const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
-    deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
-    const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
-    const snaptrade = createSnapTradeConnectTransport(process.env)
-    const nativeOnboarding = createNativeProviderOnboarding({
-      env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
-    })
-    connect = new FinanceSyncConnectControl({
-      deploymentId: config.deploymentId,
-      connections: () => deps!.loadConnections(config.deploymentId),
-      plaid: createPlaidConnectTransport({
-        env: process.env, secretReader,
-        secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
-      }),
-      snaptrade,
-      secretStore: tokenWriter,
-      nativeOnboarding,
-      sessionStore: new PostgresConnectSessionStore(sql),
-      onboarding,
-      onPlaidConnected: input => onboarding.recordConnection({
-        subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
-        secretReference: input.secretReference, accounts: input.accounts,
-      }),
-    })
+    if (fixtureModeEnabled(process.env)) {
+      // Fixture mode uses the synthetic adapters only. Do not initialize the
+      // production onboarding/Infisical control plane or attempt provider calls.
+      deps = createRuntimeDependencies(sql, config.deploymentId, process.env)
+    } else {
+      const secretReader = createInfisicalProviderSecretReader(process.env)
+      const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
+      deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
+      const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
+      const snaptrade = createSnapTradeConnectTransport(process.env)
+      const nativeOnboarding = createNativeProviderOnboarding({
+        env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
+      })
+      connect = new FinanceSyncConnectControl({
+        deploymentId: config.deploymentId,
+        connections: () => deps!.loadConnections(config.deploymentId),
+        plaid: createPlaidConnectTransport({
+          env: process.env, secretReader,
+          secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
+        }),
+        snaptrade,
+        secretStore: tokenWriter,
+        nativeOnboarding,
+        sessionStore: new PostgresConnectSessionStore(sql),
+        onboarding,
+        onPlaidConnected: input => onboarding.recordConnection({
+          subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
+          secretReference: input.secretReference, accounts: input.accounts,
+        }),
+      })
+    }
   }
   let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {
@@ -87,7 +94,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
   }
   try {
-    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay(); await cycle()
+    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../../finance-sync-migrations')); await replay(); await cycle()
     if (args.once) { if (!databaseReady || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,

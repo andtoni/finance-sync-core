@@ -20,7 +20,7 @@ function connection(provider: 'investec' | 'mercury' | 'snaptrade', localOwnerId
   }
   if (provider === 'investec') return { ...common, provider, clientId: 'client', clientSecret: 'secret', apiKey: 'key', eligibleProductNames: ['Private Bank'], fromDate: '2026-01-01', toDate: '2026-07-18' }
   if (provider === 'mercury') return { ...common, provider, apiToken: 'token' }
-  return { ...common, provider, clientId: 'client', consumerKey: 'consumer', userId: 'user', userSecret: 'secret', assetMappings: {} }
+  return { ...common, provider, clientId: 'client', consumerKey: 'consumer', authMode: 'commercial', userId: 'user', userSecret: 'secret', assetMappings: {} }
 }
 
 function dependencies(overrides: Partial<ConnectControlDependencies> = {}): ConnectControlDependencies {
@@ -125,6 +125,19 @@ describe('Finance Sync Connect control plane', () => {
     await expect(transport.createRedirectUri(snaptrade)).resolves.toEqual({
       redirectUri: 'https://app.snaptrade.com/snapTrade/redeemToken?token=short-lived',
     })
+  })
+
+  it('omits subordinate user credentials for a Personal SnapTrade key', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input))
+      expect(url.searchParams.get('userId')).toBeNull()
+      expect(url.searchParams.get('userSecret')).toBeNull()
+      return new Response(JSON.stringify({ redirectURI: 'https://app.snaptrade.com/snapTrade/redeemToken?token=short-lived' }), { status: 200 })
+    }) as unknown as typeof fetch
+    const transport = createSnapTradeConnectTransport({}, fetchImpl)
+    const commercial = connection('snaptrade') as Extract<RuntimeConnection, { provider: 'snaptrade' }>
+    const personal = { ...commercial, authMode: 'personal' as const }
+    await expect(transport.createRedirectUri(personal)).resolves.toMatchObject({ redirectUri: expect.stringContaining('redeemToken') })
   })
 
   it('hands exchanged Plaid access tokens only to ProviderSecretStore and never returns or logs them', async () => {
