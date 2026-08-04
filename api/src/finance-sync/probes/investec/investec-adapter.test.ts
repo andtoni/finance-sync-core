@@ -155,10 +155,38 @@ describe('Investec adapter G5', () => {
     expect((r.quarantine[0] as any).transactionRef).toBe('\u2026uuid')
   })
 
-  it('no transactionRef when uuid absent', async () => {
-    const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
-      [{ status: 'POSTED', postedOrder: 0, type: 'DEBIT', amount: 300, postingDate: '2026-07-12' }], undefined))
-    expect((r.quarantine[0] as any).transactionRef).toBeUndefined()
+  it('accepts PrimeSaver booked rows without UUIDs using stable synthetic identities', async () => {
+    const txns = [
+      {
+        uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+        postingDate: '2026-07-12', actionDate: '2026-07-11', transactionDate: '2026-07-11',
+        description: 'PrimeSaver interest', runningBalance: '10300',
+      },
+      {
+        uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+        postingDate: '2026-07-12', actionDate: '2026-07-11', transactionDate: '2026-07-11',
+        description: 'PrimeSaver interest', runningBalance: '10600',
+      },
+    ]
+    const transport = makeTransport(txns, undefined)
+    transport.listAccounts = async () => [{ accountId: 'acc-cash-123456789', productName: 'PrimeSaver', accountName: 'Prime Saver' }]
+    const config = { ...BASE_CONFIG, accountIds: ['acc-cash-123456789'] }
+    const first = await runInvestecAdapter(config, transport)
+    const second = await runInvestecAdapter(config, transport)
+    const firstTransactions = transactionObservations(first)
+    const secondTransactions = transactionObservations(second)
+
+    expect(firstTransactions).toHaveLength(2)
+    expect(first.quarantine).toHaveLength(0)
+    expect(firstTransactions.map(item => item.providerVersion)).toEqual(secondTransactions.map(item => item.providerVersion))
+    expect(firstTransactions.every(item => String(item.payload.transactionId).match(/^synthetic-[a-f0-9]{64}$/))).toBe(true)
+  })
+
+  it('keeps UUID-less postedOrder=0 rows quarantined for other Investec products', async () => {
+    const r = await runInvestecAdapter({ ...BASE_CONFIG, accountIds: ['acc-cash-123456789'] }, makeTransport(
+      [{ uuid: '', status: 'POSTED', postedOrder: 0, type: 'DEBIT', amount: 300, postingDate: '2026-07-12' }], undefined))
+    expect(transactionObservations(r)).toHaveLength(0)
+    expect(r.quarantine[0].reason).toBe('MISSING_IDENTITY')
   })
 
   it('retains validated provider decimal strings without Number/toFixed truncation', async () => {

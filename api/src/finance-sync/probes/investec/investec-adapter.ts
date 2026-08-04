@@ -19,11 +19,28 @@ export interface ObservationOutput {
   readonly observedAt: string
 }
 
+interface InvestecTransaction {
+  readonly uuid?: string
+  readonly status?: string
+  readonly postedOrder?: number
+  readonly type?: string
+  readonly transactionType?: string
+  readonly amount?: string | number
+  readonly postingDate?: string
+  readonly actionDate?: string
+  readonly transactionDate?: string
+  readonly valueDate?: string
+  readonly description?: string
+  readonly reference?: string
+  readonly cardNumber?: string
+  readonly runningBalance?: string | number
+}
+
 export interface InvestecTransport {
   listAccounts(): Promise<readonly { accountId: string; productName?: string; accountName?: string; accountNumber?: string; referenceName?: string }[]>
   getBalance(accountId: string): Promise<{ currency?: string; currentBalance?: string | number; availableBalance?: string | number }>
   getTransactionPage(accountId: string, window: { fromDate: string; toDate: string }, cursor?: string): Promise<{
-    transactions: readonly { uuid?: string; status?: string; postedOrder?: number; type?: string; amount?: string | number; postingDate?: string; transactionDate?: string; valueDate?: string; description?: string; reference?: string; cardNumber?: string }[]
+    transactions: readonly InvestecTransaction[]
     nextCursor?: string
   }>
 }
@@ -99,6 +116,35 @@ function investecDecimal(value: unknown): string | null {
   return /^[+-]?\d+(?:\.\d+)?$/.test(trimmed) ? trimmed : null
 }
 
+/**
+ * PrimeSaver returns booked rows with postedOrder=0 and an empty uuid. Those
+ * rows are valid, but unlike Private Bank transactions they have no upstream
+ * identity. Use a stable fingerprint of the provider fields that distinguish a
+ * ledger row; runningBalance is included as a tie-breaker for same-day rows.
+ */
+function transactionIdentity(accountId: string, productName: string | undefined, transaction: InvestecTransaction): string | null {
+  const uuid = transaction.uuid?.trim()
+  if (uuid) return uuid
+  const normalizedProduct = productName?.replace(/\s+/g, '').toLowerCase()
+  if (normalizedProduct !== 'primesaver' || transaction.postedOrder !== 0) return null
+  const fingerprint = JSON.stringify([
+    accountId,
+    transaction.postedOrder ?? null,
+    transaction.postingDate ?? null,
+    transaction.actionDate ?? null,
+    transaction.transactionDate ?? null,
+    transaction.valueDate ?? null,
+    transaction.type ?? null,
+    transaction.transactionType ?? null,
+    transaction.amount ?? null,
+    transaction.runningBalance ?? null,
+    transaction.description ?? null,
+    transaction.reference ?? null,
+    transaction.cardNumber ?? null,
+  ])
+  return `synthetic-${sha256(fingerprint)}`
+}
+
 export async function runInvestecAdapter(config: InvestecAdapterConfig, transport: InvestecTransport): Promise<InvestecAdapterResult> {
   const eligibleSet = new Set(config.eligibleProductNames)
   const admittedAccounts = config.accountIds ? new Set(config.accountIds) : undefined
@@ -162,10 +208,6 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
         const pageResult = await transport.getTransactionPage(account.accountId, { fromDate: config.fromDate, toDate: config.toDate }, cursor)
         pagesPolled++
         for (const txn of pageResult.transactions) {
-          if (txn.postedOrder === 0) {
-            quarantine.push({ reason: 'POSTED_ORDER_ZERO_PROVISIONAL', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined })
-            continue
-          }
           const status = (txn.status ?? '').toUpperCase()
           if (status !== 'POSTED') {
             if (status !== 'PENDING') {
@@ -173,18 +215,29 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             }
             continue
           }
+          // A UUID-bearing postedOrder=0 row is still the provisional shape used
+          // by the card/statement feed. PrimeSaver's booked rows have no UUID and
+          // also use postedOrder=0, so transactionIdentity handles that valid case.
+          if (txn.postedOrder === 0 && txn.uuid?.trim()) {
+            quarantine.push({ reason: 'POSTED_ORDER_ZERO_PROVISIONAL', accountRef, transactionRef: redact(txn.uuid) })
+            continue
+          }
           const date = txn.postingDate ?? txn.transactionDate ?? txn.valueDate
           if (!date) { quarantine.push({ reason: 'MISSING_DATE', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined }); continue }
-          if (!txn.uuid) { quarantine.push({ reason: 'MISSING_IDENTITY', accountRef }); continue }
+          const transactionId = transactionIdentity(account.accountId, account.productName, txn)
+          if (!transactionId) { quarantine.push({ reason: 'MISSING_IDENTITY', accountRef }); continue }
 
           const rawAmount = investecDecimal(txn.amount)
-          if (rawAmount === null) { quarantine.push({ reason: 'INVALID_AMOUNT', accountRef, transactionRef: redact(txn.uuid) }); continue }
+          if (rawAmount === null) {
+            quarantine.push({ reason: 'INVALID_AMOUNT', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : transactionId })
+            continue
+          }
           const magnitude = rawAmount.replace(/^[+-]/, '')
           const isZero = /^0+(?:\.0+)?$/.test(magnitude)
           const signed = (txn.type ?? '').toUpperCase() === 'DEBIT' && !isZero ? `-${magnitude}` : magnitude
 
           const payload = {
-            transactionId: txn.uuid,
+            transactionId,
             accountId: account.accountId,
             accountRef: redact(account.accountId),
             amount: signed,
@@ -200,12 +253,12 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
               providerHint: txn.reference ? { reference: txn.reference } : null,
             }),
           }
-          const semanticStr = [config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'cash_ledger', txn.uuid, signed, rawCurrency, date].join('\x00')
+          const semanticStr = [config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'cash_ledger', transactionId, signed, rawCurrency, date].join('\x00')
           observations.push({
             deploymentId: config.deploymentId,
             localOwnerId: config.localOwnerId,
             sourceResourceIncarnationId: config.sourceResourceIncarnationId,
-            providerVersion: 'investec:txn:' + txn.uuid,
+            providerVersion: 'investec:txn:' + transactionId,
             semanticHash: sha256(semanticStr),
             hashSpecificationVersion: HASH_SPEC_VERSION,
             domain: 'cash_ledger',
