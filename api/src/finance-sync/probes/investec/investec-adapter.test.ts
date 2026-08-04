@@ -178,6 +178,7 @@ describe('Investec adapter G5', () => {
 
     expect(firstTransactions).toHaveLength(2)
     expect(first.quarantine).toHaveLength(0)
+    expect(firstTransactions.map(item => (item.payload as any).date)).toEqual(['2026-07-11', '2026-07-11'])
     expect(firstTransactions.map(item => item.providerVersion)).toEqual(secondTransactions.map(item => item.providerVersion))
     expect(firstTransactions.every(item => String(item.payload.transactionId).match(/^synthetic-[a-f0-9]{64}$/))).toBe(true)
   })

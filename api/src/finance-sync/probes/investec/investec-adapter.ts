@@ -222,7 +222,10 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             quarantine.push({ reason: 'POSTED_ORDER_ZERO_PROVISIONAL', accountRef, transactionRef: redact(txn.uuid) })
             continue
           }
-          const date = txn.postingDate ?? txn.transactionDate ?? txn.valueDate
+          // Investec's transactionDate is the date the transaction occurred; postingDate is
+          // when it was entered into the account ledger and can be days later (PrimeSaver
+          // exposes this as the poll/current posting date).
+          const date = txn.transactionDate ?? txn.valueDate ?? txn.postingDate
           if (!date) { quarantine.push({ reason: 'MISSING_DATE', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined }); continue }
           const transactionId = transactionIdentity(account.accountId, account.productName, txn)
           if (!transactionId) { quarantine.push({ reason: 'MISSING_IDENTITY', accountRef }); continue }

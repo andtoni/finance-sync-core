@@ -104,7 +104,7 @@ export async function runInvestecG0Probe(
           if (transaction.status?.toUpperCase() !== 'PENDING') quarantine.push({ reason: 'UNKNOWN_OR_UNBOOKED_STATUS', accountRef })
           continue
         }
-        const date = transaction.postingDate ?? transaction.transactionDate ?? transaction.valueDate
+        const date = transaction.transactionDate ?? transaction.valueDate ?? transaction.postingDate
         if (!date) { quarantine.push({ reason: 'MISSING_DATE', accountRef }); continue }
         if (!transaction.uuid) { quarantine.push({ reason: 'MISSING_IDENTITY', accountRef }); continue }
         const amount = Math.abs(Number(transaction.amount ?? 0))
