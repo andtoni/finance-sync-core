@@ -19,6 +19,8 @@ import { PostgresOnboardingRepository } from './onboarding-repository'
 import { createNativeProviderOnboarding } from './server-onboarding'
 import { createProviderTransportFactories } from './provider-runtime'
 import { fixtureModeEnabled } from './fixture-runtime'
+import { startInvestecCardDrainer } from './investec-card-drainer'
+import type { DrainerHandle } from '../drain/drainer'
 
 interface CliArgs { help?: boolean; once?: boolean }
 function parseArgs(argv = process.argv): CliArgs { return { help: argv.includes('--help') || argv.includes('-h'), once: argv.includes('--once') } }
@@ -32,6 +34,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
   let deps: ReturnType<typeof createRuntimeDependencies> | undefined
   let connect: FinanceSyncConnectControl | undefined
+  let webhookDrainer: DrainerHandle | undefined
   let databaseReady = false; let cycleReady = false; let cycleFailed = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {
     if (!config.providersEnabled) {
@@ -115,9 +118,13 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })
     console.log('FINANCE_SYNC_HEALTH_LISTENING')
+    if (deps) {
+      webhookDrainer = startInvestecCardDrainer(sql, config.deploymentId, deps, process.env)
+      console.log(webhookDrainer ? 'FINANCE_SYNC_WEBHOOK_DRAINER_STARTED' : 'FINANCE_SYNC_WEBHOOK_DRAINER_DISABLED')
+    }
     const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); if (!stopping) schedule() }, config.intervalMs) }
     if (config.schedulesEnabled) schedule()
-    await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
-  } finally { if (timer) clearTimeout(timer); await sql.end() }
+    await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); webhookDrainer?.stop(); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
+  } finally { if (timer) clearTimeout(timer); webhookDrainer?.stop(); await webhookDrainer?.done; await sql.end() }
 }
 main().catch(() => { console.error('FINANCE_SYNC_RUNNER_FAILED'); process.exit(1) })
