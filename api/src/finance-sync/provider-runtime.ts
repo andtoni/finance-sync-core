@@ -383,7 +383,12 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
               const total = pagination?.total
               if (total !== undefined && (!Number.isSafeInteger(total) || (total as number) < 0)) throw new Error('invalid SnapTrade activity pagination')
               const nextOffset = offset + pageRows.length
-              if (pageRows.length === 0 || (total !== undefined ? nextOffset >= (total as number) : pageRows.length < SNAPTRADE_ACTIVITY_PAGE_SIZE)) break
+              if (total !== undefined) {
+                if (nextOffset >= (total as number)) break
+                if (pageRows.length === 0) throw new Error('SnapTrade activity pagination ended before the reported total')
+              } else if (pageRows.length === 0 || pageRows.length < SNAPTRADE_ACTIVITY_PAGE_SIZE) {
+                break
+              }
               if (nextOffset <= offset) throw new Error('SnapTrade activity pagination made no progress')
               offset = nextOffset
             }
@@ -391,7 +396,10 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
               const account = activity.account
               if (account && typeof account === 'object' && !Array.isArray(account)
                 && typeof (account as Record<string, unknown>).id === 'string'
-                && (account as Record<string, unknown>).id) return activity
+                && (account as Record<string, unknown>).id) {
+                if ((account as Record<string, unknown>).id !== accountId) throw new Error('SnapTrade activity account provenance mismatch')
+                return activity
+              }
               return {
                 ...activity,
                 account: {

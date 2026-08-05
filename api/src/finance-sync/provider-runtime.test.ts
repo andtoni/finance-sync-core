@@ -133,6 +133,43 @@ describe('four-provider runtime configuration', () => {
     }
   })
 
+  it('rejects an empty SnapTrade page before the reported total', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      data: [], pagination: { offset: 0, limit: 1000, total: 1 },
+    })) ) as typeof fetch
+    try {
+      const [connection] = parseRuntimeConnections(runtimeEnv([{
+        ...configurations[3], authMode: 'personal-oauth', userId: undefined,
+      }]), 'dep-1')
+      if (connection.provider !== 'snaptrade') throw new Error('missing SnapTrade fixture')
+      await expect(createProviderTransportFactories().snaptrade(connection)
+        .fetchActivities('2026-01-01', '2026-08-05', ['account-1'])).rejects
+        .toThrow('ended before the reported total')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('rejects SnapTrade activity rows with the wrong account provenance', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      data: [{ id: 'activity-1', account: { id: 'other-account' } }],
+      pagination: { offset: 0, limit: 1000, total: 1 },
+    })) ) as typeof fetch
+    try {
+      const [connection] = parseRuntimeConnections(runtimeEnv([{
+        ...configurations[3], authMode: 'personal-oauth', userId: undefined,
+      }]), 'dep-1')
+      if (connection.provider !== 'snaptrade') throw new Error('missing SnapTrade fixture')
+      await expect(createProviderTransportFactories().snaptrade(connection)
+        .fetchActivities('2026-01-01', '2026-08-05', ['account-1'])).rejects
+        .toThrow('provenance mismatch')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('rejects secret material in metadata, duplicate ids, and incomplete mappings', () => {
     expect(() => parseRuntimeConnections({ FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([{ ...configurations[0], accessToken: 'forbidden' }]) }, 'dep-1')).toThrow('secret material')
     expect(() => parseRuntimeConnections(runtimeEnv([configurations[0], configurations[0]]), 'dep-1')).toThrow('unique')

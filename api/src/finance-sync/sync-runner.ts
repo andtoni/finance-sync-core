@@ -1,7 +1,7 @@
 /** Finance Sync durable runner: read-only provider ingestion, canonical persistence, bridge outbox projection. */
 import { createServer } from 'node:http'
 import { resolve } from 'node:path'
-import { createRuntimeDependencies } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies } from './runtime-deps'
 import { runConfiguredSyncCycle } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
@@ -32,47 +32,16 @@ Provider credentials are resolved through scoped server-side Infisical machine i
   const config = parseServiceConfig(process.env); const sql = connectFinanceSync(config.databaseUrl)
   let deps: ReturnType<typeof createRuntimeDependencies> | undefined
   let connect: FinanceSyncConnectControl | undefined
-  if (config.providersEnabled) {
-    if (fixtureModeEnabled(process.env)) {
-      // Fixture mode uses the synthetic adapters only. Do not initialize the
-      // production onboarding/Infisical control plane or attempt provider calls.
-      deps = createRuntimeDependencies(sql, config.deploymentId, process.env)
-    } else {
-      const secretReader = createInfisicalProviderSecretReader(process.env)
-      const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
-      deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
-      const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
-      const snaptrade = createSnapTradeConnectTransport(process.env)
-      const nativeOnboarding = createNativeProviderOnboarding({
-        env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
-      })
-      connect = new FinanceSyncConnectControl({
-        deploymentId: config.deploymentId,
-        connections: () => deps!.loadConnections(config.deploymentId),
-        plaid: createPlaidConnectTransport({
-          env: process.env, secretReader,
-          secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
-        }),
-        snaptrade,
-        secretStore: tokenWriter,
-        nativeOnboarding,
-        sessionStore: new PostgresConnectSessionStore(sql),
-        onboarding,
-        onPlaidConnected: input => onboarding.recordConnection({
-          subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
-          secretReference: input.secretReference, accounts: input.accounts,
-        }),
-      })
-    }
-  }
-  let databaseReady = false; let cycleReady = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
+  let databaseReady = false; let cycleReady = false; let cycleFailed = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   const cycle = async () => {
     if (!config.providersEnabled) {
       connectionCount = 0
       cycleReady = false
+      cycleFailed = false
       console.log('FINANCE_SYNC_RUNTIME_DISABLED')
       return
     }
+    cycleFailed = false
     try {
       const result = await runConfiguredSyncCycle(config.deploymentId, deps!, {
         providersEnabled: config.providersEnabled,
@@ -80,11 +49,13 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       })
       connectionCount = result.connections
       cycleReady = result.connections > 0 && result.failures === 0
-      if (result.connections === 0) console.log('FINANCE_SYNC_DISABLED')
+      cycleFailed = result.failures > 0
+      if (result.connections === 0 && result.failures === 0) console.log('FINANCE_SYNC_DISABLED')
       else if (cycleReady) console.log('FINANCE_SYNC_CYCLE_OK')
       else console.error('FINANCE_SYNC_CYCLE_FAILED')
     } catch {
       cycleReady = false
+      cycleFailed = true
       // Never print provider/transport errors: SDK errors can contain secrets or financial payloads.
       console.error('FINANCE_SYNC_CYCLE_FAILED')
     }
@@ -94,13 +65,52 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
   }
   try {
-    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay(); await cycle()
-    if (args.once) { if (!databaseReady || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
+    console.log('FINANCE_SYNC_MIGRATING'); await migrate(sql, resolve(import.meta.dirname, '../finance-sync-migrations')); await replay()
+    if (config.providersEnabled) {
+      if (!databaseReady) throw new Error('database is required before provider control is initialized')
+      const fixture = fixtureModeEnabled(process.env)
+      // Validate bridge delivery before constructing onboarding. The control
+      // plane must never be available while projection is misconfigured.
+      assertBridgeConfiguration(process.env, fixture)
+      if (fixture) {
+        // Fixture mode uses the synthetic adapters only. Do not initialize the
+        // production onboarding/Infisical control plane or attempt provider calls.
+        deps = createRuntimeDependencies(sql, config.deploymentId, process.env)
+      } else {
+        const secretReader = createInfisicalProviderSecretReader(process.env)
+        const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
+        deps = createRuntimeDependencies(sql, config.deploymentId, process.env, undefined, undefined, secretReader)
+        const onboarding = new PostgresOnboardingRepository(sql, config.deploymentId)
+        const snaptrade = createSnapTradeConnectTransport(process.env)
+        const nativeOnboarding = createNativeProviderOnboarding({
+          env: process.env, secretStore: secretReader, factories: createProviderTransportFactories(process.env), repository: onboarding, snaptrade,
+        })
+        connect = new FinanceSyncConnectControl({
+          deploymentId: config.deploymentId,
+          connections: () => deps!.loadConnections(config.deploymentId),
+          plaid: createPlaidConnectTransport({
+            env: process.env, secretReader,
+            secretReference: process.env.FINANCE_SYNC_PLAID_CONNECT_SECRET_REFERENCE ?? '',
+          }),
+          snaptrade,
+          secretStore: tokenWriter,
+          nativeOnboarding,
+          sessionStore: new PostgresConnectSessionStore(sql),
+          onboarding,
+          onPlaidConnected: input => onboarding.recordConnection({
+            subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
+            secretReference: input.secretReference, accounts: input.accounts,
+          }),
+        })
+      }
+    }
+    await cycle()
+    if (args.once) { if (!databaseReady || cycleFailed || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
       providersEnabled: config.providersEnabled,
       connect,
-      health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount); return { status: body.ok ? 200 : 503, body } },
+      health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount, cycleFailed); return { status: body.ok ? 200 : 503, body } },
     })
     const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })

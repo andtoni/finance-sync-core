@@ -93,7 +93,9 @@ function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: R
   } catch {
     throw new Error(`${name} must be a valid URL`)
   }
-  const fixtureHttp = allowFixtureHttp && url.protocol === 'http:' && url.hostname === '127.0.0.1'
+  const fixtureLoopback = allowFixtureHttp && ['127.0.0.1', 'localhost'].includes(url.hostname.toLowerCase())
+  const fixtureHttp = fixtureLoopback && url.protocol === 'http:'
+  if (allowFixtureHttp && !fixtureLoopback) throw new Error(`${name} must target a loopback host in fixture mode`)
   if ((!fixtureHttp && url.protocol !== 'https:') || url.username || url.password) throw new Error(`${name} must be an HTTPS URL without credentials`)
   if (!allowedHosts.has(url.hostname.toLowerCase())) throw new Error(`${name} host is not allowed`)
   return url
@@ -103,6 +105,13 @@ function bridgeHosts(env: RuntimeEnv): ReadonlySet<string> {
   const hosts = env.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS?.split(',').map(value => value.trim().toLowerCase()).filter(Boolean) ?? []
   if (hosts.length === 0) throw new Error('FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS is required for configured connections')
   return new Set(hosts)
+}
+
+export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {
+  const allowedBridgeHosts = bridgeHosts(env)
+  requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture)
+  requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts, fixture)
+  readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
 }
 
 const UUID_PREFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:/i

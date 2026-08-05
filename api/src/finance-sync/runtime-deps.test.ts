@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createRuntimeDependencies } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies } from './runtime-deps'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
@@ -100,6 +100,31 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
 describe('createRuntimeDependencies startup validation', () => {
   it('allows an explicitly empty connection set', () => {
     expect(createRuntimeDependencies({} as FinanceSyncSql, 'dep-1', { FINANCE_SYNC_CONNECTIONS_JSON: '[]' })).toBeDefined()
+  })
+
+  it('requires complete bridge configuration before provider onboarding', () => {
+    expect(() => assertBridgeConfiguration({})).toThrow('BRIDGE_ALLOWED_HOSTS')
+    expect(() => assertBridgeConfiguration({
+      FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge',
+      FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts',
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test',
+    })).toThrow('BRIDGE_TOKEN')
+  })
+
+  it('keeps fixture bridge delivery on loopback', () => {
+    const fixtureEnv = {
+      FINANCE_SYNC_BRIDGE_URL: 'https://bridge.test/bridge',
+      FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'https://bridge.test/receipts',
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'bridge.test',
+      FINANCE_SYNC_BRIDGE_TOKEN: 'fixture-token',
+    }
+    expect(() => assertBridgeConfiguration(fixtureEnv, true)).toThrow('loopback')
+    expect(() => assertBridgeConfiguration({
+      ...fixtureEnv,
+      FINANCE_SYNC_BRIDGE_URL: 'http://127.0.0.1:8088/bridge',
+      FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'http://127.0.0.1:8088/receipts',
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: '127.0.0.1',
+    }, true)).not.toThrow()
   })
 
   it.each([

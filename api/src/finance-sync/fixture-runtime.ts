@@ -124,7 +124,15 @@ function fixturePlaidTransport(account: FixturePlaidAccount): PlaidTransport {
 function fixtureSnapTradeTransport(): SnapTradeTransport {
   return {
     async fetchAccounts() { return SNAPTRADE_ACCOUNTS },
-    async fetchActivities() { return SNAPTRADE_ACTIVITIES },
+    async fetchActivities(_startDate, _endDate, accountIds) {
+      if (accountIds.length === 0) throw new Error('fixture SnapTrade activities require admitted account IDs')
+      const admitted = new Set(accountIds)
+      return SNAPTRADE_ACTIVITIES.filter(activity => {
+        const accountId = activity.account && typeof activity.account === 'object' && !Array.isArray(activity.account)
+          && typeof activity.account.id === 'string' ? activity.account.id : undefined
+        return accountId !== undefined && admitted.has(accountId)
+      })
+    },
   }
 }
 

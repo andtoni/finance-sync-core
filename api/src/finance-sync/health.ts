@@ -6,10 +6,15 @@ export interface FinanceSyncHealth {
   readonly providerReady: boolean
 }
 
-export function financeSyncHealth(databaseReady: boolean, cycleReady: boolean, connectionCount: number): FinanceSyncHealth {
+export function financeSyncHealth(
+  databaseReady: boolean,
+  cycleReady: boolean,
+  connectionCount: number,
+  cycleFailed = false,
+): FinanceSyncHealth {
   const enabled = connectionCount > 0
   return {
-    ok: databaseReady && (!enabled || cycleReady),
+    ok: databaseReady && !cycleFailed && (!enabled || cycleReady),
     service: 'finance-sync',
     mode: enabled ? 'enabled' : 'disabled',
     databaseReady,
