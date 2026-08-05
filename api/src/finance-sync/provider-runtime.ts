@@ -143,8 +143,9 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
           assetMappings[providerAssetId] = wealthfolioAssetId
         }
         const rawAuthMode = c.authMode
-        const authMode: SnapTradeAuthMode = rawAuthMode === undefined ? 'commercial' : rawAuthMode === 'personal' || rawAuthMode === 'commercial'
-          ? rawAuthMode : (() => { throw new Error('connection authMode is invalid') })()
+        const authMode: SnapTradeAuthMode = rawAuthMode === undefined || rawAuthMode === 'commercial' ? 'commercial'
+          : rawAuthMode === 'personal' || rawAuthMode === 'personal-oauth' ? 'personal'
+            : (() => { throw new Error('connection authMode is invalid') })()
         const userId = authMode === 'commercial' ? string(c, 'userId') : optionalString(c, 'userId')
         const userSecret = authMode === 'commercial' ? string(c, 'userSecret') : optionalString(c, 'userSecret')
         return {

@@ -60,6 +60,18 @@ describe('four-provider runtime configuration', () => {
     expect(() => parseRuntimeConnections({ FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([{ ...common, provider }]) }, 'dep-1')).toThrow('unsupported runtime provider')
   })
 
+  it('accepts the deployed Personal SnapTrade auth-mode label without commercial credentials', () => {
+    const configuration = { ...configurations[3], authMode: 'personal-oauth', userId: undefined }
+    const secrets = { ...providerSecrets, 'connection-4': { consumerKey: 'key' } }
+    const [connection] = parseRuntimeConnections({
+      FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([configuration]),
+      FINANCE_SYNC_PROVIDER_SECRETS_JSON: JSON.stringify(secrets),
+    }, 'dep-1')
+    expect(connection).toMatchObject({ provider: 'snaptrade', authMode: 'personal' })
+    expect(connection).not.toHaveProperty('userId')
+    expect(connection).not.toHaveProperty('userSecret')
+  })
+
   it('rejects secret material in metadata, duplicate ids, and incomplete mappings', () => {
     expect(() => parseRuntimeConnections({ FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([{ ...configurations[0], accessToken: 'forbidden' }]) }, 'dep-1')).toThrow('secret material')
     expect(() => parseRuntimeConnections(runtimeEnv([configurations[0], configurations[0]]), 'dep-1')).toThrow('unique')

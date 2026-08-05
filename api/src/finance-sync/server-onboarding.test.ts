@@ -6,7 +6,7 @@ const subject = 'wealthfolio#owner'
 const bundles: Record<string, Readonly<Record<string, unknown>>> = {
   INVESTEC_BUNDLE: { providerConnectionId: 'investec-principal', clientId: 'id', clientSecret: 'secret', apiKey: 'key', eligibleProductNames: ['Private Bank'], fromDate: '2026-01-01', toDate: '2026-07-18' },
   MERCURY_BUNDLE: { providerConnectionId: 'mercury-principal', apiToken: 'token' },
-  SNAPTRADE_BUNDLE: { providerConnectionId: 'snaptrade-principal', clientId: 'id', consumerKey: 'key', userId: 'user', userSecret: 'secret' },
+  SNAPTRADE_BUNDLE: { providerConnectionId: 'snaptrade-principal', authMode: 'personal-oauth', clientId: 'id', consumerKey: 'key' },
 }
 
 function setup(snapAccounts: readonly Record<string, unknown>[] = [{ account: { id: 'broker-1', name: 'Brokerage', raw_type: 'taxable' }, total_value: { currency: 'USD' } }]) {

@@ -41,7 +41,7 @@ function optionalPositive(bundle: Readonly<Record<string, unknown>>, name: strin
 function snapTradeAuthMode(bundle: Readonly<Record<string, unknown>>): SnapTradeAuthMode {
   const value = bundle.authMode
   if (value === undefined || value === 'commercial') return 'commercial'
-  if (value === 'personal') return 'personal'
+  if (value === 'personal' || value === 'personal-oauth') return 'personal'
   throw new Error('native onboarding bundle authMode is invalid')
 }
 function strings(bundle: Readonly<Record<string, unknown>>, name: string): readonly string[] {
