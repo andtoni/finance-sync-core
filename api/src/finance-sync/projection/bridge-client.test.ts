@@ -78,7 +78,7 @@ describe('Bridge client', () => {
       semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '42.50', currency: 'USD', date: '2026-07-11', name: 'AMAZON' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'wf-acc-uuid-1')
-    expect(op.activity).toMatchObject({ accountId: 'wf-acc-uuid-1', amount: '42.5', activityType: 'WITHDRAWAL', status: 'POSTED', notes: 'AMAZON' })
+    expect(op.activity).toMatchObject({ accountId: 'wf-acc-uuid-1', amount: '42.50', activityType: 'WITHDRAWAL', status: 'POSTED', notes: 'AMAZON' })
   })
 
   it('projects the provider merchant display as notes without projecting category hints', () => {
@@ -94,13 +94,22 @@ describe('Bridge client', () => {
     expect(Object.keys((bridgeOperationToWire(op).activity as Record<string, unknown>).merchant_context as object)).toEqual(['merchant_key', 'merchant_key_version', 'normalization_version'])
   })
 
+  it('preserves provider decimal text while normalizing sign and direction', () => {
+    const op = cashObservationToBridge({
+      deploymentId: 'g8-test', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'precise', payload: { transactionId: 'txn-precise', amount: '-123456789.123456789123456789', currency: 'ZAR', date: '2026-07-11' },
+      observedAt: '2026-07-11T00:00:00.000Z',
+    }, 1, 'wf-acc-uuid-1')
+    expect(op.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '123456789.123456789123456789' })
+  })
+
   it('normalizes Plaid negative income to deposit', () => {
     const op = cashObservationToBridge({
       deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
       semanticHash: 'aaa', payload: { transactionId: 't1', amount: '-100.00', currency: 'USD', date: '2026-07-11', name: 'SALARY' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'acc-1')
-    expect(op.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '100', notes: 'SALARY' })
+    expect(op.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '100.00', notes: 'SALARY' })
   })
 
   it.each(['0', '-0'])('fails closed for a zero Plaid amount (%s)', amount => {

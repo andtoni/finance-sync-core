@@ -10,13 +10,30 @@ describe('provider-aware correction and removal projection', () => {
   it('normalizes direct-bank ledger signs without applying Plaid signs', () => {
     const debit = providerObservationToBridge('mercury', observation({ transactionId: 't-1', accountId: 'a', amount: '-12.50', currency: 'USD', date: '2026-07-18', merchantContext: { merchantDisplay: 'Supplier' } }), 1, 'wf-a')
     const credit = providerObservationToBridge('investec', observation({ transactionId: 't-2', accountId: 'a', amount: '20.00', currency: 'ZAR', date: '2026-07-18', description: 'Salary' }), 1, 'wf-a')
-    expect(debit?.activity).toMatchObject({ activityType: 'WITHDRAWAL', amount: '12.5', notes: 'Supplier' })
-    expect(credit?.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '20', notes: 'Salary' })
+    expect(debit?.activity).toMatchObject({ activityType: 'WITHDRAWAL', amount: '12.50', notes: 'Supplier' })
+    expect(credit?.activity).toMatchObject({ activityType: 'DEPOSIT', amount: '20.00', notes: 'Salary' })
+  })
+
+  it('projects direct-bank pending status to the native pending activity state', () => {
+    const mercury = providerObservationToBridge('mercury', observation({
+      transactionId: 'pending-1', accountId: 'a', amount: '-12.50', currency: 'USD', date: '2026-07-18', status: 'pending',
+    }), 1, 'wf-a')
+    const investec = providerObservationToBridge('investec', observation({
+      transactionId: 'pending-2', accountId: 'a', amount: '-8.00', currency: 'ZAR', date: '2026-07-18', status: 'PENDING',
+    }), 1, 'wf-a')
+    expect(mercury?.activity).toMatchObject({ status: 'PENDING', activityType: 'WITHDRAWAL' })
+    expect(investec?.activity).toMatchObject({ status: 'PENDING', activityType: 'WITHDRAWAL' })
+
+    const settled = providerObservationToBridge('investec', observation({
+      transactionId: 'posted-2', pendingTransactionId: 'pending-2', accountId: 'a', amount: '-8.00', currency: 'ZAR', date: '2026-07-20', status: 'POSTED',
+    }), 1, 'wf-a')
+    expect(settled).toMatchObject({ resourceId: expect.stringContaining(':pending-2'), lifecycleSuccessorId: expect.stringContaining(':posted-2') })
+    expect(settled?.activity).toMatchObject({ status: 'POSTED', activityType: 'WITHDRAWAL' })
   })
 
   it('maps SnapTrade activity kinds while leaving holdings canonical-only', () => {
     const activity = providerObservationToBridge('snaptrade', observation({ sourceId: 'snaptrade:a-1', accountId: 'a', type: 'buy', amount: '42.00', currency: 'USD', date: '2026-07-18' }, 'brokerage_activity'), 1, 'wf-a')
-    expect(activity?.activity).toMatchObject({ activityType: 'BUY', amount: '42', status: 'POSTED' })
+    expect(activity?.activity).toMatchObject({ activityType: 'BUY', amount: '42.00', status: 'POSTED' })
     expect(providerObservationToBridge('snaptrade', observation({ accountId: 'a', symbol: 'VTI', units: '1' }, 'holding'), 1, 'wf-a')).toBeNull()
   })
 

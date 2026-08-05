@@ -189,6 +189,27 @@ export function idempotencyKey(
   return createHash('sha256').update(framed, 'utf8').digest('hex').slice(0, 40)
 }
 
+interface DecimalParts {
+  readonly magnitude: string
+  readonly negative: boolean
+}
+
+function decimalParts(value: unknown): DecimalParts {
+  const text = typeof value === 'number'
+    ? Number.isFinite(value) ? String(value) : ''
+    : typeof value === 'string' ? value.trim() : ''
+  if (!/^[+-]?\d+(?:\.\d+)?$/.test(text)) throw new Error('invalid provider amount')
+  const negative = text.startsWith('-')
+  const magnitude = text.replace(/^[+-]/, '')
+  if (!/[1-9]/.test(magnitude.replace('.', ''))) throw new Error('invalid provider amount')
+  return { magnitude, negative }
+}
+
+function negateDecimal(value: unknown): string {
+  const parts = decimalParts(value)
+  return parts.negative ? parts.magnitude : `-${parts.magnitude}`
+}
+
 function providerDescription(payload: Readonly<Record<string, unknown>>): string | undefined {
   const context = isRecord(payload.merchantContext) ? payload.merchantContext : undefined
   const candidates = [
@@ -246,9 +267,10 @@ export function cashObservationToBridge(
   if (p.isRemoved === true) {
     return { ...common, kind: 'ActivityDelete', resourceId }
   }
-  const plaidAmount = Number(p.amount)
-  if (!Number.isFinite(plaidAmount) || plaidAmount === 0) throw new Error('invalid provider amount')
+  const parsedAmount = decimalParts(p.amount)
   if (typeof p.currency !== 'string' || p.currency.length === 0) throw new Error('invalid provider currency')
+  const providerStatus = typeof p.status === 'string' ? p.status.toUpperCase() : undefined
+  const isPending = p.pending === true || providerStatus === 'PENDING'
   return {
     ...common,
     kind: 'ActivityUpsert',
@@ -257,10 +279,10 @@ export function cashObservationToBridge(
     activity: {
       accountId,
       // Plaid uses positive for money leaving the account and negative for money entering it.
-      activityType: plaidAmount > 0 ? 'WITHDRAWAL' : 'DEPOSIT',
-      status: p.pending === true ? 'PENDING' : 'POSTED',
+      activityType: parsedAmount.negative ? 'DEPOSIT' : 'WITHDRAWAL',
+      status: isPending ? 'PENDING' : 'POSTED',
       activityDate: (p.date as string) ?? observation.observedAt.slice(0, 10),
-      amount: String(Math.abs(plaidAmount)),
+      amount: parsedAmount.magnitude,
       currency: p.currency,
       ...(providerDescription(p) === undefined ? {} : { notes: providerDescription(p) }),
       ...(isRecord(p.merchantContext) ? { merchantContext: p.merchantContext } : {}),
@@ -326,12 +348,11 @@ export function providerObservationToBridge(
   // resolution/grace policy proves the visible activity should be deleted.
   if (payload.isRemoved === true) return null
 
-  const amount = Number(payload.amount)
-  if (!Number.isFinite(amount) || amount === 0) throw new Error('invalid provider amount')
+  const parsedAmount = decimalParts(payload.amount)
   if (provider === 'plaid') return cashObservationToBridge(observation, accessGeneration, accountId, connectionId)
   if (provider === 'investec' || provider === 'mercury') {
     // Direct-bank adapters use ledger signs (negative money-out); Plaid uses the inverse.
-    return cashObservationToBridge({ ...observation, payload: { ...payload, amount: -amount } }, accessGeneration, accountId, connectionId)
+    return cashObservationToBridge({ ...observation, payload: { ...payload, amount: negateDecimal(payload.amount) } }, accessGeneration, accountId, connectionId)
   }
   if (observation.domain !== 'brokerage_activity') return null
   const activityTypes: Readonly<Record<string, string>> = {
@@ -340,9 +361,9 @@ export function providerObservationToBridge(
   }
   const activityType = activityTypes[String(payload.type)]
   if (!activityType) throw new Error('unsupported brokerage activity type')
-  const base = cashObservationToBridge({ ...observation, payload: { ...payload, amount: -Math.abs(amount) } }, accessGeneration, accountId, connectionId)
+  const base = cashObservationToBridge({ ...observation, payload: { ...payload, amount: negateDecimal(payload.amount) } }, accessGeneration, accountId, connectionId)
   if (!base.activity) throw new Error('brokerage activity projection failed')
-  return { ...base, activity: { ...base.activity, activityType, amount: String(Math.abs(amount)), status: 'POSTED' } }
+  return { ...base, activity: { ...base.activity, activityType, amount: parsedAmount.magnitude, status: 'POSTED' } }
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

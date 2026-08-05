@@ -147,6 +147,15 @@ describe('Mercury provider adapter G6', () => {
     expect(balanceIds).toEqual(['acc-1', 'acc-2'])
   })
 
+  it('retains Mercury pending status for native projection', async () => {
+    const result = await runMercurySync({
+      deploymentId: 'g6-test', localOwnerId: 'alexis', sourceResourceIncarnationId: 'mercury:org-1',
+    }, mockTransport({ fetchTransactions: async () => ({
+      transactions: [mockTransaction({ id: 'pending-1', status: 'pending', postedAt: null })], total: 1,
+    }) }))
+    expect(result.observations.find(o => o.providerVersion === 'mercury:txn:pending-1')?.payload).toMatchObject({ status: 'pending' })
+  })
+
   it('drops cancelled/failed transactions from observations', async () => {
     const transport = mockTransport({
       fetchTransactions: async () => ({
