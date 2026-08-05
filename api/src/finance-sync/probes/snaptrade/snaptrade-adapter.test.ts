@@ -274,7 +274,7 @@ describe('runSnapTradeSync', () => {
     const result = await runSnapTradeSync(DEFAULT_CONFIG, transport)
 
     expect(transport.fetchAccounts).toHaveBeenCalledOnce()
-    expect(transport.fetchActivities).toHaveBeenCalledWith('2026-01-01', '2026-07-11')
+    expect(transport.fetchActivities).toHaveBeenCalledWith('2026-01-01', '2026-07-11', undefined)
 
     expect(result.accountsFetched).toBe(2)
     expect(result.holdingsObserved).toBe(3) // VTI + CASH in acc-1, SCHB in acc-2

@@ -72,6 +72,54 @@ describe('four-provider runtime configuration', () => {
     expect(connection).not.toHaveProperty('userSecret')
   })
 
+  it('uses current Personal SnapTrade account and unified-position endpoints', async () => {
+    const originalFetch = globalThis.fetch
+    const requests: string[] = []
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : input)
+      requests.push(url.pathname)
+      if (url.pathname === '/api/v1/accounts') {
+        return new Response(JSON.stringify([{
+          id: 'account-1', name: 'Brokerage', number: '1234', institution_name: 'Example Broker', raw_type: 'Margin',
+          balance: { total: { amount: 100, currency: 'USD' } },
+        }]))
+      }
+      if (url.pathname === '/api/v1/accounts/account-1/positions/all') {
+        return new Response(JSON.stringify({
+          results: [{
+            instrument: { kind: 'etf', id: 'asset-1', symbol: 'VTI', description: 'Vanguard Total Stock ETF', currency: 'USD' },
+            units: '2', price: '50', cost_basis: '40', currency: 'USD',
+          }],
+          data_freshness: { as_of: '2026-08-05T00:00:00Z' },
+        }))
+      }
+      if (url.pathname === '/api/v1/accounts/account-1/activities') {
+        return new Response(JSON.stringify({ data: [{ type: 'BUY' }] }))
+      }
+      throw new Error(`unexpected SnapTrade path ${url.pathname}`)
+    }) as typeof fetch
+    try {
+      const [connection] = parseRuntimeConnections(runtimeEnv([{
+        ...configurations[3], authMode: 'personal-oauth', userId: undefined,
+      }]), 'dep-1')
+      if (connection.provider !== 'snaptrade') throw new Error('missing SnapTrade fixture')
+      const accounts = await createProviderTransportFactories().snaptrade(connection).fetchAccounts()
+      expect(requests).toEqual(['/api/v1/accounts', '/api/v1/accounts/account-1/positions/all'])
+      expect(accounts).toEqual([expect.objectContaining({
+        total_value: { value: 100, currency: 'USD' },
+        positions: [expect.objectContaining({
+          symbol: expect.objectContaining({ id: 'asset-1', symbol: 'VTI' }),
+          market_value: 100,
+        })],
+      })])
+      const activities = await createProviderTransportFactories().snaptrade(connection).fetchActivities('2026-01-01', '2026-08-05', ['account-1'])
+      expect(requests).toContain('/api/v1/accounts/account-1/activities')
+      expect(activities).toEqual([{ account: { id: 'account-1' }, type: 'BUY' }])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('rejects secret material in metadata, duplicate ids, and incomplete mappings', () => {
     expect(() => parseRuntimeConnections({ FINANCE_SYNC_CONNECTIONS_JSON: JSON.stringify([{ ...configurations[0], accessToken: 'forbidden' }]) }, 'dep-1')).toThrow('secret material')
     expect(() => parseRuntimeConnections(runtimeEnv([configurations[0], configurations[0]]), 'dep-1')).toThrow('unique')

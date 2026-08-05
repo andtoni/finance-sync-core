@@ -289,7 +289,7 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
     },
     snaptrade(connection) {
       const base = endpoint(env.FINANCE_SYNC_SNAPTRADE_URL, 'https://api.snaptrade.com/api/v1', 'snaptrade')
-      const request = async (path: '/holdings' | '/activities', extra: Record<string, string> = {}) => {
+      const request = async (path: string, extra: Record<string, string> = {}) => {
         const params: Record<string, string> = {
           clientId: connection.clientId,
           timestamp: String(Math.floor(Date.now() / 1000)),
@@ -308,14 +308,73 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
       }
       return {
         async fetchAccounts() {
-          const value = await request('/holdings')
-          if (!Array.isArray(value)) throw new Error('invalid SnapTrade holdings response')
-          return value as never[]
+          const value = await request('/accounts')
+          if (!Array.isArray(value)) throw new Error('invalid SnapTrade accounts response')
+          return await Promise.all(value.map(async rawAccount => {
+            const account = record(rawAccount, 'invalid SnapTrade account response')
+            const accountId = string(account, 'id')
+            const name = typeof account.name === 'string' && account.name ? account.name : accountId
+            const balance = record(account.balance, 'invalid SnapTrade account balance response')
+            const total = record(balance.total, 'invalid SnapTrade account total response')
+            const totalCurrency = string(total, 'currency')
+            const positionsResponse = record(await request(`/accounts/${encodeURIComponent(accountId)}/positions/all`), 'invalid SnapTrade positions response')
+            const positions = positionsResponse.results
+            if (!Array.isArray(positions)) throw new Error('invalid SnapTrade positions response')
+            const normalizedPositions = positions.map(rawPosition => {
+              const position = record(rawPosition, 'invalid SnapTrade position response')
+              const instrument = record(position.instrument, 'invalid SnapTrade instrument response')
+              const symbol = string(instrument, 'symbol')
+              const instrumentType = typeof instrument.kind === 'string' && instrument.kind ? instrument.kind : 'other'
+              const instrumentCurrency = typeof position.currency === 'string' && position.currency
+                ? position.currency : typeof instrument.currency === 'string' && instrument.currency ? instrument.currency : totalCurrency
+              const units = typeof position.units === 'string' || typeof position.units === 'number' ? Number(position.units) : undefined
+              const price = typeof position.price === 'string' || typeof position.price === 'number' ? Number(position.price) : undefined
+              const costBasis = typeof position.cost_basis === 'string' || typeof position.cost_basis === 'number' ? Number(position.cost_basis) : undefined
+              if (units !== undefined && !Number.isFinite(units)) throw new Error('invalid SnapTrade position units')
+              if (price !== undefined && !Number.isFinite(price)) throw new Error('invalid SnapTrade position price')
+              if (costBasis !== undefined && !Number.isFinite(costBasis)) throw new Error('invalid SnapTrade position cost basis')
+              return {
+                symbol: {
+                  id: typeof instrument.id === 'string' ? instrument.id : undefined,
+                  symbol,
+                  name: typeof instrument.description === 'string' ? instrument.description : symbol,
+                  currency: { code: instrumentCurrency },
+                  type: { code: instrumentType, description: instrumentType },
+                },
+                units,
+                price,
+                cost_basis: costBasis,
+                market_value: units !== undefined && price !== undefined ? units * price : undefined,
+              }
+            })
+            return {
+              account: {
+                ...account,
+                id: accountId,
+                name,
+                ...(typeof account.number === 'string' ? { number: account.number } : {}),
+              },
+              total_value: { value: total.amount, currency: totalCurrency },
+              positions: normalizedPositions,
+            }
+          })) as never[]
         },
-        async fetchActivities(startDate, endDate) {
-          const value = await request('/activities', { startDate, endDate })
-          if (!Array.isArray(value) && !Array.isArray((value as { data?: unknown[] } | null)?.data)) throw new Error('invalid SnapTrade activities response')
-          return value as Awaited<ReturnType<SnapTradeTransport['fetchActivities']>>
+        async fetchActivities(startDate, endDate, accountIds = []) {
+          if (accountIds.length === 0) {
+            const value = await request('/activities', { startDate, endDate })
+            if (!Array.isArray(value) && !Array.isArray((value as { data?: unknown[] } | null)?.data)) throw new Error('invalid SnapTrade activities response')
+            return value as Awaited<ReturnType<SnapTradeTransport['fetchActivities']>>
+          }
+          const activities = (await Promise.all(accountIds.map(async accountId => {
+            const value = await request(`/accounts/${encodeURIComponent(accountId)}/activities`, { startDate, endDate })
+            const rows = Array.isArray(value) ? value : (record(value, 'invalid SnapTrade activities response').data as unknown)
+            if (!Array.isArray(rows)) throw new Error('invalid SnapTrade activities response')
+            return rows.map(rawActivity => {
+              const activity = record(rawActivity, 'invalid SnapTrade activity response')
+              return activity.account ? activity : { ...activity, account: { id: accountId } }
+            })
+          }))).flat()
+          return activities as Awaited<ReturnType<SnapTradeTransport['fetchActivities']>>
         },
       }
     },

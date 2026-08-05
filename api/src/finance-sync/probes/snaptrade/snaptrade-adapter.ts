@@ -85,7 +85,7 @@ export interface SnapTradeTransport {
   fetchAccounts(): Promise<readonly SnapTradeRawAccount[]>
 
   /** Fetch the documented bounded activity date range. */
-  fetchActivities(startDate: string, endDate: string): Promise<readonly SnapTradeRawActivity[] | { readonly data: readonly SnapTradeRawActivity[] }>
+  fetchActivities(startDate: string, endDate: string, accountIds?: readonly string[]): Promise<readonly SnapTradeRawActivity[] | { readonly data: readonly SnapTradeRawActivity[] }>
 }
 
 // ─── Config and result types ───────────────────────────────────────────────────
@@ -541,7 +541,7 @@ export async function runSnapTradeSync(
 
   let activityPasses = 0
   try {
-    // The documented user-level endpoint has a bounded date window but no
+    // The documented account-level endpoint has a bounded date window but no
     // cursor parameter. Require two identical bounded snapshots instead of
     // guessing undocumented pagination fields or accepting a moving partial run.
     const maxRows = config.maxActivityRows ?? DEFAULT_MAX_ACTIVITY_ROWS
@@ -549,7 +549,7 @@ export async function runSnapTradeSync(
     let stableActivities: SnapTradeNormalizedActivity[] | null = null
     let stableSignature: string | null = null
     for (let pass = 0; pass < ACTIVITY_STABILITY_PASSES; pass++) {
-      const actPayload = await transport.fetchActivities(startDate, endDate)
+      const actPayload = await transport.fetchActivities(startDate, endDate, config.accountIds)
       activityPasses++
       const normalized = normalizeActivities(actPayload)
       if (normalized.length > maxRows) throw new Error('activity bound exceeded')
