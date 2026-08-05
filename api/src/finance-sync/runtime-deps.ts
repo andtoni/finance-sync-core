@@ -15,7 +15,7 @@ import {
   validateBridgeReceipt,
   type BridgeDisclosureOperation,
 } from './projection/bridge-client'
-import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
+import type { PersistEnqueueOptions, RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import { readExclusiveInput } from './secret-input'
 import { loadDurableRuntimeConnections, type ProviderSecretResolver } from './durable-connections'
 import { unavailableProviderSecretStore } from './connect-control'
@@ -210,10 +210,10 @@ export function createRuntimeDependencies(
       `)[0]?.cursor ?? null
     },
     runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
-    persistAndEnqueue: async (connection, observations) => sql.begin(async transaction => {
+    persistAndEnqueue: async (connection, observations, options?: PersistEnqueueOptions) => sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
       await assertDurableAuthority(tx, deploymentId, connection)
-      const currentStates = assembleCurrentState(connection.provider, observations, connection.accountIds.map(providerAccountId => ({
+      const currentStates = options?.skipCurrentState ? [] : assembleCurrentState(connection.provider, observations, connection.accountIds.map(providerAccountId => ({
         providerAccountId,
         accountId: connection.wealthfolioAccountIds[providerAccountId],
       })), {

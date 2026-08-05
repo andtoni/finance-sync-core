@@ -66,11 +66,12 @@ export type RuntimeConnection =
   | SnapTradeRuntimeConnection
 
 export interface ProviderRun { readonly nextCursor: string | null; readonly observations: readonly ObservationOutput[] }
+export interface PersistEnqueueOptions { readonly skipCurrentState?: boolean }
 export interface SyncRuntimeDependencies {
   loadConnections(deploymentId: string): Promise<readonly RuntimeConnection[]>
   loadCheckpoint(connection: RuntimeConnection): Promise<string | null>
   runProvider(connection: RuntimeConnection, cursor: string | null): Promise<ProviderRun>
-  persistAndEnqueue(connection: RuntimeConnection, observations: readonly ObservationOutput[]): Promise<number>
+  persistAndEnqueue(connection: RuntimeConnection, observations: readonly ObservationOutput[], options?: PersistEnqueueOptions): Promise<number>
   projectPending(connection: RuntimeConnection): Promise<{ delivered: number; failed: number }>
   saveCheckpoint(connection: RuntimeConnection, cursor: string | null): Promise<void>
 }

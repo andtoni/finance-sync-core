@@ -199,7 +199,7 @@ async function handleInvestecCardMessage(
     receivedAt: stringValue(envelope.received_at),
   })
   if (!observation) return true
-  await deps.persistAndEnqueue(connection, [observation])
+  await deps.persistAndEnqueue(connection, [observation], { skipCurrentState: true })
   const projection = await deps.projectPending(connection)
   if (projection.failed > 0) throw new Error('Investec card projection is unresolved')
   return true
