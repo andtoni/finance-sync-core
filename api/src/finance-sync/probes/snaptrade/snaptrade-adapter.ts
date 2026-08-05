@@ -84,8 +84,8 @@ export interface SnapTradeTransport {
   /** Fetch all brokerage accounts with their positions (holdings). */
   fetchAccounts(): Promise<readonly SnapTradeRawAccount[]>
 
-  /** Fetch the documented bounded activity date range. */
-  fetchActivities(startDate: string, endDate: string, accountIds?: readonly string[]): Promise<readonly SnapTradeRawActivity[] | { readonly data: readonly SnapTradeRawActivity[] }>
+  /** Fetch the documented account-scoped activity date range. */
+  fetchActivities(startDate: string, endDate: string, accountIds: readonly string[]): Promise<readonly SnapTradeRawActivity[] | { readonly data: readonly SnapTradeRawActivity[] }>
 }
 
 // ─── Config and result types ───────────────────────────────────────────────────
@@ -536,6 +536,9 @@ export async function runSnapTradeSync(
   }
 
   // 3. Fetch activities
+  const activityAccountIds = config.accountIds && config.accountIds.length > 0
+    ? config.accountIds
+    : rawAccounts.map(accountIdOf)
   const startDate = config.activitiesStartDate ?? new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)
   const endDate = config.activitiesEndDate ?? new Date().toISOString().slice(0, 10)
 
@@ -549,7 +552,7 @@ export async function runSnapTradeSync(
     let stableActivities: SnapTradeNormalizedActivity[] | null = null
     let stableSignature: string | null = null
     for (let pass = 0; pass < ACTIVITY_STABILITY_PASSES; pass++) {
-      const actPayload = await transport.fetchActivities(startDate, endDate, config.accountIds)
+      const actPayload = await transport.fetchActivities(startDate, endDate, activityAccountIds)
       activityPasses++
       const normalized = normalizeActivities(actPayload)
       if (normalized.length > maxRows) throw new Error('activity bound exceeded')

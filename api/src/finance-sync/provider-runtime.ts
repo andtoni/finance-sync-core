@@ -14,6 +14,8 @@ const HOSTS: Record<ProviderName, ReadonlySet<string>> = {
   plaid: new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com']),
   snaptrade: new Set(['api.snaptrade.com']),
 }
+const SNAPTRADE_ACTIVITY_PAGE_SIZE = 1000
+const SNAPTRADE_MAX_ACTIVITY_ROWS = 10_000
 
 export interface ProviderRuntimeEnv {
   readonly FINANCE_SYNC_CONNECTIONS_JSON?: string
@@ -359,19 +361,44 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
             }
           })) as never[]
         },
-        async fetchActivities(startDate, endDate, accountIds = []) {
-          if (accountIds.length === 0) {
-            const value = await request('/activities', { startDate, endDate })
-            if (!Array.isArray(value) && !Array.isArray((value as { data?: unknown[] } | null)?.data)) throw new Error('invalid SnapTrade activities response')
-            return value as Awaited<ReturnType<SnapTradeTransport['fetchActivities']>>
-          }
+        async fetchActivities(startDate, endDate, accountIds) {
+          if (accountIds.length === 0) throw new Error('SnapTrade account-scoped activities require admitted account IDs')
           const activities = (await Promise.all(accountIds.map(async accountId => {
-            const value = await request(`/accounts/${encodeURIComponent(accountId)}/activities`, { startDate, endDate })
-            const rows = Array.isArray(value) ? value : (record(value, 'invalid SnapTrade activities response').data as unknown)
-            if (!Array.isArray(rows)) throw new Error('invalid SnapTrade activities response')
-            return rows.map(rawActivity => {
-              const activity = record(rawActivity, 'invalid SnapTrade activity response')
-              return activity.account ? activity : { ...activity, account: { id: accountId } }
+            const rows: Record<string, unknown>[] = []
+            let offset = 0
+            for (;;) {
+              const value = await request(`/accounts/${encodeURIComponent(accountId)}/activities`, {
+                startDate,
+                endDate,
+                offset: String(offset),
+                limit: String(SNAPTRADE_ACTIVITY_PAGE_SIZE),
+              })
+              const page = Array.isArray(value) ? { data: value } : record(value, 'invalid SnapTrade activities response')
+              if (!Array.isArray(page.data)) throw new Error('invalid SnapTrade activities response')
+              const pageRows = page.data.map(rawActivity => record(rawActivity, 'invalid SnapTrade activity response'))
+              rows.push(...pageRows)
+              if (rows.length > SNAPTRADE_MAX_ACTIVITY_ROWS) throw new Error('SnapTrade activity bound exceeded')
+
+              const pagination = page.pagination === undefined ? undefined : record(page.pagination, 'invalid SnapTrade activity pagination')
+              const total = pagination?.total
+              if (total !== undefined && (!Number.isSafeInteger(total) || (total as number) < 0)) throw new Error('invalid SnapTrade activity pagination')
+              const nextOffset = offset + pageRows.length
+              if (pageRows.length === 0 || (total !== undefined ? nextOffset >= (total as number) : pageRows.length < SNAPTRADE_ACTIVITY_PAGE_SIZE)) break
+              if (nextOffset <= offset) throw new Error('SnapTrade activity pagination made no progress')
+              offset = nextOffset
+            }
+            return rows.map(activity => {
+              const account = activity.account
+              if (account && typeof account === 'object' && !Array.isArray(account)
+                && typeof (account as Record<string, unknown>).id === 'string'
+                && (account as Record<string, unknown>).id) return activity
+              return {
+                ...activity,
+                account: {
+                  ...(account && typeof account === 'object' && !Array.isArray(account) ? account : {}),
+                  id: accountId,
+                },
+              }
             })
           }))).flat()
           return activities as Awaited<ReturnType<SnapTradeTransport['fetchActivities']>>

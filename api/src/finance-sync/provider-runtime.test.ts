@@ -75,9 +75,11 @@ describe('four-provider runtime configuration', () => {
   it('uses current Personal SnapTrade account and unified-position endpoints', async () => {
     const originalFetch = globalThis.fetch
     const requests: string[] = []
+    const requestUrls: URL[] = []
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = new URL(input instanceof Request ? input.url : input)
       requests.push(url.pathname)
+      requestUrls.push(url)
       if (url.pathname === '/api/v1/accounts') {
         return new Response(JSON.stringify([{
           id: 'account-1', name: 'Brokerage', number: '1234', institution_name: 'Example Broker', raw_type: 'Margin',
@@ -94,7 +96,10 @@ describe('four-provider runtime configuration', () => {
         }))
       }
       if (url.pathname === '/api/v1/accounts/account-1/activities') {
-        return new Response(JSON.stringify({ data: [{ type: 'BUY' }] }))
+        const offset = url.searchParams.get('offset')
+        return new Response(JSON.stringify(offset === '0'
+          ? { data: [{ type: 'BUY' }], pagination: { offset: 0, limit: 1, total: 2 } }
+          : { data: [{ type: 'SELL' }], pagination: { offset: 1, limit: 1, total: 2 } }))
       }
       throw new Error(`unexpected SnapTrade path ${url.pathname}`)
     }) as typeof fetch
@@ -114,7 +119,15 @@ describe('four-provider runtime configuration', () => {
       })])
       const activities = await createProviderTransportFactories().snaptrade(connection).fetchActivities('2026-01-01', '2026-08-05', ['account-1'])
       expect(requests).toContain('/api/v1/accounts/account-1/activities')
-      expect(activities).toEqual([{ account: { id: 'account-1' }, type: 'BUY' }])
+      expect(requestUrls.filter(url => url.pathname === '/api/v1/accounts/account-1/activities')).toHaveLength(2)
+      const activityUrls = requestUrls.filter(url => url.pathname === '/api/v1/accounts/account-1/activities')
+      expect(activityUrls[0]?.searchParams.get('offset')).toBe('0')
+      expect(activityUrls[0]?.searchParams.get('limit')).toBe('1000')
+      expect(activityUrls[1]?.searchParams.get('offset')).toBe('1')
+      expect(activities).toEqual([
+        { account: { id: 'account-1' }, type: 'BUY' },
+        { account: { id: 'account-1' }, type: 'SELL' },
+      ])
     } finally {
       globalThis.fetch = originalFetch
     }
