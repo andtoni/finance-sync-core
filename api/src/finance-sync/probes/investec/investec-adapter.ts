@@ -209,16 +209,14 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
         pagesPolled++
         for (const txn of pageResult.transactions) {
           const status = (txn.status ?? '').toUpperCase()
-          if (status !== 'POSTED') {
-            if (status !== 'PENDING') {
-              quarantine.push({ reason: 'UNKNOWN_OR_UNBOOKED_STATUS', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined })
-            }
+          if (status !== 'POSTED' && status !== 'PENDING') {
+            quarantine.push({ reason: 'UNKNOWN_OR_UNBOOKED_STATUS', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined })
             continue
           }
           // A UUID-bearing postedOrder=0 row is still the provisional shape used
           // by the card/statement feed. PrimeSaver's booked rows have no UUID and
           // also use postedOrder=0, so transactionIdentity handles that valid case.
-          if (txn.postedOrder === 0 && txn.uuid?.trim()) {
+          if (status === 'POSTED' && txn.postedOrder === 0 && txn.uuid?.trim()) {
             quarantine.push({ reason: 'POSTED_ORDER_ZERO_PROVISIONAL', accountRef, transactionRef: redact(txn.uuid) })
             continue
           }
@@ -250,13 +248,14 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             transactionType: txn.type ?? null,
             cardNumber: txn.cardNumber ? redact(txn.cardNumber) : null,
             reference: txn.reference ?? null,
+            status: status.toLowerCase(),
             merchantContext: merchantContext({
               provider: 'investec', rawDescription: txn.description ?? null,
               merchantDisplay: txn.description ?? txn.reference ?? null, amount: signed.startsWith('-') ? -1 : 1,
               providerHint: txn.reference ? { reference: txn.reference } : null,
             }),
           }
-          const semanticStr = [config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'cash_ledger', transactionId, signed, rawCurrency, date].join('\x00')
+          const semanticStr = [config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'cash_ledger', transactionId, signed, rawCurrency, date, status].join('\x00')
           observations.push({
             deploymentId: config.deploymentId,
             localOwnerId: config.localOwnerId,

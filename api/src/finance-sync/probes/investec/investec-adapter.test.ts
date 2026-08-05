@@ -64,10 +64,13 @@ describe('Investec adapter G5', () => {
     expect(r.quarantine.some(q => q.reason === 'MISSING_ACCOUNT_CURRENCY')).toBe(true)
   })
 
-  it('produces observations for posted transactions only', async () => {
-    const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
-      [{ uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'A' }], undefined))
-    expect(transactionObservations(r)).toHaveLength(1)
+  it('produces observations for posted and pending transactions', async () => {
+    const r = await runInvestecAdapter(BASE_CONFIG, makeTransport([
+      { uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'A' },
+      { uuid: 't2', status: 'PENDING', postedOrder: 0, type: 'DEBIT', amount: 25, transactionDate: '2026-07-11', description: 'B' },
+    ], undefined))
+    expect(transactionObservations(r)).toHaveLength(2)
+    expect(transactionObservations(r)[1].payload.status).toBe('pending')
   })
 
   it('quarantines postedOrder=0 as provisional', async () => {
@@ -77,10 +80,11 @@ describe('Investec adapter G5', () => {
     expect(r.quarantine[0].reason).toBe('POSTED_ORDER_ZERO_PROVISIONAL')
   })
 
-  it('skips pending without quarantine', async () => {
+  it('preserves pending without quarantine', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
-      [{ uuid: 't1', status: 'PENDING', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10' }], undefined))
-    expect(transactionObservations(r)).toHaveLength(0)
+      [{ uuid: 't1', status: 'PENDING', postedOrder: 0, type: 'DEBIT', amount: 100, transactionDate: '2026-07-10' }], undefined))
+    expect(transactionObservations(r)).toHaveLength(1)
+    expect(transactionObservations(r)[0].payload.status).toBe('pending')
     expect(r.quarantine.length).toBe(0)
   })
 
