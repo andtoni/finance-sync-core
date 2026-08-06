@@ -1,6 +1,6 @@
 import type { FinanceSyncSql } from './storage/pg'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
-import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
+import { investecPrimeSaverSupersessionKey } from './probes/investec/investec-adapter'
 import {
   createProviderTransportFactories,
   parseRuntimeConnections,
@@ -124,7 +124,8 @@ async function investecSupersededResourceIds(
   const identityKey = typeof payload?.primeSaverIdentityKey === 'string' ? payload.primeSaverIdentityKey : undefined
   const accountId = typeof payload?.accountId === 'string' ? payload.accountId : undefined
   const transactionId = typeof payload?.transactionId === 'string' ? payload.transactionId : undefined
-  if (!identityKey || !accountId || !transactionId) return []
+  const supersessionKey = investecPrimeSaverSupersessionKey(payload ?? {})
+  if (!identityKey || !accountId || !transactionId || !supersessionKey) return []
 
   const prior = await sql<{ payload: unknown }[]>`
     SELECT payload
@@ -141,10 +142,8 @@ async function investecSupersededResourceIds(
   for (const row of prior) {
     const candidate = observationPayload(row.payload)
     if (!candidate || typeof candidate.transactionId !== 'string') continue
-    const candidateKey = typeof candidate.primeSaverIdentityKey === 'string'
-      ? candidate.primeSaverIdentityKey
-      : investecPrimeSaverIdentityKey(candidate)
-    if (candidateKey !== identityKey) continue
+    const candidateKey = investecPrimeSaverSupersessionKey(candidate)
+    if (candidateKey !== supersessionKey) continue
     resourceIds.add(`${deploymentId}:${connection.sourceResourceIncarnationId}:${candidate.transactionId}`)
   }
   if (resourceIds.size > 64) throw new Error('Investec PrimeSaver identity supersession candidate overflow')

@@ -182,6 +182,32 @@ function primeSaverIdentity(
   }
 }
 
+/**
+ * Compute the exact normalized key used only to discover legacy resource IDs.
+ * Unlike the resource identity, this key uses fields retained in normalized
+ * observations and excludes the provider date and running balance. It is not
+ * a fuzzy match: account, amount, narrative, type, and card identity must all
+ * agree, while an embedded MBP/UBP reference remains the preferred key.
+ */
+export function investecPrimeSaverSupersessionKey(payload: Readonly<Record<string, unknown>>): string | null {
+  const accountId = typeof payload.accountId === 'string' ? payload.accountId : ''
+  const normalizedAmount = investecDecimal(payload.amount)
+  if (!accountId || !normalizedAmount) return null
+  const providerReference = stableProviderReference(payload.reference, payload.description)
+  if (providerReference !== null) return `reference-v1:${accountId}:${providerReference}`
+  const description = identityText(payload.description)
+  if (!description) return null
+  const fingerprint = [
+    'prime-saver-supersession-v1',
+    accountId,
+    normalizedAmount,
+    identityText(payload.transactionType),
+    description,
+    identityText(payload.cardNumber),
+  ]
+  return `fallback-v1:${sha256(JSON.stringify(fingerprint))}`
+}
+
 /** Compute the same PrimeSaver identity from a normalized observation payload. */
 export function investecPrimeSaverIdentityKey(payload: Readonly<Record<string, unknown>>): string | null {
   const key = primeSaverIdentity(

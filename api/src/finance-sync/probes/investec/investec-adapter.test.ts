@@ -1,6 +1,11 @@
 
 import { describe, expect, it } from 'vitest'
-import { runInvestecAdapter, investecResourceKind, type InvestecTransport } from './investec-adapter'
+import {
+  investecPrimeSaverSupersessionKey,
+  runInvestecAdapter,
+  investecResourceKind,
+  type InvestecTransport,
+} from './investec-adapter'
 
 const BASE_CONFIG = {
   deploymentId: 'g5-test', localOwnerId: 'alexis',
@@ -185,6 +190,24 @@ describe('Investec adapter G5', () => {
     expect(firstTransactions.map(item => (item.payload as any).date)).toEqual(['2026-07-11', '2026-07-11'])
     expect(firstTransactions.map(item => item.providerVersion)).toEqual(secondTransactions.map(item => item.providerVersion))
     expect(firstTransactions.every(item => String(item.payload.transactionId).match(/^synthetic-v2:[a-f0-9]{64}$/))).toBe(true)
+  })
+
+  it('matches legacy fallback observations when only the provider date changes', () => {
+    const first = investecPrimeSaverSupersessionKey({
+      accountId: 'acc-cash-123456789', amount: '107.49', transactionType: 'CREDIT',
+      description: 'Interest Value Date 01Jul26', cardNumber: null, date: '2026-06-30',
+    })
+    const changedDate = investecPrimeSaverSupersessionKey({
+      accountId: 'acc-cash-123456789', amount: '107.49', transactionType: 'CREDIT',
+      description: 'Interest Value Date 01Jul26', cardNumber: null, date: '2026-08-04',
+    })
+    const changedNarrative = investecPrimeSaverSupersessionKey({
+      accountId: 'acc-cash-123456789', amount: '107.49', transactionType: 'CREDIT',
+      description: 'Interest Value Date 02Jul26', cardNumber: null, date: '2026-06-30',
+    })
+    expect(first).toBeTruthy()
+    expect(changedDate).toBe(first)
+    expect(changedNarrative).not.toBe(first)
   })
 
   it('keeps a PrimeSaver identity stable when mutable provider dates and balance change', async () => {

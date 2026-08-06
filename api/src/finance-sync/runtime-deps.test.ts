@@ -198,6 +198,36 @@ describe('persistAndEnqueue current-state contract', () => {
 })
 
 describe('PrimeSaver identity supersession projection', () => {
+  it('attaches fallback legacy IDs when the provider date changes', async () => {
+    const priorPayload = {
+      transactionId: 'synthetic-legacy-interest', accountId: 'acc-1', amount: '107.49', currency: 'ZAR', date: '2026-06-30',
+      transactionType: 'CREDIT', description: 'Interest Value Date 01Jul26', reference: null, cardNumber: null,
+    }
+    const stableKey = investecPrimeSaverIdentityKey({ ...priorPayload, date: '2026-08-04' })
+    expect(stableKey).toBeTruthy()
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000097', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [priorPayload])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', connectionId: 'investec-connection',
+      apiKey: 'api-key', eligibleProductNames: ['PrimeSaver'], fromDate: '2026-07-01', toDate: '2026-07-31',
+    }
+    await deps.persistAndEnqueue(investecConnection, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: 'investec:txn:synthetic-v2-interest-current', semanticHash: 'd'.repeat(64),
+      hashSpecificationVersion: 2, observedAt: '2026-07-11T00:00:00.000Z', domain: 'cash_ledger',
+      payload: {
+        ...priorPayload, date: '2026-08-04', transactionId: 'synthetic-v2-interest-current', primeSaverIdentityKey: stableKey,
+      },
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued[0].supersededResourceIds).toEqual([
+      'dep-1:00000000-0000-0000-0000-000000000001:synthetic-legacy-interest',
+    ])
+  })
+
   it('attaches legacy resource IDs when a stable identity replaces old provider IDs', async () => {
     const priorPayload = {
       transactionId: 'synthetic-legacy', accountId: 'acc-1', amount: '5', currency: 'ZAR', date: '2026-07-11',
