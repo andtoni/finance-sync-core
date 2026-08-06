@@ -99,7 +99,8 @@ export interface InvestecAdapterResult {
   readonly nextCursor: string | null
 }
 
-const HASH_SPEC_VERSION = 1
+const HASH_SPEC_VERSION = 2
+const PRIME_SAVER_IDENTITY_VERSION = 2
 
 function sha256(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex')
@@ -119,30 +120,105 @@ function investecDecimal(value: unknown): string | null {
 /**
  * PrimeSaver returns booked rows with postedOrder=0 and an empty uuid. Those
  * rows are valid, but unlike Private Bank transactions they have no upstream
- * identity. Use a stable fingerprint of the provider fields that distinguish a
- * ledger row; runningBalance is included as a tie-breaker for same-day rows.
+ * identity. Keep the identity tied to the provider's stable transaction
+ * reference (usually the MBP/UBP reference embedded in the narrative), or to
+ * the immutable-looking economic fields when no reference is available.
+ *
+ * Deliberately excluded: postingDate, actionDate, valueDate and runningBalance.
+ * Investec revises those fields while retaining the same booked row; including
+ * them creates a new resource ID and re-projects a duplicate activity.
  */
-function transactionIdentity(accountId: string, productName: string | undefined, transaction: InvestecTransaction): string | null {
+function identityText(value: unknown): string {
+  return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').toUpperCase() : ''
+}
+
+function stableProviderReference(reference: unknown, description: unknown): string | null {
+  for (const candidate of [reference, description]) {
+    const text = identityText(candidate)
+    if (!text) continue
+    const embedded = text.match(/\b(?:MBP|UBP)\d{6,}\b/)
+    if (embedded) return embedded[0]
+    if (candidate === reference) return text
+  }
+  return null
+}
+
+interface PrimeSaverIdentity {
+  readonly transactionId: string
+  readonly identityKey: string
+  readonly strongReference: boolean
+}
+
+function primeSaverIdentity(
+  accountId: string,
+  amount: unknown,
+  type: unknown,
+  transactionType: unknown,
+  description: unknown,
+  reference: unknown,
+  cardNumber: unknown,
+  date: unknown,
+): PrimeSaverIdentity | null {
+  const normalizedAmount = investecDecimal(amount)
+  if (!normalizedAmount) return null
+  const providerReference = stableProviderReference(reference, description)
+  const strongReference = providerReference !== null
+  const fingerprint = strongReference
+    ? [
+      `prime-saver-identity-v${PRIME_SAVER_IDENTITY_VERSION}`,
+      'reference', accountId, providerReference,
+    ]
+    : [
+      `prime-saver-identity-v${PRIME_SAVER_IDENTITY_VERSION}`,
+      'fallback', accountId, normalizedAmount,
+      identityText(type), identityText(transactionType), identityText(description),
+      identityText(cardNumber), typeof date === 'string' ? date.trim() : '',
+    ]
+  const identityKey = `v${PRIME_SAVER_IDENTITY_VERSION}:${sha256(JSON.stringify(fingerprint))}`
+  return {
+    transactionId: `synthetic-${identityKey}`,
+    identityKey,
+    strongReference,
+  }
+}
+
+/** Compute the same PrimeSaver identity from a normalized observation payload. */
+export function investecPrimeSaverIdentityKey(payload: Readonly<Record<string, unknown>>): string | null {
+  const key = primeSaverIdentity(
+    String(payload.accountId ?? ''),
+    payload.amount,
+    payload.transactionType,
+    payload.transactionType,
+    payload.description,
+    payload.reference,
+    payload.cardNumber,
+    payload.date,
+  )
+  return key?.identityKey ?? null
+}
+
+function transactionIdentity(
+  accountId: string,
+  productName: string | undefined,
+  transaction: InvestecTransaction,
+): { transactionId: string; primeSaverIdentityKey?: string } | null {
   const uuid = transaction.uuid?.trim()
-  if (uuid) return uuid
+  if (uuid) return { transactionId: uuid }
   const normalizedProduct = productName?.replace(/\s+/g, '').toLowerCase()
   if (normalizedProduct !== 'primesaver' || transaction.postedOrder !== 0) return null
-  const fingerprint = JSON.stringify([
+  const date = transaction.transactionDate ?? transaction.valueDate ?? transaction.postingDate
+  const identity = primeSaverIdentity(
     accountId,
-    transaction.postedOrder ?? null,
-    transaction.postingDate ?? null,
-    transaction.actionDate ?? null,
-    transaction.transactionDate ?? null,
-    transaction.valueDate ?? null,
-    transaction.type ?? null,
-    transaction.transactionType ?? null,
-    transaction.amount ?? null,
-    transaction.runningBalance ?? null,
-    transaction.description ?? null,
-    transaction.reference ?? null,
-    transaction.cardNumber ?? null,
-  ])
-  return `synthetic-${sha256(fingerprint)}`
+    transaction.amount,
+    transaction.type,
+    transaction.transactionType,
+    transaction.description,
+    transaction.reference,
+    transaction.cardNumber,
+    date,
+  )
+  if (!identity) return null
+  return { transactionId: identity.transactionId, primeSaverIdentityKey: identity.identityKey }
 }
 
 export async function runInvestecAdapter(config: InvestecAdapterConfig, transport: InvestecTransport): Promise<InvestecAdapterResult> {
@@ -225,8 +301,9 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
           // exposes this as the poll/current posting date).
           const date = txn.transactionDate ?? txn.valueDate ?? txn.postingDate
           if (!date) { quarantine.push({ reason: 'MISSING_DATE', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined }); continue }
-          const transactionId = transactionIdentity(account.accountId, account.productName, txn)
-          if (!transactionId) { quarantine.push({ reason: 'MISSING_IDENTITY', accountRef }); continue }
+          const identity = transactionIdentity(account.accountId, account.productName, txn)
+          if (!identity) { quarantine.push({ reason: 'MISSING_IDENTITY', accountRef }); continue }
+          const transactionId = identity.transactionId
 
           const rawAmount = investecDecimal(txn.amount)
           if (rawAmount === null) {
@@ -249,6 +326,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             cardNumber: txn.cardNumber ? redact(txn.cardNumber) : null,
             reference: txn.reference ?? null,
             status: status.toLowerCase(),
+            ...(identity.primeSaverIdentityKey === undefined ? {} : { primeSaverIdentityKey: identity.primeSaverIdentityKey }),
             merchantContext: merchantContext({
               provider: 'investec', rawDescription: txn.description ?? null,
               merchantDisplay: txn.description ?? txn.reference ?? null, amount: signed.startsWith('-') ? -1 : 1,

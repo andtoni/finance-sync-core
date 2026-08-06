@@ -1,5 +1,6 @@
 import type { FinanceSyncSql } from './storage/pg'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
+import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
 import {
   createProviderTransportFactories,
   parseRuntimeConnections,
@@ -105,6 +106,49 @@ function bridgeHosts(env: RuntimeEnv): ReadonlySet<string> {
   const hosts = env.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS?.split(',').map(value => value.trim().toLowerCase()).filter(Boolean) ?? []
   if (hosts.length === 0) throw new Error('FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS is required for configured connections')
   return new Set(hosts)
+}
+
+function observationPayload(value: unknown): Readonly<Record<string, unknown>> | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Readonly<Record<string, unknown>>
+}
+
+async function investecSupersededResourceIds(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  observation: ObservationOutput,
+): Promise<readonly string[]> {
+  if (connection.provider !== 'investec') return []
+  const payload = observationPayload(observation.payload)
+  const identityKey = typeof payload?.primeSaverIdentityKey === 'string' ? payload.primeSaverIdentityKey : undefined
+  const accountId = typeof payload?.accountId === 'string' ? payload.accountId : undefined
+  const transactionId = typeof payload?.transactionId === 'string' ? payload.transactionId : undefined
+  if (!identityKey || !accountId || !transactionId) return []
+
+  const prior = await sql<{ payload: unknown }[]>`
+    SELECT payload
+    FROM raw_observations
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${connection.localOwnerId}
+      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+      AND payload->>'accountId' = ${accountId}
+      AND payload ? 'transactionId'
+      AND payload->>'transactionId' <> ${transactionId}
+      AND provider_version LIKE 'investec:txn:%'
+  `
+  const resourceIds = new Set<string>()
+  for (const row of prior) {
+    const candidate = observationPayload(row.payload)
+    if (!candidate || typeof candidate.transactionId !== 'string') continue
+    const candidateKey = typeof candidate.primeSaverIdentityKey === 'string'
+      ? candidate.primeSaverIdentityKey
+      : investecPrimeSaverIdentityKey(candidate)
+    if (candidateKey !== identityKey) continue
+    resourceIds.add(`${deploymentId}:${connection.sourceResourceIncarnationId}:${candidate.transactionId}`)
+  }
+  if (resourceIds.size > 64) throw new Error('Investec PrimeSaver identity supersession candidate overflow')
+  return [...resourceIds].sort()
 }
 
 export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {
@@ -265,7 +309,14 @@ export function createRuntimeDependencies(
           RETURNING observation_id
         `
         insertedCount += inserted.length
-        const operation = providerObservationToBridge(connection.provider, enriched, connection.receiverAccessGeneration, wealthfolioAccountId, connection.connectionId)
+        const supersededResourceIds = await investecSupersededResourceIds(tx, deploymentId, connection, enriched)
+        const operation = providerObservationToBridge(
+          connection.provider,
+          supersededResourceIds.length === 0 ? enriched : { ...enriched, supersededResourceIds },
+          connection.receiverAccessGeneration,
+          wealthfolioAccountId,
+          connection.connectionId,
+        )
         if (operation) await tx`
           INSERT INTO projection_outbox (
             deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload

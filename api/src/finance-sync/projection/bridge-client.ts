@@ -47,6 +47,8 @@ export interface BridgeDisclosureOperation {
   /** Present for CurrentStateUpsert and computed from its complete payload. */
   readonly semanticHash?: string
   readonly lifecycleSuccessorId?: string
+  /** Provider identity corrections that must be atomically merged into this resource. */
+  readonly supersededResourceIds?: readonly string[]
 }
 
 export interface BridgeReceipt {
@@ -166,6 +168,9 @@ export function bridgeOperationToWire(operation: BridgeDisclosureOperation): Rec
     } }),
     ...(operation.semanticHash === undefined ? {} : { semantic_hash: operation.semanticHash }),
     ...(operation.lifecycleSuccessorId === undefined ? {} : { lifecycle_successor_id: operation.lifecycleSuccessorId }),
+    ...(operation.supersededResourceIds === undefined || operation.supersededResourceIds.length === 0
+      ? {}
+      : { superseded_resource_ids: [...operation.supersededResourceIds].sort() }),
   }
 }
 
@@ -176,6 +181,7 @@ export type ObservationToBridge = (observation: {
   readonly domain: string
   readonly payload: Readonly<Record<string, unknown>>
   readonly observedAt: string
+  readonly supersededResourceIds?: readonly string[]
 }) => BridgeDisclosureOperation
 
 export function idempotencyKey(
@@ -233,6 +239,7 @@ export function cashObservationToBridge(
     readonly semanticHash: string
     readonly payload: Readonly<Record<string, unknown>>
     readonly observedAt: string
+    readonly supersededResourceIds?: readonly string[]
   },
   accessGeneration: number,
   accountId: string,
@@ -260,9 +267,13 @@ export function cashObservationToBridge(
       // Re-project existing provider facts once when their display description
       // becomes part of the native activity payload.
       'merchant-notes-v1',
+      ...(observation.supersededResourceIds ?? []).slice().sort(),
     ]),
     subject,
     accessGeneration,
+    ...(observation.supersededResourceIds === undefined || observation.supersededResourceIds.length === 0
+      ? {}
+      : { supersededResourceIds: [...observation.supersededResourceIds].sort() }),
   }
   if (p.isRemoved === true) {
     return { ...common, kind: 'ActivityDelete', resourceId }
@@ -334,6 +345,7 @@ export function providerObservationToBridge(
     readonly domain: string
     readonly payload: Readonly<Record<string, unknown>>
     readonly observedAt: string
+    readonly supersededResourceIds?: readonly string[]
   },
   accessGeneration: number,
   accountId: string,

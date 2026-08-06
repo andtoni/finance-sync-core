@@ -164,12 +164,12 @@ describe('Investec adapter G5', () => {
       {
         uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
         postingDate: '2026-07-12', actionDate: '2026-07-11', transactionDate: '2026-07-11',
-        description: 'PrimeSaver interest', runningBalance: '10300',
+        description: 'PrimeSaver interest', reference: 'MBP000001', runningBalance: '10300',
       },
       {
         uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
         postingDate: '2026-07-12', actionDate: '2026-07-11', transactionDate: '2026-07-11',
-        description: 'PrimeSaver interest', runningBalance: '10600',
+        description: 'PrimeSaver interest', reference: 'MBP000002', runningBalance: '10600',
       },
     ]
     const transport = makeTransport(txns, undefined)
@@ -184,7 +184,28 @@ describe('Investec adapter G5', () => {
     expect(first.quarantine).toHaveLength(0)
     expect(firstTransactions.map(item => (item.payload as any).date)).toEqual(['2026-07-11', '2026-07-11'])
     expect(firstTransactions.map(item => item.providerVersion)).toEqual(secondTransactions.map(item => item.providerVersion))
-    expect(firstTransactions.every(item => String(item.payload.transactionId).match(/^synthetic-[a-f0-9]{64}$/))).toBe(true)
+    expect(firstTransactions.every(item => String(item.payload.transactionId).match(/^synthetic-v2:[a-f0-9]{64}$/))).toBe(true)
+  })
+
+  it('keeps a PrimeSaver identity stable when mutable provider dates and balance change', async () => {
+    const transport = makeTransport([{
+      uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+      postingDate: '2026-07-12', actionDate: '2026-07-11', transactionDate: '2026-07-11',
+      valueDate: '2026-07-11', description: 'Internal Transaction MBP000123', runningBalance: '10300',
+    }], undefined)
+    transport.listAccounts = async () => [{ accountId: 'acc-cash-123456789', productName: 'PrimeSaver', accountName: 'Prime Saver' }]
+    const config = { ...BASE_CONFIG, accountIds: ['acc-cash-123456789'] }
+    const first = await runInvestecAdapter(config, transport)
+    transport.getTransactionPage = async () => ({ transactions: [{
+      uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+      postingDate: '2026-07-15', actionDate: '2026-07-14', transactionDate: '2026-07-14',
+      valueDate: '2026-07-14', description: 'Internal Transaction MBP000123', runningBalance: '10600',
+    }] })
+    const second = await runInvestecAdapter(config, transport)
+    const firstTransaction = transactionObservations(first)[0]
+    const secondTransaction = transactionObservations(second)[0]
+    expect(secondTransaction.providerVersion).toBe(firstTransaction.providerVersion)
+    expect(secondTransaction.payload.primeSaverIdentityKey).toBe(firstTransaction.payload.primeSaverIdentityKey)
   })
 
   it('keeps UUID-less postedOrder=0 rows quarantined for other Investec products', async () => {

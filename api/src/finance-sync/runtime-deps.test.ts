@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { assertBridgeConfiguration, createRuntimeDependencies } from './runtime-deps'
+import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
@@ -63,7 +64,7 @@ function receipt(op: BridgeDisclosureOperation) {
   }
 }
 
-function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attempts: number }) {
+function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attempts: number }, priorPayloads: unknown[] = []) {
   let state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' = 'pending'
   let attempts = row.attempts
   const queries: string[] = []
@@ -75,6 +76,9 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
       if (payload) enqueued.push(payload)
     }
     queries.push(text)
+    if (/SELECT\s+payload\s+FROM\s+raw_observations/i.test(text)) {
+      return priorPayloads.map(payload => ({ payload }))
+    }
     if (/count\(\*\)/i.test(text)) {
       const count = /state\s*=\s*'dead_letter'/i.test(text)
         ? Number(state === 'dead_letter')
@@ -190,6 +194,38 @@ describe('persistAndEnqueue current-state contract', () => {
     expect(fixture.enqueued[1].semanticHash).toMatch(/^[a-f0-9]{64}$/)
     expect(fixture.queries.filter(query => /INSERT\s+INTO\s+projection_outbox/i.test(query))
       .every(query => /provider_generation/i.test(query))).toBe(true)
+  })
+})
+
+describe('PrimeSaver identity supersession projection', () => {
+  it('attaches legacy resource IDs when a stable identity replaces old provider IDs', async () => {
+    const priorPayload = {
+      transactionId: 'synthetic-legacy', accountId: 'acc-1', amount: '5', currency: 'ZAR', date: '2026-07-11',
+      transactionType: 'CREDIT', description: 'Internal Transaction MBP000123', reference: null, cardNumber: null,
+    }
+    const stableKey = investecPrimeSaverIdentityKey(priorPayload)
+    expect(stableKey).toBeTruthy()
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000098', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [priorPayload])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', connectionId: 'investec-connection',
+      apiKey: 'api-key', eligibleProductNames: ['PrimeSaver'], fromDate: '2026-07-01', toDate: '2026-07-31',
+    }
+    await deps.persistAndEnqueue(investecConnection, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: 'investec:txn:synthetic-v2-current', semanticHash: 'c'.repeat(64),
+      hashSpecificationVersion: 2, observedAt: '2026-07-11T00:00:00.000Z', domain: 'cash_ledger',
+      payload: {
+        ...priorPayload, transactionId: 'synthetic-v2-current', primeSaverIdentityKey: stableKey,
+      },
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued[0].supersededResourceIds).toEqual([
+      'dep-1:00000000-0000-0000-0000-000000000001:synthetic-legacy',
+    ])
   })
 })
 

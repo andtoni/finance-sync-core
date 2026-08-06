@@ -120,6 +120,18 @@ describe('Bridge client', () => {
     }, 1, 'acc-1')).toThrow('invalid provider amount')
   })
 
+  it('binds provider identity supersession to the canonical activity operation', () => {
+    const base = {
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'supersession', observedAt: '2026-07-11T00:00:00.000Z',
+      payload: { transactionId: 'stable', amount: '10', currency: 'ZAR', date: '2026-07-11' },
+    }
+    const op = cashObservationToBridge({ ...base, supersededResourceIds: ['old-b', 'old-a'] }, 1, 'wf-1')
+    expect(op.supersededResourceIds).toEqual(['old-a', 'old-b'])
+    expect(bridgeOperationToWire(op).superseded_resource_ids).toEqual(['old-a', 'old-b'])
+    expect(op.idempotencyKey).not.toBe(cashObservationToBridge(base, 1, 'wf-1').idempotencyKey)
+  })
+
   it('projects removals as deletes and posted successors as lifecycle migrations', () => {
     const base = {
       deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
