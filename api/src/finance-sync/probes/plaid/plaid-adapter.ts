@@ -85,6 +85,7 @@ export interface ObservationOutput {
   readonly hashSpecificationVersion: number
   readonly domain: CanonicalDomain
   readonly payload: Readonly<Record<string, unknown>>
+  readonly rawPayload?: unknown
   readonly observedAt: string
 }
 
@@ -100,7 +101,7 @@ function sha256(input: string): string {
   return createHash('sha256').update(input, 'utf8').digest('hex')
 }
 
-const HASH_SPEC_VERSION = 1
+const HASH_SPEC_VERSION = 2
 const MAX_PAGES = 50
 
 /**
@@ -167,7 +168,7 @@ export async function runPlaidSync(
           }
           const semanticPayload = [
             config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-            domain, txn.transaction_id, String(txn.amount), currency, txn.date,
+            domain, txn.transaction_id, JSON.stringify(payload), JSON.stringify(txn),
           ].join('\x00')
           const semanticHash = sha256(semanticPayload)
           const hashSpecificationVersion = HASH_SPEC_VERSION
@@ -181,6 +182,7 @@ export async function runPlaidSync(
             hashSpecificationVersion,
             domain,
             payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+            rawPayload: txn,
             observedAt: txn.date ? `${txn.date}T00:00:00.000Z` : new Date().toISOString(),
           })
         }
@@ -211,7 +213,7 @@ export async function runPlaidSync(
           }
           const semanticPayload = [
             config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-            domain, txn.transaction_id, String(txn.amount), currency, txn.date, 'modified',
+            domain, txn.transaction_id, JSON.stringify(payload), JSON.stringify(txn), 'modified',
           ].join('\x00')
           const semanticHash = sha256(semanticPayload)
 
@@ -224,6 +226,7 @@ export async function runPlaidSync(
             hashSpecificationVersion: HASH_SPEC_VERSION,
             domain,
             payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+            rawPayload: txn,
             observedAt: txn.date ? `${txn.date}T00:00:00.000Z` : new Date().toISOString(),
           })
         }
@@ -249,6 +252,7 @@ export async function runPlaidSync(
             hashSpecificationVersion: HASH_SPEC_VERSION,
             domain: 'cash_ledger',
             payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+            rawPayload: rem,
             observedAt: new Date().toISOString(),
           })
         }
@@ -279,7 +283,7 @@ export async function runPlaidSync(
               providerVersion: `plaid:balance:${accountId}`,
               semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'balance', JSON.stringify(balancePayload)].join('\x00')),
               hashSpecificationVersion: HASH_SPEC_VERSION,
-              domain: plaidResourceKind(account.type), payload: balancePayload, observedAt: snapshotObservedAt,
+              domain: plaidResourceKind(account.type), payload: balancePayload, rawPayload: account, observedAt: snapshotObservedAt,
             })
             if (account.type === 'credit' || account.type === 'loan') {
               const details = liabilityRows.filter(row => row.account_id === accountId)
@@ -290,7 +294,7 @@ export async function runPlaidSync(
                 providerVersion: `plaid:liability:${accountId}`,
                 semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'liability', JSON.stringify(liabilityPayload)].join('\x00')),
                 hashSpecificationVersion: HASH_SPEC_VERSION,
-                domain: 'liability', payload: liabilityPayload, observedAt: snapshotObservedAt,
+                domain: 'liability', payload: liabilityPayload, rawPayload: details, observedAt: snapshotObservedAt,
               })
             }
           }

@@ -302,7 +302,7 @@ describe('runSnapTradeSync', () => {
       expect(obs.semanticHash).toMatch(/^[a-f0-9]{64}$/)
       expect(obs.deploymentId).toBe('g7-test')
       expect(obs.localOwnerId).toBe('alexis')
-      expect(obs.hashSpecificationVersion).toBe(1)
+      expect(obs.hashSpecificationVersion).toBe(2)
     }
 
     // Verify domain assignments

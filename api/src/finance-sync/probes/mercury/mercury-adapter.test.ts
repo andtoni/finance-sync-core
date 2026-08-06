@@ -318,7 +318,7 @@ describe('Mercury provider adapter G6', () => {
       expect(obs.semanticHash).toMatch(/^[a-f0-9]{64}$/)
       expect(obs.deploymentId).toBe('g6-test')
       expect(obs.localOwnerId).toBe('alexis')
-      expect(obs.hashSpecificationVersion).toBe(1)
+      expect(obs.hashSpecificationVersion).toBe(2)
     }
 
     const result2 = await runMercurySync({

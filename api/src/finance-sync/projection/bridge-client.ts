@@ -24,8 +24,24 @@ export interface BridgeActivityPayload {
   readonly activityType: string
   readonly status: string
   readonly activityDate: string
+  /** Economic amount in the activity/account currency. Card original is separate. */
   readonly amount: string
   readonly currency: string
+  readonly settlementDate?: string
+  readonly fee?: string
+  readonly tax?: string
+  /** Provider rate converting activity currency into account/settlement currency. */
+  readonly fxRate?: string
+  readonly sourceType?: string
+  readonly subtype?: string
+  readonly sourceRecordId?: string
+  readonly sourceGroupId?: string
+  /** Provider-owned JSON evidence; never user categories, notes, or overrides. */
+  readonly metadata?: Readonly<Record<string, unknown>>
+  readonly originalAmount?: string
+  readonly originalCurrency?: string
+  readonly settlementAmount?: string
+  readonly settlementCurrency?: string
   readonly notes?: string
   readonly activityTypeOverride?: string
   readonly needsReview?: boolean
@@ -137,6 +153,19 @@ export function bridgeOperationToWire(operation: BridgeDisclosureOperation): Rec
     activity_date: operation.activity.activityDate,
     amount: operation.activity.amount,
     currency: operation.activity.currency,
+    ...(operation.activity.settlementDate === undefined ? {} : { settlement_date: operation.activity.settlementDate }),
+    ...(operation.activity.fee === undefined ? {} : { fee: operation.activity.fee }),
+    ...(operation.activity.tax === undefined ? {} : { tax: operation.activity.tax }),
+    ...(operation.activity.fxRate === undefined ? {} : { fx_rate: operation.activity.fxRate }),
+    ...(operation.activity.sourceType === undefined ? {} : { source_type: operation.activity.sourceType }),
+    ...(operation.activity.subtype === undefined ? {} : { subtype: operation.activity.subtype }),
+    ...(operation.activity.sourceRecordId === undefined ? {} : { source_record_id: operation.activity.sourceRecordId }),
+    ...(operation.activity.sourceGroupId === undefined ? {} : { source_group_id: operation.activity.sourceGroupId }),
+    ...(operation.activity.metadata === undefined ? {} : { metadata: operation.activity.metadata }),
+    ...(operation.activity.originalAmount === undefined ? {} : { original_amount: operation.activity.originalAmount }),
+    ...(operation.activity.originalCurrency === undefined ? {} : { original_currency: operation.activity.originalCurrency }),
+    ...(operation.activity.settlementAmount === undefined ? {} : { settlement_amount: operation.activity.settlementAmount }),
+    ...(operation.activity.settlementCurrency === undefined ? {} : { settlement_currency: operation.activity.settlementCurrency }),
     ...(operation.activity.notes === undefined ? {} : { notes: operation.activity.notes }),
     ...(operation.activity.activityTypeOverride === undefined ? {} : { activity_type_override: operation.activity.activityTypeOverride }),
     ...(operation.activity.needsReview === undefined ? {} : { needs_review: operation.activity.needsReview }),
@@ -200,14 +229,14 @@ interface DecimalParts {
   readonly negative: boolean
 }
 
-function decimalParts(value: unknown): DecimalParts {
+function decimalParts(value: unknown, allowZero = false): DecimalParts {
   const text = typeof value === 'number'
     ? Number.isFinite(value) ? String(value) : ''
     : typeof value === 'string' ? value.trim() : ''
   if (!/^[+-]?\d+(?:\.\d+)?$/.test(text)) throw new Error('invalid provider amount')
   const negative = text.startsWith('-')
   const magnitude = text.replace(/^[+-]/, '')
-  if (!/[1-9]/.test(magnitude.replace('.', ''))) throw new Error('invalid provider amount')
+  if (!allowZero && !/[1-9]/.test(magnitude.replace('.', ''))) throw new Error('invalid provider amount')
   return { magnitude, negative }
 }
 
@@ -229,6 +258,21 @@ function providerDescription(payload: Readonly<Record<string, unknown>>): string
   ]
   const description = candidates.find(value => typeof value === 'string' && value.trim().length > 0)
   return typeof description === 'string' ? description.trim().slice(0, 512) : undefined
+}
+
+function optionalString(payload: Readonly<Record<string, unknown>>, key: string): string | undefined {
+  const value = payload[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function absoluteDecimal(value: unknown): string {
+  const parts = decimalParts(value, true)
+  return parts.magnitude
+}
+
+function optionalCurrency(payload: Readonly<Record<string, unknown>>, key: string): string | undefined {
+  const value = optionalString(payload, key)?.toUpperCase()
+  return value && /^[A-Z]{3}$/.test(value) ? value : undefined
 }
 
 export function cashObservationToBridge(
@@ -280,8 +324,16 @@ export function cashObservationToBridge(
   }
   const parsedAmount = decimalParts(p.amount)
   if (typeof p.currency !== 'string' || p.currency.length === 0) throw new Error('invalid provider currency')
+  const currency = p.currency.toUpperCase()
   const providerStatus = typeof p.status === 'string' ? p.status.toUpperCase() : undefined
   const isPending = p.pending === true || providerStatus === 'PENDING'
+  const explicitActivityType = optionalString(p, 'activityType')
+  const activityType = explicitActivityType ?? (parsedAmount.negative ? 'DEPOSIT' : 'WITHDRAWAL')
+  const originalAmount = p.originalAmount === undefined ? undefined : absoluteDecimal(p.originalAmount)
+  const originalCurrency = optionalCurrency(p, 'originalCurrency')
+  const settlementAmount = p.settlementAmount === undefined ? undefined : absoluteDecimal(p.settlementAmount)
+  const settlementCurrency = optionalCurrency(p, 'settlementCurrency')
+  const sourceRecordId = optionalString(p, 'sourceRecordId') ?? transactionId
   return {
     ...common,
     kind: 'ActivityUpsert',
@@ -289,12 +341,27 @@ export function cashObservationToBridge(
     ...(pendingResourceId === undefined ? {} : { lifecycleSuccessorId: resourceId }),
     activity: {
       accountId,
-      // Plaid uses positive for money leaving the account and negative for money entering it.
-      activityType: parsedAmount.negative ? 'DEPOSIT' : 'WITHDRAWAL',
+      activityType,
       status: isPending ? 'PENDING' : 'POSTED',
-      activityDate: (p.date as string) ?? observation.observedAt.slice(0, 10),
+      // Preserve real card authorization time; account feeds that only provide
+      // a date remain date-only rather than receiving a fabricated timestamp.
+      activityDate: optionalString(p, 'authorizationDateTime') ?? (p.date as string) ?? observation.observedAt.slice(0, 10),
       amount: parsedAmount.magnitude,
-      currency: p.currency,
+      currency,
+      ...(optionalString(p, 'settlementDate') === undefined ? {} : { settlementDate: optionalString(p, 'settlementDate') }),
+      ...(optionalString(p, 'fee') === undefined ? {} : { fee: absoluteDecimal(p.fee) }),
+      ...(optionalString(p, 'tax') === undefined ? {} : { tax: absoluteDecimal(p.tax) }),
+      ...(optionalString(p, 'fxRate') === undefined ? {} : { fxRate: optionalString(p, 'fxRate') }),
+      ...(optionalString(p, 'sourceType') === undefined ? {} : { sourceType: optionalString(p, 'sourceType') }),
+      ...(optionalString(p, 'subtype') === undefined ? {} : { subtype: optionalString(p, 'subtype') }),
+      sourceRecordId,
+      ...(optionalString(p, 'sourceGroupId') === undefined ? {} : { sourceGroupId: optionalString(p, 'sourceGroupId') }),
+      ...(isRecord(p.metadata) ? { metadata: p.metadata } : {}),
+      ...(originalAmount === undefined ? {} : { originalAmount }),
+      ...(originalCurrency === undefined ? {} : { originalCurrency }),
+      ...(settlementAmount === undefined ? {} : { settlementAmount }),
+      ...(settlementCurrency === undefined ? {} : { settlementCurrency }),
+      ...(p.needsReview === true ? { needsReview: true } : {}),
       ...(providerDescription(p) === undefined ? {} : { notes: providerDescription(p) }),
       ...(isRecord(p.merchantContext) ? { merchantContext: p.merchantContext } : {}),
     },
@@ -364,7 +431,25 @@ export function providerObservationToBridge(
   if (provider === 'plaid') return cashObservationToBridge(observation, accessGeneration, accountId, connectionId)
   if (provider === 'investec' || provider === 'mercury') {
     // Direct-bank adapters use ledger signs (negative money-out); Plaid uses the inverse.
-    return cashObservationToBridge({ ...observation, payload: { ...payload, amount: negateDecimal(payload.amount) } }, accessGeneration, accountId, connectionId)
+    // Pocket funding is an internal transfer, never a spending withdrawal.
+    const transactionType = optionalString(payload, 'transactionType')?.toUpperCase()
+    const direction = (optionalString(payload, 'type') ?? optionalString(payload, 'direction'))?.toUpperCase()
+    const isPocketTransfer = provider === 'investec'
+      && (transactionType === 'MCPBAPOCKETTRANSFERS' || transactionType?.includes('POCKET'))
+    const activityType = isPocketTransfer
+      ? (direction === 'CREDIT' ? 'TRANSFER_IN' : 'TRANSFER_OUT')
+      : undefined
+    return cashObservationToBridge({
+      ...observation,
+      payload: {
+        ...payload,
+        amount: negateDecimal(payload.amount),
+        ...(activityType === undefined ? {} : { activityType }),
+        ...(optionalString(payload, 'sourceType') === undefined && transactionType === undefined
+          ? {}
+          : { sourceType: optionalString(payload, 'sourceType') ?? transactionType }),
+      },
+    }, accessGeneration, accountId, connectionId)
   }
   if (observation.domain !== 'brokerage_activity') return null
   const activityTypes: Readonly<Record<string, string>> = {

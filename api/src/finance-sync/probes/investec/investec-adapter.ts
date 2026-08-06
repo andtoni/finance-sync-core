@@ -15,7 +15,10 @@ export interface ObservationOutput {
   readonly semanticHash: string
   readonly hashSpecificationVersion: number
   readonly domain: CanonicalDomain
+  /** Normalized canonical fact used for identity and projection. */
   readonly payload: Readonly<Record<string, unknown>>
+  /** Exact provider wire object, retained separately from normalized payload. */
+  readonly rawPayload?: unknown
   readonly observedAt: string
 }
 
@@ -34,6 +37,13 @@ interface InvestecTransaction {
   readonly reference?: string
   readonly cardNumber?: string
   readonly runningBalance?: string | number
+  readonly pendingTransactionId?: string
+  readonly postedTransactionId?: string
+  readonly settlementTransactionId?: string
+  readonly successorTransactionId?: string
+  readonly cardTransactionId?: string
+  readonly linkedTransactionId?: string
+  readonly providerLifecycleTransactionId?: string
 }
 
 export interface InvestecTransport {
@@ -49,6 +59,8 @@ export interface InvestecAdapterConfig {
   readonly deploymentId: string
   readonly localOwnerId: string
   readonly sourceResourceIncarnationId: string
+  /** Stable provider-connection scope shared by all admitted account legs. */
+  readonly providerConnectionId?: string
   readonly fromDate: string
   readonly toDate: string
   readonly eligibleProductNames: readonly string[]
@@ -99,7 +111,7 @@ export interface InvestecAdapterResult {
   readonly nextCursor: string | null
 }
 
-const HASH_SPEC_VERSION = 2
+const HASH_SPEC_VERSION = 3
 const PRIME_SAVER_IDENTITY_VERSION = 2
 
 function sha256(input: string): string {
@@ -130,6 +142,20 @@ function investecDecimal(value: unknown): string | null {
  */
 function identityText(value: unknown): string {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').toUpperCase() : ''
+}
+
+function normalizedDirection(type: unknown, transactionType: unknown): string {
+  const direct = identityText(type)
+  if (direct === 'DEBIT' || direct === 'CREDIT') return direct
+  const legacy = identityText(transactionType)
+  return legacy === 'DEBIT' || legacy === 'CREDIT' ? legacy : ''
+}
+
+function normalizedProviderTransactionType(type: unknown, transactionType: unknown): string {
+  const providerType = identityText(transactionType)
+  if (providerType && providerType !== 'DEBIT' && providerType !== 'CREDIT') return providerType
+  const legacyType = identityText(type)
+  return legacyType !== 'DEBIT' && legacyType !== 'CREDIT' ? legacyType : ''
 }
 
 function stableProviderReference(reference: unknown, description: unknown): string | null {
@@ -163,6 +189,19 @@ function primeSaverIdentity(
   if (!normalizedAmount) return null
   const providerReference = stableProviderReference(reference, description)
   const strongReference = providerReference !== null
+  // Without the provider's stable reference, a missing transactionDate cannot
+  // distinguish repeated same-value PrimeSaver rows. Fail closed instead of
+  // assigning multiple economic facts to one synthetic resource.
+  if (!strongReference && (typeof date !== 'string' || !date.trim())) return null
+  const legacyType = identityText(type)
+  const legacyTransactionType = identityText(transactionType)
+  // v2 stored direction in transactionType. The current normalized payload
+  // stores it in type and keeps the provider subtype separately; collapse that
+  // split for identity so unchanged rows retain their deployed v2 resource ID.
+  const comparableType = legacyType === 'DEBIT' || legacyType === 'CREDIT' ? '' : legacyType
+  const comparableTransactionType = legacyType === 'DEBIT' || legacyType === 'CREDIT'
+    ? legacyType
+    : legacyTransactionType
   const fingerprint = strongReference
     ? [
       `prime-saver-identity-v${PRIME_SAVER_IDENTITY_VERSION}`,
@@ -171,7 +210,7 @@ function primeSaverIdentity(
     : [
       `prime-saver-identity-v${PRIME_SAVER_IDENTITY_VERSION}`,
       'fallback', accountId, normalizedAmount,
-      identityText(type), identityText(transactionType), identityText(description),
+      comparableType, comparableTransactionType, identityText(description),
       identityText(cardNumber), typeof date === 'string' ? date.trim() : '',
     ]
   const identityKey = `v${PRIME_SAVER_IDENTITY_VERSION}:${sha256(JSON.stringify(fingerprint))}`
@@ -201,7 +240,10 @@ export function investecPrimeSaverSupersessionKey(payload: Readonly<Record<strin
     'prime-saver-supersession-v1',
     accountId,
     normalizedAmount,
-    identityText(payload.transactionType),
+    // Keep the fallback supersession key compatible with legacy v2 payloads,
+    // which stored direction in transactionType and did not preserve the new
+    // normalized provider subtype separately.
+    normalizedDirection(payload.type, payload.transactionType),
     description,
     identityText(payload.cardNumber),
   ]
@@ -213,12 +255,12 @@ export function investecPrimeSaverIdentityKey(payload: Readonly<Record<string, u
   const key = primeSaverIdentity(
     String(payload.accountId ?? ''),
     payload.amount,
-    payload.transactionType,
+    payload.type,
     payload.transactionType,
     payload.description,
     payload.reference,
     payload.cardNumber,
-    payload.date,
+    payload.transactionDate,
   )
   return key?.identityKey ?? null
 }
@@ -232,7 +274,9 @@ function transactionIdentity(
   if (uuid) return { transactionId: uuid }
   const normalizedProduct = productName?.replace(/\s+/g, '').toLowerCase()
   if (normalizedProduct !== 'primesaver' || transaction.postedOrder !== 0) return null
-  const date = transaction.transactionDate ?? transaction.valueDate ?? transaction.postingDate
+  // Only the provider transaction date is an economic identity field. Value
+  // and posting dates are mutable booking facts and are deliberately excluded.
+  const date = transaction.transactionDate
   const identity = primeSaverIdentity(
     accountId,
     transaction.amount,
@@ -245,6 +289,53 @@ function transactionIdentity(
   )
   if (!identity) return null
   return { transactionId: identity.transactionId, primeSaverIdentityKey: identity.identityKey }
+}
+
+function providerField(transaction: InvestecTransaction, names: readonly string[]): string | undefined {
+  const record = transaction as unknown as Record<string, unknown>
+  for (const name of names) {
+    const value = record[name]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function providerDecimalField(transaction: InvestecTransaction, names: readonly string[]): string | undefined {
+  const record = transaction as unknown as Record<string, unknown>
+  for (const name of names) {
+    const value = investecDecimal(record[name])
+    if (value !== null) return value
+  }
+  return undefined
+}
+
+function providerLifecycleTransactionId(transaction: InvestecTransaction): string | undefined {
+  for (const value of [
+    transaction.providerLifecycleTransactionId, transaction.pendingTransactionId, transaction.postedTransactionId,
+    transaction.settlementTransactionId, transaction.successorTransactionId,
+    transaction.cardTransactionId, transaction.linkedTransactionId,
+  ]) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function providerCurrencyField(transaction: InvestecTransaction, names: readonly string[]): string | undefined {
+  const value = providerField(transaction, names)?.toUpperCase()
+  return value && /^[A-Z]{3}$/.test(value) ? value : undefined
+}
+
+function pocketSourceGroupId(
+  providerScope: string,
+  transaction: InvestecTransaction,
+  providerTransactionType: string,
+): string | undefined {
+  if (providerTransactionType !== 'MCPBAPOCKETTRANSFERS') return undefined
+  const groupReference = providerField(transaction, [
+    'pocketTransferId', 'pocketGroupId', 'transactionGroupId', 'groupId',
+    'groupReference', 'transactionGroupReference',
+  ])
+  return groupReference ? `investec:pocket:${providerScope}:${groupReference}` : undefined
 }
 
 export async function runInvestecAdapter(config: InvestecAdapterConfig, transport: InvestecTransport): Promise<InvestecAdapterResult> {
@@ -300,6 +391,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
       hashSpecificationVersion: HASH_SPEC_VERSION,
       domain: 'balance',
       payload: balancePayload,
+      rawPayload: balance,
       observedAt: balanceObservedAt,
     })
 
@@ -311,8 +403,12 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
         pagesPolled++
         for (const txn of pageResult.transactions) {
           const status = (txn.status ?? '').toUpperCase()
-          if (status !== 'POSTED' && status !== 'PENDING') {
-            quarantine.push({ reason: 'UNKNOWN_OR_UNBOOKED_STATUS', accountRef, transactionRef: txn.uuid ? redact(txn.uuid) : undefined })
+          if (status !== 'POSTED') {
+            quarantine.push({
+              reason: status === 'PENDING' ? 'PENDING_NOT_PROJECTED' : 'UNKNOWN_OR_UNBOOKED_STATUS',
+              accountRef,
+              transactionRef: txn.uuid ? redact(txn.uuid) : undefined,
+            })
             continue
           }
           // A UUID-bearing postedOrder=0 row is still the provisional shape used
@@ -338,28 +434,87 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
           }
           const magnitude = rawAmount.replace(/^[+-]/, '')
           const isZero = /^0+(?:\.0+)?$/.test(magnitude)
-          const signed = (txn.type ?? '').toUpperCase() === 'DEBIT' && !isZero ? `-${magnitude}` : magnitude
+          const providerDirection = normalizedDirection(txn.type, txn.transactionType) || null
+          const signed = providerDirection === 'DEBIT' && !isZero ? `-${magnitude}` : magnitude
 
+          const providerTransactionType = normalizedProviderTransactionType(txn.type, txn.transactionType) || null
+          const providerScope = config.providerConnectionId === undefined
+            ? config.sourceResourceIncarnationId
+            : config.providerConnectionId.split(':', 1)[0]
+          const sourceGroupId = providerTransactionType === 'MCPBAPOCKETTRANSFERS'
+            ? pocketSourceGroupId(providerScope, txn, providerTransactionType)
+            : undefined
+          const postingDate = txn.postingDate ?? null
+          const actionDate = txn.actionDate ?? null
+          const transactionDate = txn.transactionDate ?? null
+          const valueDate = txn.valueDate ?? null
+          const fee = providerDecimalField(txn, ['fee', 'feeAmount', 'transactionFee'])
+          const tax = providerDecimalField(txn, ['tax', 'taxAmount', 'transactionTax'])
+          const fxRate = providerDecimalField(txn, ['fxRate', 'exchangeRate', 'conversionRate'])
+          const originalAmount = providerDecimalField(txn, ['originalAmount', 'cardAmount', 'foreignAmount'])
+          const originalCurrency = providerCurrencyField(txn, ['originalCurrency', 'cardCurrency', 'foreignCurrency'])
+          const settlementAmount = providerDecimalField(txn, ['settlementAmount', 'accountAmount', 'localAmount']) ?? signed
+          const settlementCurrency = providerCurrencyField(txn, ['settlementCurrency', 'accountCurrency', 'localCurrency']) ?? rawCurrency
+          const providerLifecycleId = providerLifecycleTransactionId(txn)
           const payload = {
             transactionId,
             accountId: account.accountId,
             accountRef: redact(account.accountId),
             amount: signed,
             currency: rawCurrency,
+            settlementAmount,
+            settlementCurrency,
+            ...(fee === undefined ? {} : { fee }),
+            ...(tax === undefined ? {} : { tax }),
+            ...(fxRate === undefined ? {} : { fxRate }),
+            ...(originalAmount === undefined ? {} : { originalAmount }),
+            ...(originalCurrency === undefined ? {} : { originalCurrency }),
             date,
+            transactionDate,
+            postingDate,
+            actionDate,
+            valueDate,
+            settlementDate: postingDate ?? valueDate,
             description: txn.description ?? null,
-            transactionType: txn.type ?? null,
+            type: providerDirection,
+            direction: providerDirection,
+            sourceType: providerTransactionType,
+            subtype: providerTransactionType === 'MCPBAPOCKETTRANSFERS' ? 'POCKET_TRANSFER' : null,
+            transactionType: providerTransactionType,
             cardNumber: txn.cardNumber ? redact(txn.cardNumber) : null,
             reference: txn.reference ?? null,
+            ...(providerLifecycleId === undefined ? {} : { providerLifecycleTransactionId: providerLifecycleId }),
             status: status.toLowerCase(),
+            ...(sourceGroupId === undefined ? {} : { sourceGroupId }),
             ...(identity.primeSaverIdentityKey === undefined ? {} : { primeSaverIdentityKey: identity.primeSaverIdentityKey }),
+            metadata: {
+              providerOwned: {
+                investec: {
+                  providerTransactionType,
+                  providerDirection,
+                  uuid: txn.uuid ?? null,
+                  postedOrder: txn.postedOrder ?? null,
+                  transactionDate,
+                  postingDate,
+                  actionDate,
+                  valueDate,
+                  ...(sourceGroupId === undefined ? {} : { pocketSourceGroupId: sourceGroupId }),
+                },
+              },
+            },
             merchantContext: merchantContext({
               provider: 'investec', rawDescription: txn.description ?? null,
               merchantDisplay: txn.description ?? txn.reference ?? null, amount: signed.startsWith('-') ? -1 : 1,
-              providerHint: txn.reference ? { reference: txn.reference } : null,
+              providerHint: {
+                ...(txn.reference ? { reference: txn.reference } : {}),
+                ...(providerTransactionType ? { transactionType: providerTransactionType } : {}),
+              },
             }),
           }
-          const semanticStr = [config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'cash_ledger', transactionId, signed, rawCurrency, date, status].join('\x00')
+          const semanticStr = [
+            config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
+            'cash_ledger', JSON.stringify(payload),
+          ].join('\x00')
           observations.push({
             deploymentId: config.deploymentId,
             localOwnerId: config.localOwnerId,
@@ -369,7 +524,10 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             hashSpecificationVersion: HASH_SPEC_VERSION,
             domain: 'cash_ledger',
             payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
-            observedAt: new Date(date).toISOString(),
+            rawPayload: txn,
+            // Account transaction dates are date-only facts. Keep the real poll
+            // observation time here rather than fabricating a midnight timestamp.
+            observedAt: new Date().toISOString(),
           })
         }
         cursor = pageResult.nextCursor

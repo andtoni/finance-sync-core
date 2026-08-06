@@ -425,6 +425,7 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
     case 'investec': {
       const run = await runInvestecAdapter({
         ...connection,
+        providerConnectionId: connection.connectionId,
         // The credential bundle defines the historical lower bound. The upper
         // bound must advance with every poll rather than freezing at onboarding.
         toDate: new Date().toISOString().slice(0, 10),

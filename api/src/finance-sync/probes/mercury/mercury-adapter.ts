@@ -66,6 +66,7 @@ export interface ObservationOutput {
   readonly hashSpecificationVersion: number
   readonly domain: CanonicalDomain
   readonly payload: Readonly<Record<string, unknown>>
+  readonly rawPayload?: unknown
   readonly observedAt: string
 }
 
@@ -81,7 +82,7 @@ export interface MercurySyncResult {
   readonly nextSince: string | null
 }
 
-const HASH_SPEC_VERSION = 1
+const HASH_SPEC_VERSION = 2
 const PAGE_LIMIT = 500
 const MAX_PAGES_PER_ACCOUNT = 50
 const CHECKPOINT_OVERLAP_MS = 24 * 60 * 60 * 1000
@@ -158,7 +159,7 @@ export async function runMercurySync(
     }
     const balanceSemantic = [
       config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-      balanceDomain, 'balance', account.id, decimalString(account.currentBalance), account.currency,
+      balanceDomain, 'balance', account.id, JSON.stringify(balancePayload), JSON.stringify(account),
     ].join('\x00')
     const balanceHash = sha256(balanceSemantic)
 
@@ -171,6 +172,7 @@ export async function runMercurySync(
       hashSpecificationVersion: HASH_SPEC_VERSION,
       domain: balanceDomain,
       payload: Object.freeze(balancePayload) as Readonly<Record<string, unknown>>,
+      rawPayload: account,
       observedAt: snapshotObservedAt,
     })
 
@@ -233,7 +235,7 @@ export async function runMercurySync(
 
         const semanticPayload = [
           config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-          domain, txn.id, decimalString(txn.amount), currency, effectiveDate ?? '', status,
+          domain, txn.id, JSON.stringify(payload), JSON.stringify(txn),
         ].join('\x00')
         const semanticHash = sha256(semanticPayload)
 
@@ -246,6 +248,7 @@ export async function runMercurySync(
           hashSpecificationVersion: HASH_SPEC_VERSION,
           domain,
           payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+          rawPayload: txn,
           observedAt: toIsoDate(effectiveDate),
         })
 

@@ -113,6 +113,7 @@ export interface ObservationOutput {
   readonly hashSpecificationVersion: number
   readonly domain: CanonicalDomain
   readonly payload: Readonly<Record<string, unknown>>
+  readonly rawPayload?: unknown
   readonly observedAt: string
 }
 
@@ -171,7 +172,7 @@ export interface SnapTradeNormalizedActivity {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-const HASH_SPEC_VERSION = 1
+const HASH_SPEC_VERSION = 2
 const DEFAULT_MAX_ACTIVITY_ROWS = 10_000
 const ACTIVITY_STABILITY_PASSES = 2
 
@@ -220,6 +221,17 @@ function extractSymbol(sym: SnapTradeRawSymbol | undefined): string | null {
     if (inner) return inner
   }
   return sym.ticker ?? null
+}
+
+function rawPositionForHolding(
+  account: SnapTradeRawAccount,
+  providerAssetIdValue: string | null,
+  symbol: string,
+): SnapTradeRawPosition | undefined {
+  const matches = (account.positions ?? []).filter(position => providerAssetIdValue !== null
+    ? providerAssetId(position.symbol) === providerAssetIdValue
+    : extractSymbol(position.symbol) === symbol)
+  return matches.length === 1 ? matches[0] : undefined
 }
 
 function extractCurrency(rawCcy: { readonly code?: string } | string | null | undefined): string {
@@ -471,7 +483,7 @@ export async function runSnapTradeSync(
     }
     const balanceSemantic = [
       config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-      'balance', normAccount.id, normAccount.totalValue ?? '0.00', normAccount.currency,
+      'balance', normAccount.id, JSON.stringify(balancePayload), JSON.stringify(rawAcct),
     ].join('\x00')
     const balanceHash = sha256(balanceSemantic)
 
@@ -484,6 +496,7 @@ export async function runSnapTradeSync(
       hashSpecificationVersion: HASH_SPEC_VERSION,
       domain: 'balance',
       payload: Object.freeze(balancePayload) as Readonly<Record<string, unknown>>,
+      rawPayload: rawAcct,
       observedAt: new Date().toISOString(),
     })
 
@@ -515,9 +528,10 @@ export async function runSnapTradeSync(
         brokerTag: h.brokerTag,
         instrumentTypeTag: h.instrumentTypeTag,
       }
+      const rawPosition = rawPositionForHolding(rawAcct, h.providerAssetId, h.symbol)
       const semanticPayload = [
         config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-        domain, h.accountId, h.symbol, h.units, h.value, h.currency,
+        domain, h.accountId, h.symbol, JSON.stringify(payload), JSON.stringify(rawPosition ?? rawAcct),
       ].join('\x00')
       const semanticHash = sha256(semanticPayload)
 
@@ -530,6 +544,7 @@ export async function runSnapTradeSync(
         hashSpecificationVersion: HASH_SPEC_VERSION,
         domain,
         payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+        rawPayload: rawPosition ?? rawAcct,
         observedAt: new Date().toISOString(),
       })
     }
@@ -551,9 +566,16 @@ export async function runSnapTradeSync(
     if (!Number.isSafeInteger(maxRows) || maxRows < 1) throw new Error('invalid activity bound')
     let stableActivities: SnapTradeNormalizedActivity[] | null = null
     let stableSignature: string | null = null
+    let rawActivityById = new Map<string, SnapTradeRawActivity>()
     for (let pass = 0; pass < ACTIVITY_STABILITY_PASSES; pass++) {
       const actPayload = await transport.fetchActivities(startDate, endDate, activityAccountIds)
       activityPasses++
+      const rawRows: readonly SnapTradeRawActivity[] = Array.isArray(actPayload)
+        ? actPayload as SnapTradeRawActivity[]
+        : Array.isArray((actPayload as { readonly data?: unknown[] } | null)?.data)
+          ? (actPayload as { readonly data: SnapTradeRawActivity[] }).data
+          : []
+      rawActivityById = new Map(rawRows.filter(row => row && typeof row === 'object' && row.id).map(row => ['snaptrade:' + row.id, row]))
       const normalized = normalizeActivities(actPayload)
       if (normalized.length > maxRows) throw new Error('activity bound exceeded')
       const signature = sha256(JSON.stringify([...normalized].sort((a, b) => a.id.localeCompare(b.id))))
@@ -592,9 +614,10 @@ export async function runSnapTradeSync(
           providerHint: { lane: 'brokerage', symbol: a.symbol },
         }),
       }
+      const rawActivity = rawActivityById.get(a.id)
       const semanticPayload = [
         config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-        'brokerage_activity', a.id, a.providerAssetId ?? '', a.type, a.amount, a.currency, a.date,
+        'brokerage_activity', a.id, JSON.stringify(payload), JSON.stringify(rawActivity ?? a),
       ].join('\x00')
       const semanticHash = sha256(semanticPayload)
 
@@ -607,6 +630,7 @@ export async function runSnapTradeSync(
         hashSpecificationVersion: HASH_SPEC_VERSION,
         domain: 'brokerage_activity',
         payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+        rawPayload: rawActivity,
         observedAt: toIsoDate(a.date),
       })
     }

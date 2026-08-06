@@ -94,6 +94,19 @@ describe('Bridge client', () => {
     expect(Object.keys((bridgeOperationToWire(op).activity as Record<string, unknown>).merchant_context as object)).toEqual(['merchant_key', 'merchant_key_version', 'normalization_version'])
   })
 
+  it('serializes original and settlement currency evidence without collapsing the account leg', () => {
+    const op = cashObservationToBridge({
+      deploymentId: 'g8-test', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'fx', payload: {
+        transactionId: 'txn-fx', amount: '193.91', currency: 'ZAR', date: '2026-08-05T16:00:00Z',
+        originalAmount: '-11.50', originalCurrency: 'USD', settlementAmount: '-193.91', settlementCurrency: 'ZAR',
+        settlementDate: '2026-08-06', sourceType: 'CardPurchases', needsReview: true,
+      }, observedAt: '2026-08-06T00:00:00.000Z',
+    }, 1, 'wf-acc-uuid-1')
+    expect(op.activity).toMatchObject({ amount: '193.91', currency: 'ZAR', originalAmount: '11.50', originalCurrency: 'USD', settlementAmount: '193.91', settlementCurrency: 'ZAR', needsReview: true })
+    expect(bridgeOperationToWire(op).activity).toMatchObject({ amount: '193.91', currency: 'ZAR', original_amount: '11.50', original_currency: 'USD', settlement_amount: '193.91', settlement_currency: 'ZAR', source_type: 'CardPurchases', settlement_date: '2026-08-06' })
+  })
+
   it('preserves provider decimal text while normalizing sign and direction', () => {
     const op = cashObservationToBridge({
       deploymentId: 'g8-test', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
@@ -118,6 +131,16 @@ describe('Bridge client', () => {
       semanticHash: 'zero', payload: { transactionId: 't0', amount, currency: 'USD', date: '2026-07-11' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'acc-1')).toThrow('invalid provider amount')
+  })
+
+  it('preserves valid zero-valued optional provider evidence', () => {
+    const op = cashObservationToBridge({
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'zero-fee', payload: {
+        transactionId: 't-zero-fee', amount: '-10.00', currency: 'ZAR', date: '2026-07-11', fee: '0.00', tax: '0',
+      }, observedAt: '2026-07-11T00:00:00.000Z',
+    }, 1, 'acc-1')
+    expect(op.activity).toMatchObject({ fee: '0.00', tax: '0' })
   })
 
   it('binds provider identity supersession to the canonical activity operation', () => {

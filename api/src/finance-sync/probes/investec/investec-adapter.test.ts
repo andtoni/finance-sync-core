@@ -69,13 +69,13 @@ describe('Investec adapter G5', () => {
     expect(r.quarantine.some(q => q.reason === 'MISSING_ACCOUNT_CURRENCY')).toBe(true)
   })
 
-  it('produces observations for posted and pending transactions', async () => {
+  it('projects booked transactions and quarantines polling pendings', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport([
       { uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'A' },
       { uuid: 't2', status: 'PENDING', postedOrder: 0, type: 'DEBIT', amount: 25, transactionDate: '2026-07-11', description: 'B' },
     ], undefined))
-    expect(transactionObservations(r)).toHaveLength(2)
-    expect(transactionObservations(r)[1].payload.status).toBe('pending')
+    expect(transactionObservations(r)).toHaveLength(1)
+    expect(r.quarantine.some(item => item.reason === 'PENDING_NOT_PROJECTED')).toBe(true)
   })
 
   it('quarantines postedOrder=0 as provisional', async () => {
@@ -85,12 +85,11 @@ describe('Investec adapter G5', () => {
     expect(r.quarantine[0].reason).toBe('POSTED_ORDER_ZERO_PROVISIONAL')
   })
 
-  it('preserves pending without quarantine', async () => {
+  it('quarantines a pending polling row without projecting it', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'PENDING', postedOrder: 0, type: 'DEBIT', amount: 100, transactionDate: '2026-07-10' }], undefined))
-    expect(transactionObservations(r)).toHaveLength(1)
-    expect(transactionObservations(r)[0].payload.status).toBe('pending')
-    expect(r.quarantine.length).toBe(0)
+    expect(transactionObservations(r)).toHaveLength(0)
+    expect(r.quarantine).toEqual([{ reason: 'PENDING_NOT_PROJECTED', accountRef: '…6789', transactionRef: 't1' }])
   })
 
   it('signs DEBIT negative CREDIT positive', async () => {
@@ -114,6 +113,16 @@ describe('Investec adapter G5', () => {
     const r1 = await runInvestecAdapter(BASE_CONFIG, makeTransport(t, undefined))
     const r2 = await runInvestecAdapter(BASE_CONFIG, makeTransport(t, undefined))
     expect(r1.observations[0].semanticHash).toBe(r2.observations[0].semanticHash)
+  })
+
+  it('advances the semantic hash when provider-owned settlement evidence changes', async () => {
+    const first = await runInvestecAdapter(BASE_CONFIG, makeTransport([
+      { uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: '100', postingDate: '2026-07-10', feeAmount: '0.00' },
+    ], undefined))
+    const second = await runInvestecAdapter(BASE_CONFIG, makeTransport([
+      { uuid: 't1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: '100', postingDate: '2026-07-10', feeAmount: '1.00' },
+    ], undefined))
+    expect(transactionObservations(first)[0].semanticHash).not.toBe(transactionObservations(second)[0].semanticHash)
   })
 
   it('redacts accountRef in payload', async () => {
@@ -164,6 +173,25 @@ describe('Investec adapter G5', () => {
     expect((r.quarantine[0] as any).transactionRef).toBe('\u2026uuid')
   })
 
+  it('preserves provider type, all provider dates, and pocket grouping evidence', async () => {
+    const transport = makeTransport([{
+      uuid: 'pocket-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', transactionType: 'MCPBAPocketTransfers', amount: '65.99',
+      transactionDate: '2026-08-05', postingDate: '2026-08-06', actionDate: '2026-08-05', valueDate: '2026-08-06',
+      description: 'Pocket movement', reference: 'pocket-ref', pocketGroupId: 'pocket-batch-1',
+      feeAmount: '1.25', taxAmount: '0.10', exchangeRate: '18.25',
+    } as any], undefined)
+    const [observation] = transactionObservations(await runInvestecAdapter(BASE_CONFIG, transport))
+    expect(observation.payload).toMatchObject({
+      type: 'DEBIT', transactionType: 'MCPBAPOCKETTRANSFERS', subtype: 'POCKET_TRANSFER',
+      date: '2026-08-05', transactionDate: '2026-08-05', postingDate: '2026-08-06',
+      actionDate: '2026-08-05', valueDate: '2026-08-06', settlementDate: '2026-08-06',
+      sourceGroupId: 'investec:pocket:investec:connection-1:pocket-batch-1',
+      fee: '1.25', tax: '0.10', fxRate: '18.25',
+    })
+    expect(observation.observedAt).not.toBe('2026-08-05T00:00:00.000Z')
+    expect(observation.rawPayload).toMatchObject({ uuid: 'pocket-1', feeAmount: '1.25', exchangeRate: '18.25' })
+  })
+
   it('accepts PrimeSaver booked rows without UUIDs using stable synthetic identities', async () => {
     const txns = [
       {
@@ -210,6 +238,22 @@ describe('Investec adapter G5', () => {
     expect(changedNarrative).not.toBe(first)
   })
 
+  it('keeps a reference-less PrimeSaver identity stable when only booking dates change', async () => {
+    const transport = makeTransport([{
+      uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+      postingDate: '2026-07-12', valueDate: '2026-07-11', transactionDate: '2026-07-11', description: 'Interest',
+    }], undefined)
+    transport.listAccounts = async () => [{ accountId: 'acc-cash-123456789', productName: 'PrimeSaver', accountName: 'Prime Saver' }]
+    const config = { ...BASE_CONFIG, accountIds: ['acc-cash-123456789'] }
+    const first = await runInvestecAdapter(config, transport)
+    transport.getTransactionPage = async () => ({ transactions: [{
+      uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+      postingDate: '2026-07-15', valueDate: '2026-07-14', transactionDate: '2026-07-11', description: 'Interest',
+    }] })
+    const second = await runInvestecAdapter(config, transport)
+    expect(transactionObservations(second)[0].providerVersion).toBe(transactionObservations(first)[0].providerVersion)
+  })
+
   it('keeps a PrimeSaver identity stable when mutable provider dates and balance change', async () => {
     const transport = makeTransport([{
       uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
@@ -229,6 +273,17 @@ describe('Investec adapter G5', () => {
     const secondTransaction = transactionObservations(second)[0]
     expect(secondTransaction.providerVersion).toBe(firstTransaction.providerVersion)
     expect(secondTransaction.payload.primeSaverIdentityKey).toBe(firstTransaction.payload.primeSaverIdentityKey)
+  })
+
+  it('quarantines reference-less PrimeSaver rows without a provider transaction date', async () => {
+    const transport = makeTransport([{
+      uuid: '', status: 'POSTED', postedOrder: 0, type: 'CREDIT', amount: '300',
+      postingDate: '2026-07-12', description: 'Interest',
+    }], undefined)
+    transport.listAccounts = async () => [{ accountId: 'acc-cash-123456789', productName: 'PrimeSaver', accountName: 'Prime Saver' }]
+    const result = await runInvestecAdapter({ ...BASE_CONFIG, accountIds: ['acc-cash-123456789'] }, transport)
+    expect(transactionObservations(result)).toHaveLength(0)
+    expect(result.quarantine.some(item => item.reason === 'MISSING_IDENTITY')).toBe(true)
   })
 
   it('keeps UUID-less postedOrder=0 rows quarantined for other Investec products', async () => {

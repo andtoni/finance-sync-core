@@ -36,7 +36,7 @@ interface CardAccountMapping {
   readonly mask: string
 }
 
-const HASH_SPECIFICATION_VERSION = 1
+const HASH_SPECIFICATION_VERSION = 3
 
 function record(value: unknown): RecordValue | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : undefined
@@ -48,6 +48,17 @@ function stringValue(value: unknown): string | undefined {
 
 function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function providerLifecycleTransactionId(payload: RecordValue): string | undefined {
+  for (const key of [
+    'providerLifecycleTransactionId', 'pendingTransactionId', 'postedTransactionId', 'settlementTransactionId',
+    'successorTransactionId', 'cardTransactionId', 'linkedTransactionId',
+  ]) {
+    const value = payload[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
 }
 
 function accountMask(value: unknown): string | undefined {
@@ -64,19 +75,50 @@ function decimalFromCents(value: unknown): string | undefined {
   if (!raw || /^0+$/.test(raw)) return undefined
   const whole = raw.length > 2 ? raw.slice(0, -2) : '0'
   const fraction = raw.slice(-2).padStart(2, '0')
-  return `-${whole}.${fraction}`
+  return `${whole}.${fraction}`
+}
+
+function decimalFromValue(value: unknown): string | undefined {
+  const raw = typeof value === 'number' && Number.isFinite(value)
+    ? value.toFixed(2)
+    : typeof value === 'string' && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim())
+      ? value.trim()
+      : undefined
+  if (!raw || Number(raw) === 0) return undefined
+  return raw.replace(/^[+-]/, '')
+}
+
+function cardCredit(payload: InvestecCardPayload): boolean {
+  if (String(payload.type).toUpperCase() === 'CREDIT') return true
+  const rawAmount = payload.amount
+  if (typeof rawAmount === 'number') return Number.isFinite(rawAmount) && rawAmount < 0
+  return typeof rawAmount === 'string' && rawAmount.trim().startsWith('-')
+}
+
+function signedAmount(value: unknown, isCredit: boolean, cents: boolean): string | undefined {
+  const magnitude = cents ? decimalFromCents(value) : decimalFromValue(value)
+  if (!magnitude) return undefined
+  return isCredit ? magnitude : `-${magnitude}`
 }
 
 function cardAmount(payload: InvestecCardPayload): string | undefined {
-  if (payload.centsAmount !== undefined) return decimalFromCents(payload.centsAmount)
-  const value = typeof payload.amount === 'number' && Number.isFinite(payload.amount)
-    ? payload.amount.toFixed(2)
-    : typeof payload.amount === 'string' && /^[+-]?\d+(?:\.\d+)?$/.test(payload.amount.trim())
-      ? payload.amount.trim()
-      : undefined
-  if (!value || Number(value) === 0) return undefined
-  const magnitude = value.replace(/^[+-]/, '')
-  return String(payload.type).toUpperCase() === 'CREDIT' || value.startsWith('-') ? magnitude : `-${magnitude}`
+  const isCredit = cardCredit(payload)
+  // Investec's centsAmount/amount is the debit to the admitted account. The
+  // merchant currency is a separate evidence leg and must not relabel it.
+  return signedAmount(payload.centsAmount, isCredit, true)
+    ?? signedAmount(payload.amount, isCredit, false)
+}
+
+function cardOriginalAmount(payload: InvestecCardPayload, isCredit: boolean): string | undefined {
+  for (const key of ['originalCentsAmount', 'foreignCentsAmount']) {
+    const amount = signedAmount(payload[key], isCredit, true)
+    if (amount !== undefined) return amount
+  }
+  for (const key of ['originalAmount', 'foreignAmount']) {
+    const amount = signedAmount(payload[key], isCredit, false)
+    if (amount !== undefined) return amount
+  }
+  return undefined
 }
 
 function merchantName(payload: InvestecCardPayload): string {
@@ -109,36 +151,67 @@ export function investecCardObservation(input: {
   readonly payload: InvestecCardPayload
   readonly receivedAt?: string
 }): ObservationOutput | null {
+  const isCredit = cardCredit(input.payload)
   const amount = cardAmount(input.payload)
+  const providerDateTime = stringValue(input.payload.dateTime)
   const dateTime = observedAt(input.payload, input.receivedAt)
   const date = dateTime.slice(0, 10)
   const merchant = merchantName(input.payload)
   const reference = stringValue(input.payload.reference)
+  const lifecycleTransactionId = providerLifecycleTransactionId(input.payload)
   if (!amount || !date || !/^[A-Z]{3}$/.test(input.accountCurrency)) return null
   const identity = reference
     ? `reference-${reference}`
     : `fingerprint-${sha256([input.providerAccountId, dateTime, amount, merchant].join('\x00')).slice(0, 32)}`
   const transactionId = `investec-card:${input.providerAccountId}:${identity}`
-  const currency = input.accountCurrency.toUpperCase()
+  const accountCurrency = input.accountCurrency.toUpperCase()
+  const originalCurrency = (stringValue(input.payload.currencyCode) ?? accountCurrency).toUpperCase()
+  if (!/^[A-Z]{3}$/.test(originalCurrency)) return null
+  const cardDisplay = cardNumber(input.payload)
+  const providerOriginalAmount = cardOriginalAmount(input.payload, isCredit)
+  const originalAmount = providerOriginalAmount ?? (originalCurrency === accountCurrency ? amount : undefined)
   const payload = Object.freeze({
     transactionId,
     accountId: input.providerAccountId,
     amount,
-    currency,
+    currency: accountCurrency,
+    ...(originalAmount === undefined ? {} : { originalAmount }),
+    originalCurrency,
+    settlementCurrency: accountCurrency,
     date,
+    transactionDate: date,
+    authorizationDateTime: dateTime,
     description: merchant,
+    sourceType: 'CARD',
+    subtype: 'CARD_PURCHASE',
+    type: isCredit ? 'CREDIT' : 'DEBIT',
+    direction: isCredit ? 'CREDIT' : 'DEBIT',
     transactionType: 'CARD',
-    cardNumber: cardNumber(input.payload),
+    cardNumber: cardDisplay,
     reference: reference ?? null,
+    ...(lifecycleTransactionId === undefined ? {} : { providerLifecycleTransactionId: lifecycleTransactionId }),
     status: 'pending',
+    metadata: {
+      providerOwned: {
+        investec: {
+          cardCurrency: originalCurrency,
+          accountCurrency,
+          cardNumber: cardDisplay,
+        },
+      },
+    },
     merchantContext: merchantContext({
       provider: 'investec', rawDescription: merchant, merchantDisplay: merchant,
-      amount, providerHint: reference ? { reference } : null,
+      amount, providerHint: { ...(reference ? { reference } : {}), currency: originalCurrency },
     }),
   })
+  // A provider reference is the card event identity. Redelivery may carry a
+  // different received_at timestamp, but a newly supplied provider dateTime is
+  // a canonical correction and must advance the observation hash.
   const semanticHash = sha256([
     input.deploymentId, input.localOwnerId, input.sourceResourceIncarnationId,
-    'cash_ledger', transactionId, amount, currency, dateTime, merchant, 'PENDING',
+    'cash_ledger', transactionId, amount, accountCurrency, originalAmount ?? '', originalCurrency,
+    reference ? (providerDateTime ?? '') : dateTime, merchant, cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
   ].join('\x00'))
   return Object.freeze({
     deploymentId: input.deploymentId,
@@ -149,6 +222,7 @@ export function investecCardObservation(input: {
     hashSpecificationVersion: HASH_SPECIFICATION_VERSION,
     domain: 'cash_ledger',
     payload,
+    rawPayload: input.payload,
     observedAt: dateTime,
   })
 }
