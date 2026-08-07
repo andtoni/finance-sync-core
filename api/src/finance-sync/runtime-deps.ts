@@ -114,6 +114,143 @@ function observationPayload(value: unknown): Readonly<Record<string, unknown>> |
   return value as Readonly<Record<string, unknown>>
 }
 
+interface PrimeSaverDuplicateRow {
+  readonly payload: unknown
+  readonly raw_payload: unknown
+  readonly provider_version: string
+}
+
+function primeSaverProviderReference(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const explicitReference = normalizedText(payload.reference)
+  if (explicitReference) return explicitReference
+  const description = normalizedText(payload.description)
+  return description.match(/\b(?:MBP|UBP)\d{6,}\b/)?.[0]
+}
+
+function hasPrimeSaverSyntheticIdentity(payload: Readonly<Record<string, unknown>>): boolean {
+  return typeof payload.primeSaverIdentityKey === 'string' && payload.primeSaverIdentityKey.trim().length > 0
+}
+
+function decimalMagnitude(value: unknown): string | undefined {
+  const text = typeof value === 'number' && Number.isFinite(value) ? String(value)
+    : typeof value === 'string' && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim()) ? value.trim()
+      : undefined
+  if (!text) return undefined
+  const unsigned = text.replace(/^[+-]/, '')
+  const [whole, fraction = ''] = unsigned.split('.')
+  const normalizedWhole = whole.replace(/^0+(?=\d)/, '') || '0'
+  const normalizedFraction = fraction.replace(/0+$/, '')
+  return normalizedFraction ? `${normalizedWhole}.${normalizedFraction}` : normalizedWhole
+}
+
+function primeSaverTransactionDate(payload: Readonly<Record<string, unknown>>): string | undefined {
+  for (const value of [payload.transactionDate, payload.date]) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
+function primeSaverDirection(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const direct = normalizedText(payload.type)
+  if (direct === 'CREDIT' || direct === 'DEBIT') return direct
+  const transactionType = normalizedText(payload.transactionType)
+  return transactionType === 'CREDIT' || transactionType === 'DEBIT' ? transactionType : undefined
+}
+
+function primeSaverDuplicatePair(
+  weak: Readonly<Record<string, unknown>>,
+  strong: Readonly<Record<string, unknown>>,
+): boolean {
+  if (!hasPrimeSaverSyntheticIdentity(weak) || !hasPrimeSaverSyntheticIdentity(strong)
+    || primeSaverProviderReference(weak) || !primeSaverProviderReference(strong)) return false
+  if (weak.accountId !== strong.accountId
+    || primeSaverTransactionDate(weak) !== primeSaverTransactionDate(strong)
+    || primeSaverDirection(weak) !== primeSaverDirection(strong)
+    || decimalMagnitude(weak.amount) !== decimalMagnitude(strong.amount)) return false
+  const weakDescription = normalizedText(weak.description)
+  const strongDescription = normalizedText(strong.description)
+  return weakDescription.length >= 8
+    && strongDescription.length > weakDescription.length
+    && strongDescription.endsWith(weakDescription)
+}
+
+function primeSaverWeakRawPayload(value: unknown): boolean {
+  const raw = recordPayload(value)
+  return raw !== null && /^[-+]?0(?:\.0+)?$/.test(String(raw.runningBalance ?? '').trim())
+}
+
+async function primeSaverDuplicateRows(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  payload: Readonly<Record<string, unknown>>,
+): Promise<readonly PrimeSaverDuplicateRow[]> {
+  const accountId = typeof payload.accountId === 'string' ? payload.accountId : undefined
+  const transactionId = typeof payload.transactionId === 'string' ? payload.transactionId : undefined
+  if (!accountId || !transactionId) return []
+  const rows = await sql<PrimeSaverDuplicateRow[]>`
+    SELECT payload, raw_payload, provider_version
+    FROM raw_observations
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${connection.localOwnerId}
+      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+      AND payload->>'accountId' = ${accountId}
+      AND payload ? 'transactionId'
+      AND payload->>'transactionId' <> ${transactionId}
+      AND provider_version LIKE 'investec:txn:%'
+  `
+  return rows
+}
+
+function primeSaverTransactionId(payload: Readonly<Record<string, unknown>>): string | undefined {
+  return typeof payload.transactionId === 'string' && payload.transactionId.trim()
+    ? payload.transactionId.trim()
+    : undefined
+}
+
+function distinctPrimeSaverRows(rows: readonly PrimeSaverDuplicateRow[]): readonly PrimeSaverDuplicateRow[] {
+  const seen = new Set<string>()
+  return rows.filter(row => {
+    const payload = observationPayload(row.payload)
+    const transactionId = payload ? primeSaverTransactionId(payload) : undefined
+    if (!transactionId || seen.has(transactionId)) return false
+    seen.add(transactionId)
+    return true
+  })
+}
+
+function primeSaverStrongIdentityIds(
+  weak: Readonly<Record<string, unknown>>,
+  currentStrong: Readonly<Record<string, unknown>>,
+  rows: readonly PrimeSaverDuplicateRow[],
+): ReadonlySet<string> {
+  const strongIdentityIds = new Set<string>()
+  const candidates = [currentStrong, ...rows.map(row => observationPayload(row.payload))]
+  for (const candidate of candidates) {
+    if (!candidate || !primeSaverDuplicatePair(weak, candidate)) continue
+    const transactionId = primeSaverTransactionId(candidate)
+    if (transactionId) strongIdentityIds.add(transactionId)
+  }
+  return strongIdentityIds
+}
+
+async function primeSaverWeakObservationAlreadyCanonical(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  observation: ObservationOutput,
+): Promise<boolean> {
+  const payload = observationPayload(observation.payload)
+  if (!payload || !hasPrimeSaverSyntheticIdentity(payload) || !primeSaverWeakRawPayload(observation.rawPayload)) return false
+  const matches = distinctPrimeSaverRows((await primeSaverDuplicateRows(sql, deploymentId, connection, payload)).filter(row => {
+    const candidate = observationPayload(row.payload)
+    return candidate !== null && primeSaverDuplicatePair(payload, candidate)
+  }))
+  // Fail closed if more than one provider-referenced identity could explain
+  // the weak row. Repeated observations of one identity are not ambiguity.
+  return matches.length === 1
+}
+
 async function investecSupersededResourceIds(
   sql: FinanceSyncSql,
   deploymentId: string,
@@ -122,7 +259,8 @@ async function investecSupersededResourceIds(
 ): Promise<readonly string[]> {
   if (connection.provider !== 'investec') return []
   const payload = observationPayload(observation.payload)
-  const identityKey = typeof payload?.primeSaverIdentityKey === 'string' ? payload.primeSaverIdentityKey : undefined
+  if (!payload) return []
+  const identityKey = typeof payload.primeSaverIdentityKey === 'string' ? payload.primeSaverIdentityKey : undefined
   const accountId = typeof payload?.accountId === 'string' ? payload.accountId : undefined
   const transactionId = typeof payload?.transactionId === 'string' ? payload.transactionId : undefined
   const supersessionKey = investecPrimeSaverSupersessionKey(payload ?? {})
@@ -146,6 +284,33 @@ async function investecSupersededResourceIds(
     const candidateKey = investecPrimeSaverSupersessionKey(candidate)
     if (candidateKey !== supersessionKey) continue
     resourceIds.add(`${deploymentId}:${connection.sourceResourceIncarnationId}:${candidate.transactionId}`)
+  }
+
+  // PrimeSaver sometimes emits a second UUID-less row with only the account
+  // holder's short narrative and a zero running balance. When a single
+  // provider-referenced row has the same date, direction, amount, and narrative
+  // suffix, treat the weak row as a provider correction. Raw payload remains
+  // append-only; only the native projection converges to the strong identity.
+  if (primeSaverProviderReference(payload)) {
+    const duplicateRows = await primeSaverDuplicateRows(sql, deploymentId, connection, payload)
+    const weakMatches = distinctPrimeSaverRows(duplicateRows.filter(row => {
+      const candidate = observationPayload(row.payload)
+      return candidate !== null
+        && primeSaverDuplicatePair(candidate, payload)
+        && primeSaverWeakRawPayload(row.raw_payload)
+    }))
+    if (weakMatches.length === 1) {
+      const candidate = observationPayload(weakMatches[0].payload)
+      const strongIdentityIds = candidate
+        ? primeSaverStrongIdentityIds(candidate, payload, duplicateRows)
+        : new Set<string>()
+      if (candidate && strongIdentityIds.size === 1 && strongIdentityIds.has(transactionId)) {
+        const candidateTransactionId = primeSaverTransactionId(candidate)
+        if (candidateTransactionId) {
+          resourceIds.add(`${deploymentId}:${connection.sourceResourceIncarnationId}:${candidateTransactionId}`)
+        }
+      }
+    }
   }
   if (resourceIds.size > 64) throw new Error('Investec PrimeSaver identity supersession candidate overflow')
   return [...resourceIds].sort()
@@ -396,6 +561,7 @@ async function investecProjectionOperations(
   accountId: string,
   connectionId: string,
 ): Promise<BridgeDisclosureOperation[]> {
+  if (await primeSaverWeakObservationAlreadyCanonical(sql, deploymentId, connection, observation)) return []
   const counterpart = await findInvestecCounterpart(sql, deploymentId, connection, observation)
   const current = recordPayload(observation.payload)
   if (!current || !transactionId(current) || !counterpart) {
@@ -574,6 +740,7 @@ export function createRuntimeDependencies(
         providerGeneration: connection.providerGeneration,
       })
       let insertedCount = 0
+      const enrichedObservations: Array<{ observation: ObservationOutput; wealthfolioAccountId: string }> = []
       for (const observation of observations) {
         if (observation.deploymentId !== deploymentId
           || observation.localOwnerId !== connection.localOwnerId
@@ -619,6 +786,14 @@ export function createRuntimeDependencies(
           RETURNING observation_id
         `
         insertedCount += inserted.length
+        enrichedObservations.push({ observation: enriched, wealthfolioAccountId })
+      }
+
+      // Derive projections only after the whole batch is visible in the raw
+      // evidence table. This lets a weak PrimeSaver correction observe its
+      // strong counterpart regardless of provider arrival order and suppress
+      // the weak upsert before it reaches the outbox.
+      for (const { observation: enriched, wealthfolioAccountId } of enrichedObservations) {
         const supersededResourceIds = await investecSupersededResourceIds(tx, deploymentId, connection, enriched)
         const projectedObservation = supersededResourceIds.length === 0
           ? enriched
