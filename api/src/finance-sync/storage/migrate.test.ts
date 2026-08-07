@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -49,6 +49,16 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/active\.wealthfolio_account_id = po\.payload->>'accountId'/i);
     expect(sql).toMatch(/dead_letter_reason = 'BRIDGE_HTTP_REJECTED'/i);
     expect(sql).toMatch(/state = 'pending'/i);
+  });
+
+  it("defines an append-only exact observation quarantine and suppressible outbox state", () => {
+    const sql = readFileSync(resolve(root, "0014_observation_quarantine.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS observation_quarantines/i);
+    expect(sql).toMatch(/UNIQUE \([\s\S]*provider_version, semantic_hash, hash_specification_version/i);
+    expect(sql).toMatch(/FOREIGN KEY \(deployment_id, local_owner_id, observation_id\)[\s\S]*REFERENCES raw_observations/i);
+    expect(sql).toMatch(/REVOKE UPDATE, DELETE ON observation_quarantines FROM finance_sync_runtime/i);
+    expect(sql).toMatch(/observation quarantines are append-only/i);
+    expect(sql).toMatch(/'suppressed'/i);
   });
 
   it("rejects checksum drift", () => {

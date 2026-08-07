@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { ConnectControlError, FinanceSyncConnectControl } from './connect-control'
+import { ObservationQuarantineError, type ObservationQuarantineRequest } from './observation-quarantine'
 
 const MAX_JSON_BODY_BYTES = 16 * 1024
 
@@ -40,6 +41,7 @@ export function createFinanceSyncHttpHandler(input: {
   readonly controlToken: string
   readonly providersEnabled: boolean
   readonly connect?: FinanceSyncConnectControl
+  readonly quarantine?: { create(rawSubject: string, request: ObservationQuarantineRequest): Promise<unknown> }
   readonly health: () => { readonly status: number; readonly body: unknown }
 }) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -62,6 +64,30 @@ export function createFinanceSyncHttpHandler(input: {
     const connect = input.connect
 
     try {
+      if (request.method === 'POST' && path === '/control/v1/observation-quarantines') {
+        if (!input.quarantine) return send(response, 503, { error: 'projection_control_disabled' })
+        const body = await jsonBody(request)
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        const sourceResourceIncarnationId = body.sourceResourceIncarnationId
+        const providerVersion = body.providerVersion
+        const semanticHash = body.semanticHash
+        const hashSpecificationVersion = body.hashSpecificationVersion
+        const reason = body.reason
+        if (typeof sourceResourceIncarnationId !== 'string' || !uuid.test(sourceResourceIncarnationId)
+          || typeof providerVersion !== 'string' || providerVersion.length < 1 || providerVersion.length > 512
+          || typeof semanticHash !== 'string' || !/^[a-f0-9]{64}$/i.test(semanticHash)
+          || typeof hashSpecificationVersion !== 'number' || !Number.isSafeInteger(hashSpecificationVersion) || hashSpecificationVersion < 1
+          || typeof reason !== 'string' || reason.trim().length < 1 || reason.trim().length > 2048) {
+          throw new ConnectControlError(400, 'invalid observation quarantine request')
+        }
+        return send(response, 200, await input.quarantine.create(rawSubject, {
+          sourceResourceIncarnationId,
+          providerVersion,
+          semanticHash: semanticHash.toLowerCase(),
+          hashSpecificationVersion,
+          reason: reason.trim(),
+        }))
+      }
       if (request.method === 'GET' && path === '/control/v1/provider-connections') {
         return send(response, 200, await connect.list(rawSubject))
       }
@@ -112,7 +138,7 @@ export function createFinanceSyncHttpHandler(input: {
       }
       return send(response, 404, { error: 'not_found' })
     } catch (error) {
-      const status = error instanceof ConnectControlError ? error.status : 500
+      const status = error instanceof ConnectControlError || error instanceof ObservationQuarantineError ? error.status : 500
       return send(response, status, { error: 'request_failed' })
     }
   }

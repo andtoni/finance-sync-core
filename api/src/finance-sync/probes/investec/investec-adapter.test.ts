@@ -175,10 +175,10 @@ describe('Investec adapter G5', () => {
 
   it('preserves provider type, all provider dates, and pocket grouping evidence', async () => {
     const transport = makeTransport([{
-      uuid: 'pocket-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', transactionType: 'MCPBAPocketTransfers', amount: '65.99',
+      uuid: 'pocket-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', transactionType: 'MCPBAPocketTransfers', amount: '10.00',
       transactionDate: '2026-08-05', postingDate: '2026-08-06', actionDate: '2026-08-05', valueDate: '2026-08-06',
-      description: 'USD POCKET - ****0000', reference: 'pocket-ref', pocketGroupId: 'pocket-batch-1',
-      feeAmount: '1.25', taxAmount: '0.10', exchangeRate: '18.25',
+      description: 'SYNTHETIC USD POCKET', reference: 'pocket-ref', pocketGroupId: 'pocket-batch-1',
+      feeAmount: '0.10', taxAmount: '0.01', exchangeRate: '18.00',
     } as any], undefined)
     const [observation] = transactionObservations(await runInvestecAdapter(BASE_CONFIG, transport))
     expect(observation.payload).toMatchObject({
@@ -186,14 +186,14 @@ describe('Investec adapter G5', () => {
       date: '2026-08-05', transactionDate: '2026-08-05', postingDate: '2026-08-06',
       actionDate: '2026-08-05', valueDate: '2026-08-06', settlementDate: '2026-08-06',
       sourceGroupId: 'investec:pocket:investec:connection-1:pocket-batch-1',
-      fee: '1.25', tax: '0.10', fxRate: '18.25', needsReview: true,
+      fee: '0.10', tax: '0.01', fxRate: '18.00', needsReview: true,
       metadata: { providerOwned: { investec: { currencyEvidence: {
         accountCurrency: 'ZAR', originalAmount: null, originalCurrency: null,
-        fxRate: '18.25', status: 'account_only',
+        fxRate: '18.00', status: 'account_only',
       } } } },
     })
     expect(observation.observedAt).not.toBe('2026-08-05T00:00:00.000Z')
-    expect(observation.rawPayload).toMatchObject({ uuid: 'pocket-1', feeAmount: '1.25', exchangeRate: '18.25' })
+    expect(observation.rawPayload).toMatchObject({ uuid: 'pocket-1', feeAmount: '0.10', exchangeRate: '18.00' })
   })
 
   it('accepts PrimeSaver booked rows without UUIDs using stable synthetic identities', async () => {

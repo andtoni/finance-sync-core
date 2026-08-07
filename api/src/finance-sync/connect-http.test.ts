@@ -8,9 +8,11 @@ const subject = 'wealthfolio#owner-a'
 let server: ReturnType<typeof createServer>
 let base: string
 let admitted: Record<string, unknown>[]
+let quarantined: Record<string, unknown>[]
 
 beforeEach(async () => {
   admitted = []
+  quarantined = []
   const connect = new FinanceSyncConnectControl({
     deploymentId: 'deployment-1',
     connections: [],
@@ -38,7 +40,17 @@ beforeEach(async () => {
     },
     onPlaidConnected: async () => undefined,
   })
-  const handler = createFinanceSyncHttpHandler({ controlToken, providersEnabled: true, connect, health: () => ({ status: 200, body: { ok: true } }) })
+  const handler = createFinanceSyncHttpHandler({
+    controlToken, providersEnabled: true, connect,
+    quarantine: {
+      create: async (rawSubject, request) => {
+        const result = { rawSubject, ...request, quarantineId: 'quarantine-1' }
+        quarantined.push(result)
+        return result
+      },
+    },
+    health: () => ({ status: 200, body: { ok: true } }),
+  })
   server = createServer((request, response) => { void handler(request, response) })
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const address = server.address()
@@ -124,6 +136,27 @@ describe('Finance Sync internal Connect HTTP routes', () => {
       baselineKind: 'relink', priorProviderGeneration: 2, databaseStateDigest: relinkDigest })
   })
 
+  it('creates an exact authenticated observation quarantine request', async () => {
+    const request = {
+      sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
+      providerVersion: 'investec:txn:synthetic-1',
+      semanticHash: 'a'.repeat(64), hashSpecificationVersion: 3,
+      reason: 'exact synthetic observation correction',
+    }
+    const response = await fetch(`${base}/control/v1/observation-quarantines`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify(request),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ ...request, rawSubject: subject, quarantineId: 'quarantine-1' })
+    expect(quarantined).toEqual([{ ...request, rawSubject: subject, quarantineId: 'quarantine-1' }])
+
+    const invalid = await fetch(`${base}/control/v1/observation-quarantines`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ ...request, semanticHash: 'not-a-hash' }),
+    })
+    expect(invalid.status).toBe(400)
+  })
+
   it('disconnects a subject-bound provider without exposing a 501 path', async () => {
     const response = await fetch(`${base}/control/v1/provider-connections/plaid/connection-1`, { method: 'DELETE', headers: headers() })
     expect(response.status).toBe(200)
@@ -155,6 +188,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
         ['/control/v1/provider-connections/investec/start', { method: 'POST' }],
         ['/control/v1/provider-connections/mercury/start', { method: 'POST' }],
         ['/control/v1/provider-connections/snaptrade/start', { method: 'POST' }],
+        ['/control/v1/observation-quarantines', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
       ] as const
       for (const [path, init] of requests) {
         const response = await fetch(`${disabledBase}${path}`, { ...init, headers: headers('headers' in init ? init.headers : {}) })

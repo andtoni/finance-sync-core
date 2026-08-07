@@ -524,9 +524,12 @@ function correlatedInvestecPayload(
   const originalAmount = originalCurrency !== undefined && typeof card.originalAmount === 'string'
     ? card.originalAmount
     : undefined
+  const settledWithoutOriginalEvidence: Record<string, unknown> = { ...settled }
+  delete settledWithoutOriginalEvidence.originalAmount
+  delete settledWithoutOriginalEvidence.originalCurrency
   const settlementDate = settled.settlementDate ?? settled.postingDate ?? settled.valueDate ?? settled.date
   return Object.freeze({
-    ...settled,
+    ...settledWithoutOriginalEvidence,
     transactionId: settledId,
     pendingTransactionId: cardId,
     // The posted ledger fact must use the settlement/account leg for native
@@ -552,8 +555,8 @@ function correlatedInvestecPayload(
         ...(cardProviderOwned ?? {}),
         ...(settledProviderOwned ?? {}),
         investec: {
-          ...(cardInvestecMetadata ?? {}),
           ...(settledInvestecMetadata ?? {}),
+          ...(cardInvestecMetadata ?? {}),
         },
         investecCorrelation: {
           cardTransactionId: cardId,
@@ -691,6 +694,26 @@ async function assertDurableAuthority(sql: FinanceSyncSql, deploymentId: string,
 
 export type BridgeReceiptLookup = (operation: BridgeDisclosureOperation) => Promise<unknown | null>
 
+async function observationIsQuarantined(
+  tx: FinanceSyncSql,
+  deploymentId: string,
+  localOwnerId: string,
+  observation: ObservationOutput,
+): Promise<boolean> {
+  const rows = await tx<{ quarantine_id: string }[]>`
+    SELECT quarantine_id
+    FROM observation_quarantines
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${localOwnerId}
+      AND source_resource_incarnation_id = ${observation.sourceResourceIncarnationId}::uuid
+      AND provider_version = ${observation.providerVersion}
+      AND semantic_hash = ${observation.semanticHash}
+      AND hash_specification_version = ${observation.hashSpecificationVersion}
+    LIMIT 1
+  `
+  return rows.length > 0
+}
+
 export function createRuntimeDependencies(
   sql: FinanceSyncSql,
   deploymentId: string,
@@ -748,14 +771,6 @@ export function createRuntimeDependencies(
     persistAndEnqueue: async (connection, observations, options?: PersistEnqueueOptions) => sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
       await assertDurableAuthority(tx, deploymentId, connection)
-      const currentStates = options?.skipCurrentState ? [] : assembleCurrentState(connection.provider, observations, connection.accountIds.map(providerAccountId => ({
-        providerAccountId,
-        accountId: connection.wealthfolioAccountIds[providerAccountId],
-      })), {
-        providerConnectionId: connection.connectionId,
-        providerIncarnationId: connection.sourceResourceIncarnationId,
-        providerGeneration: connection.providerGeneration,
-      })
       let insertedCount = 0
       const enrichedObservations: Array<{ observation: ObservationOutput; wealthfolioAccountId: string }> = []
       for (const observation of observations) {
@@ -809,8 +824,28 @@ export function createRuntimeDependencies(
       // Derive projections only after the whole batch is visible in the raw
       // evidence table. This lets a weak PrimeSaver correction observe its
       // strong counterpart regardless of provider arrival order and suppress
-      // the weak upsert before it reaches the outbox.
-      for (const { observation: enriched, wealthfolioAccountId } of enrichedObservations) {
+      // the weak upsert before it reaches the outbox. A durable quarantine is
+      // checked by the exact immutable observation identity before projection.
+      const projectableObservations: typeof enrichedObservations = []
+      for (const candidate of enrichedObservations) {
+        if (!(await observationIsQuarantined(tx, deploymentId, connection.localOwnerId, candidate.observation))) {
+          projectableObservations.push(candidate)
+        }
+      }
+      const currentStates = options?.skipCurrentState ? [] : assembleCurrentState(
+        connection.provider,
+        projectableObservations.map(candidate => candidate.observation),
+        connection.accountIds.map(providerAccountId => ({
+          providerAccountId,
+          accountId: connection.wealthfolioAccountIds[providerAccountId],
+        })),
+        {
+          providerConnectionId: connection.connectionId,
+          providerIncarnationId: connection.sourceResourceIncarnationId,
+          providerGeneration: connection.providerGeneration,
+        },
+      )
+      for (const { observation: enriched, wealthfolioAccountId } of projectableObservations) {
         const supersededResourceIds = await investecSupersededResourceIds(tx, deploymentId, connection, enriched)
         const projectedObservation = supersededResourceIds.length === 0
           ? enriched

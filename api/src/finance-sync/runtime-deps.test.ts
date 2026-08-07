@@ -645,17 +645,17 @@ describe('Investec card and poll lifecycle correlation', () => {
 
   const settledPayload = {
     transactionId: 'settled-1', providerVersion: 'investec:txn:settled-1', semanticHash: 'settled-hash',
-    observedAt: '2026-08-06T10:00:00.000Z', accountId: 'acc-1', amount: '-193.91', currency: 'ZAR',
+    observedAt: '2026-08-06T10:00:00.000Z', accountId: 'acc-1', amount: '-123.45', currency: 'ZAR',
     date: '2026-08-06', postingDate: '2026-08-06', settlementDate: '2026-08-06',
-    description: 'SYNTHETIC SERVICE FEE', reference: 'ref-1', type: 'DEBIT',
+    description: 'SYNTHETIC CARD MERCHANT', reference: 'ref-1', type: 'DEBIT',
     status: 'posted', providerLifecycleTransactionId: 'card-1',
   }
   const cardPayload = {
     transactionId: 'card-1', providerVersion: 'investec:card:card-1', semanticHash: 'card-hash',
-    observedAt: '2026-08-05T10:00:00.000Z', accountId: 'acc-1', amount: '-11.50', currency: 'ZAR',
-    originalAmount: '11.50', originalCurrency: 'USD', settlementCurrency: 'ZAR',
-    date: '2026-08-05', description: 'SYNTHETIC SERVICE FEE', reference: 'ref-1', type: 'DEBIT',
-    transactionType: 'CARD', cardNumber: '400000XXXXXX0011', status: 'pending', providerLifecycleTransactionId: 'settled-1',
+    observedAt: '2026-08-05T10:00:00.000Z', accountId: 'acc-1', amount: '-12.34', currency: 'ZAR',
+    originalAmount: '12.34', originalCurrency: 'USD', settlementCurrency: 'ZAR',
+    date: '2026-08-05', description: 'SYNTHETIC CARD MERCHANT', reference: 'ref-1', type: 'DEBIT',
+    transactionType: 'CARD', cardNumber: 'TEST-CARD-0011', status: 'pending', providerLifecycleTransactionId: 'settled-1',
   }
 
   it.each([
@@ -682,7 +682,7 @@ describe('Investec card and poll lifecycle correlation', () => {
     expect(activities.some(operation => operation.activity?.originalCurrency === 'USD')).toBe(true)
     expect(activities.some(operation => operation.lifecycleSuccessorId
       && operation.activity?.currency === 'ZAR'
-      && operation.activity?.amount === '193.91'
+      && operation.activity?.amount === '123.45'
       && operation.activity?.originalCurrency === 'USD')).toBe(true)
     expect(activities.some(operation => operation.activity?.settlementCurrency === 'ZAR')).toBe(true)
     expect(activities.every(operation => operation.activity?.sourceGroupId === undefined)).toBe(true)
@@ -694,7 +694,7 @@ describe('Investec card and poll lifecycle correlation', () => {
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000101', payload: {
       deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
       idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
-    }, attempts: 0 }, [settledPayload])
+    }, attempts: 0 }, [{ ...settledPayload, originalAmount: '99.99' }])
     const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
     await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
       deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,

@@ -307,13 +307,13 @@ export async function reprojectRetainedInvestecCards(
 ): Promise<number> {
   const rows = await sql<RetainedCardObservationRow[]>`
     WITH latest AS (
-      SELECT DISTINCT ON (payload->>'transactionId')
+      SELECT DISTINCT ON (source_resource_incarnation_id, payload->>'transactionId')
         payload, raw_payload, semantic_hash, observed_at, source_resource_incarnation_id::text
       FROM raw_observations
       WHERE deployment_id = ${deploymentId}
         AND provider_version LIKE 'investec:card:%'
         AND raw_payload IS NOT NULL
-      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+      ORDER BY source_resource_incarnation_id, payload->>'transactionId', recorded_at DESC, observation_id DESC
     )
     SELECT payload, raw_payload, semantic_hash, observed_at, source_resource_incarnation_id
     FROM latest
@@ -355,12 +355,21 @@ export async function reprojectRetainedInvestecCards(
     batches.set(connection.connectionId, batch)
   }
   let reprojected = 0
+  let failed = false
   for (const { connection, observations } of batches.values()) {
-    await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
-    const projection = await deps.projectPending(connection)
-    if (projection.failed > 0) throw new Error('Investec retained card projection is unresolved')
-    reprojected += observations.length
+    try {
+      await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
+      const projection = await deps.projectPending(connection)
+      if (projection.failed > 0) {
+        failed = true
+        continue
+      }
+      reprojected += observations.length
+    } catch {
+      failed = true
+    }
   }
+  if (failed) throw new Error('Investec retained card projection is unresolved')
   return reprojected
 }
 
