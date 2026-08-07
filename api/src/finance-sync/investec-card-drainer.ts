@@ -165,18 +165,25 @@ export function investecCardObservation(input: {
     : `fingerprint-${sha256([input.providerAccountId, dateTime, amount, merchant].join('\x00')).slice(0, 32)}`
   const transactionId = `investec-card:${input.providerAccountId}:${identity}`
   const accountCurrency = input.accountCurrency.toUpperCase()
-  const originalCurrency = (stringValue(input.payload.currencyCode) ?? accountCurrency).toUpperCase()
-  if (!/^[A-Z]{3}$/.test(originalCurrency)) return null
+  const suppliedOriginalCurrency = stringValue(input.payload.currencyCode)?.toUpperCase()
+  if (suppliedOriginalCurrency !== undefined && !/^[A-Z]{3}$/.test(suppliedOriginalCurrency)) return null
   const cardDisplay = cardNumber(input.payload)
   const providerOriginalAmount = cardOriginalAmount(input.payload, isCredit)
-  const originalAmount = providerOriginalAmount ?? (originalCurrency === accountCurrency ? amount : undefined)
+  // Never manufacture a foreign/original leg from the admitted account leg.
+  // Investec's card amount is the account debit; a separate original leg is
+  // meaningful only when the provider supplies both its amount and currency.
+  const originalCurrency = suppliedOriginalCurrency !== undefined && providerOriginalAmount !== undefined
+    ? suppliedOriginalCurrency
+    : undefined
+  const originalAmount = originalCurrency === undefined ? undefined : providerOriginalAmount
+  const currencyEvidenceStatus = originalCurrency === undefined ? 'account_only' : 'provider_explicit'
   const payload = Object.freeze({
     transactionId,
     accountId: input.providerAccountId,
     amount,
     currency: accountCurrency,
     ...(originalAmount === undefined ? {} : { originalAmount }),
-    originalCurrency,
+    ...(originalCurrency === undefined ? {} : { originalCurrency }),
     settlementCurrency: accountCurrency,
     date,
     transactionDate: date,
@@ -194,15 +201,25 @@ export function investecCardObservation(input: {
     metadata: {
       providerOwned: {
         investec: {
-          cardCurrency: originalCurrency,
           accountCurrency,
+          ...(originalCurrency === undefined ? {} : { cardCurrency: originalCurrency }),
           cardNumber: cardDisplay,
+          currencyEvidence: {
+            accountCurrency,
+            originalCurrency: originalCurrency ?? null,
+            originalAmount: originalAmount ?? null,
+            status: currencyEvidenceStatus,
+          },
         },
       },
     },
     merchantContext: merchantContext({
       provider: 'investec', rawDescription: merchant, merchantDisplay: merchant,
-      amount, providerHint: { ...(reference ? { reference } : {}), currency: originalCurrency },
+      amount,
+      providerHint: {
+        ...(reference ? { reference } : {}),
+        ...(originalCurrency === undefined ? {} : { currency: originalCurrency }),
+      },
     }),
   })
   // A provider reference is the card event identity. Redelivery may carry a
@@ -210,8 +227,9 @@ export function investecCardObservation(input: {
   // a canonical correction and must advance the observation hash.
   const semanticHash = sha256([
     input.deploymentId, input.localOwnerId, input.sourceResourceIncarnationId,
-    'cash_ledger', transactionId, amount, accountCurrency, originalAmount ?? '', originalCurrency,
-    reference ? (providerDateTime ?? '') : dateTime, merchant, cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
+    'cash_ledger', transactionId, amount, accountCurrency, originalAmount ?? '', originalCurrency ?? '',
+    currencyEvidenceStatus, reference ? (providerDateTime ?? '') : dateTime,
+    merchant, cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
   ].join('\x00'))
   return Object.freeze({
     deploymentId: input.deploymentId,
@@ -245,6 +263,105 @@ async function exactCardAccount(sql: FinanceSyncSql, deploymentId: string, mask:
   `
   if (rows.length !== 1) throw new Error('Investec card account admission is absent or ambiguous')
   return rows[0]
+}
+
+interface RetainedCardObservationRow {
+  readonly payload: unknown
+  readonly raw_payload: unknown
+  readonly semantic_hash: string
+  readonly observed_at: string | Date
+  readonly source_resource_incarnation_id: string
+}
+
+async function exactRetainedCardAccount(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  providerAccountId: string,
+  sourceResourceIncarnationId: string,
+): Promise<CardAccountMapping> {
+  const rows = await sql<CardAccountMapping[]>`
+    SELECT dpa.local_owner_id, dpa.connection_id::text, dpa.provider_account_id,
+      paa.wealthfolio_account_id, dpa.source_resource_incarnation_id::text,
+      dpa.currency, dpa.mask
+    FROM discovered_provider_accounts dpa
+    JOIN provider_connections pc
+      ON pc.deployment_id = dpa.deployment_id AND pc.local_owner_id = dpa.local_owner_id
+      AND pc.connection_id = dpa.connection_id
+    JOIN provider_account_admissions paa
+      ON paa.deployment_id = dpa.deployment_id AND paa.local_owner_id = dpa.local_owner_id
+      AND paa.connection_id = dpa.connection_id AND paa.provider_account_id = dpa.provider_account_id
+    WHERE dpa.deployment_id = ${deploymentId}
+      AND dpa.provider_account_id = ${providerAccountId}
+      AND dpa.source_resource_incarnation_id = ${sourceResourceIncarnationId}::uuid
+      AND pc.provider = 'investec' AND pc.state = 'active'
+      AND pc.disabled_at IS NULL AND paa.revoked_at IS NULL AND paa.baseline_state = 'verified'
+  `
+  if (rows.length !== 1) throw new Error('Investec retained card account admission is absent or ambiguous')
+  return rows[0]
+}
+
+export async function reprojectRetainedInvestecCards(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  deps: SyncRuntimeDependencies,
+): Promise<number> {
+  const rows = await sql<RetainedCardObservationRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (payload->>'transactionId')
+        payload, raw_payload, semantic_hash, observed_at, source_resource_incarnation_id::text
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND provider_version LIKE 'investec:card:%'
+        AND raw_payload IS NOT NULL
+      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, raw_payload, semantic_hash, observed_at, source_resource_incarnation_id
+    FROM latest
+  `
+  if (rows.length === 0) return 0
+  const connections = await deps.loadConnections(deploymentId)
+  const batches = new Map<string, { connection: RuntimeConnection; observations: ObservationOutput[] }>()
+  const seen = new Set<string>()
+  for (const row of rows) {
+    const normalizedPayload = record(row.payload)
+    const providerAccountId = stringValue(normalizedPayload?.accountId)
+    const rawPayload = record(row.raw_payload)
+    if (!providerAccountId || !rawPayload) continue
+    let mapping: CardAccountMapping
+    try {
+      mapping = await exactRetainedCardAccount(sql, deploymentId, providerAccountId, row.source_resource_incarnation_id)
+    } catch {
+      continue
+    }
+    const connection = connections.find(candidate => candidate.provider === 'investec'
+      && candidate.connectionId === `${mapping.connection_id}:${mapping.provider_account_id}`
+      && candidate.sourceResourceIncarnationId === row.source_resource_incarnation_id)
+    if (!connection) continue
+    const observation = investecCardObservation({
+      deploymentId,
+      localOwnerId: connection.localOwnerId,
+      sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+      providerAccountId: mapping.provider_account_id,
+      accountCurrency: mapping.currency,
+      payload: rawPayload as InvestecCardPayload,
+      receivedAt: row.observed_at instanceof Date ? row.observed_at.toISOString() : row.observed_at,
+    })
+    if (!observation || observation.semanticHash === row.semantic_hash) continue
+    const identity = `${connection.connectionId}:${observation.semanticHash}`
+    if (seen.has(identity)) continue
+    seen.add(identity)
+    const batch = batches.get(connection.connectionId) ?? { connection, observations: [] }
+    batch.observations.push(observation)
+    batches.set(connection.connectionId, batch)
+  }
+  let reprojected = 0
+  for (const { connection, observations } of batches.values()) {
+    await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
+    const projection = await deps.projectPending(connection)
+    if (projection.failed > 0) throw new Error('Investec retained card projection is unresolved')
+    reprojected += observations.length
+  }
+  return reprojected
 }
 
 async function handleInvestecCardMessage(

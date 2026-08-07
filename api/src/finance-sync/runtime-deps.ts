@@ -163,9 +163,12 @@ function primeSaverDuplicatePair(
 ): boolean {
   if (!hasPrimeSaverSyntheticIdentity(weak) || !hasPrimeSaverSyntheticIdentity(strong)
     || primeSaverProviderReference(weak) || !primeSaverProviderReference(strong)) return false
-  if (weak.accountId !== strong.accountId
+  const weakDirection = primeSaverDirection(weak)
+  const strongDirection = primeSaverDirection(strong)
+  if (!weakDirection || !strongDirection
+    || weak.accountId !== strong.accountId
     || primeSaverTransactionDate(weak) !== primeSaverTransactionDate(strong)
-    || primeSaverDirection(weak) !== primeSaverDirection(strong)
+    || weakDirection !== strongDirection
     || decimalMagnitude(weak.amount) !== decimalMagnitude(strong.amount)) return false
   const weakDescription = normalizedText(weak.description)
   const strongDescription = normalizedText(strong.description)
@@ -176,7 +179,10 @@ function primeSaverDuplicatePair(
 
 function primeSaverWeakRawPayload(value: unknown): boolean {
   const raw = recordPayload(value)
-  return raw !== null && /^[-+]?0(?:\.0+)?$/.test(String(raw.runningBalance ?? '').trim())
+  // Observations written before migration 0013 have no raw_payload. Treat
+  // those legacy synthetic rows as weak only when the surrounding exact
+  // PrimeSaver identity checks also prove a single strong counterpart.
+  return raw === null || /^[-+]?0(?:\.0+)?$/.test(String(raw.runningBalance ?? '').trim())
 }
 
 async function primeSaverDuplicateRows(
@@ -189,15 +195,20 @@ async function primeSaverDuplicateRows(
   const transactionId = typeof payload.transactionId === 'string' ? payload.transactionId : undefined
   if (!accountId || !transactionId) return []
   const rows = await sql<PrimeSaverDuplicateRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (payload->>'transactionId') payload, raw_payload, provider_version
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND local_owner_id = ${connection.localOwnerId}
+        AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+        AND payload ? 'transactionId'
+        AND provider_version LIKE 'investec:txn:%'
+      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
     SELECT payload, raw_payload, provider_version
-    FROM raw_observations
-    WHERE deployment_id = ${deploymentId}
-      AND local_owner_id = ${connection.localOwnerId}
-      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
-      AND payload->>'accountId' = ${accountId}
-      AND payload ? 'transactionId'
+    FROM latest
+    WHERE payload->>'accountId' = ${accountId}
       AND payload->>'transactionId' <> ${transactionId}
-      AND provider_version LIKE 'investec:txn:%'
   `
   return rows
 }
@@ -242,13 +253,25 @@ async function primeSaverWeakObservationAlreadyCanonical(
 ): Promise<boolean> {
   const payload = observationPayload(observation.payload)
   if (!payload || !hasPrimeSaverSyntheticIdentity(payload) || !primeSaverWeakRawPayload(observation.rawPayload)) return false
-  const matches = distinctPrimeSaverRows((await primeSaverDuplicateRows(sql, deploymentId, connection, payload)).filter(row => {
+  const rows = distinctPrimeSaverRows(await primeSaverDuplicateRows(sql, deploymentId, connection, payload))
+  const matches = rows.filter(row => {
     const candidate = observationPayload(row.payload)
     return candidate !== null && primeSaverDuplicatePair(payload, candidate)
-  }))
+  })
   // Fail closed if more than one provider-referenced identity could explain
-  // the weak row. Repeated observations of one identity are not ambiguity.
-  return matches.length === 1
+  // the weak row, or if another distinct weak identity also explains the same
+  // strong row. This keeps arrival order from silently dropping one weak row.
+  if (matches.length !== 1) return false
+  const strong = observationPayload(matches[0].payload)
+  if (!strong) return false
+  const otherWeakMatches = rows.filter(row => {
+    const candidate = observationPayload(row.payload)
+    return candidate !== null
+      && candidate.transactionId !== payload.transactionId
+      && primeSaverDuplicatePair(candidate, strong)
+      && primeSaverWeakRawPayload(row.raw_payload)
+  })
+  return otherWeakMatches.length === 0
 }
 
 async function investecSupersededResourceIds(
@@ -266,17 +289,7 @@ async function investecSupersededResourceIds(
   const supersessionKey = investecPrimeSaverSupersessionKey(payload ?? {})
   if (!identityKey || !accountId || !transactionId || !supersessionKey) return []
 
-  const prior = await sql<{ payload: unknown }[]>`
-    SELECT payload
-    FROM raw_observations
-    WHERE deployment_id = ${deploymentId}
-      AND local_owner_id = ${connection.localOwnerId}
-      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
-      AND payload->>'accountId' = ${accountId}
-      AND payload ? 'transactionId'
-      AND payload->>'transactionId' <> ${transactionId}
-      AND provider_version LIKE 'investec:txn:%'
-  `
+  const prior = await primeSaverDuplicateRows(sql, deploymentId, connection, payload)
   const resourceIds = new Set<string>()
   for (const row of prior) {
     const candidate = observationPayload(row.payload)
@@ -507,6 +520,10 @@ function correlatedInvestecPayload(
   const settledProviderOwned = recordPayload(settledMetadata?.providerOwned)
   const cardInvestecMetadata = recordPayload(cardProviderOwned?.investec)
   const settledInvestecMetadata = recordPayload(settledProviderOwned?.investec)
+  const originalCurrency = typeof card.originalCurrency === 'string' ? card.originalCurrency : undefined
+  const originalAmount = originalCurrency !== undefined && typeof card.originalAmount === 'string'
+    ? card.originalAmount
+    : undefined
   const settlementDate = settled.settlementDate ?? settled.postingDate ?? settled.valueDate ?? settled.date
   return Object.freeze({
     ...settled,
@@ -517,8 +534,8 @@ function correlatedInvestecPayload(
     // making a USD amount look like ZAR account cash (or vice versa).
     amount: settlementAmount,
     currency: settlementCurrency,
-    ...(typeof card.originalAmount === 'string' ? { originalAmount: card.originalAmount } : {}),
-    originalCurrency: card.originalCurrency ?? card.currency,
+    ...(originalAmount === undefined ? {} : { originalAmount }),
+    ...(originalCurrency === undefined ? {} : { originalCurrency }),
     settlementAmount,
     settlementCurrency,
     date: card.date ?? settled.date,
@@ -542,7 +559,7 @@ function correlatedInvestecPayload(
           cardTransactionId: cardId,
           settlementTransactionId: settledId,
           confidence: 'provider-explicit',
-          originalCurrency: card.originalCurrency ?? card.currency ?? null,
+          originalCurrency: originalCurrency ?? null,
           settlementCurrency: settlementCurrency ?? null,
           sameCurrencyRoundingMatch: sameCurrencyAmountWithinTolerance(card, settled),
         },

@@ -19,7 +19,7 @@ import { PostgresOnboardingRepository } from './onboarding-repository'
 import { createNativeProviderOnboarding } from './server-onboarding'
 import { createProviderTransportFactories } from './provider-runtime'
 import { fixtureModeEnabled } from './fixture-runtime'
-import { startInvestecCardDrainer } from './investec-card-drainer'
+import { reprojectRetainedInvestecCards, startInvestecCardDrainer } from './investec-card-drainer'
 import type { DrainerHandle } from '../drain/drainer'
 
 interface CliArgs { help?: boolean; once?: boolean }
@@ -108,6 +108,16 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       }
     }
     await cycle()
+    if (deps && config.projectionEnabled) {
+      try {
+        const reprojectedCards = await reprojectRetainedInvestecCards(sql, config.deploymentId, deps)
+        if (reprojectedCards > 0) console.log('FINANCE_SYNC_RETAINED_CARD_REPROJECTION_OK')
+      } catch {
+        // Keep the health server and normal retry loop available when the bridge
+        // is transiently unavailable or another outbox row is unresolved.
+        console.error('FINANCE_SYNC_RETAINED_CARD_REPROJECTION_FAILED')
+      }
+    }
     if (args.once) { if (!databaseReady || cycleFailed || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,

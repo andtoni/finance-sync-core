@@ -177,7 +177,7 @@ describe('Investec adapter G5', () => {
     const transport = makeTransport([{
       uuid: 'pocket-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', transactionType: 'MCPBAPocketTransfers', amount: '65.99',
       transactionDate: '2026-08-05', postingDate: '2026-08-06', actionDate: '2026-08-05', valueDate: '2026-08-06',
-      description: 'Pocket movement', reference: 'pocket-ref', pocketGroupId: 'pocket-batch-1',
+      description: 'USD POCKET - ****0000', reference: 'pocket-ref', pocketGroupId: 'pocket-batch-1',
       feeAmount: '1.25', taxAmount: '0.10', exchangeRate: '18.25',
     } as any], undefined)
     const [observation] = transactionObservations(await runInvestecAdapter(BASE_CONFIG, transport))
@@ -186,7 +186,11 @@ describe('Investec adapter G5', () => {
       date: '2026-08-05', transactionDate: '2026-08-05', postingDate: '2026-08-06',
       actionDate: '2026-08-05', valueDate: '2026-08-06', settlementDate: '2026-08-06',
       sourceGroupId: 'investec:pocket:investec:connection-1:pocket-batch-1',
-      fee: '1.25', tax: '0.10', fxRate: '18.25',
+      fee: '1.25', tax: '0.10', fxRate: '18.25', needsReview: true,
+      metadata: { providerOwned: { investec: { currencyEvidence: {
+        accountCurrency: 'ZAR', originalAmount: null, originalCurrency: null,
+        fxRate: '18.25', status: 'account_only',
+      } } } },
     })
     expect(observation.observedAt).not.toBe('2026-08-05T00:00:00.000Z')
     expect(observation.rawPayload).toMatchObject({ uuid: 'pocket-1', feeAmount: '1.25', exchangeRate: '18.25' })

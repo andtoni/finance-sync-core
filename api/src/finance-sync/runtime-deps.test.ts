@@ -126,6 +126,21 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
         }
       })
     }
+    if (/WITH\s+latest/i.test(text) && /FROM\s+raw_observations/i.test(text)) {
+      const rows = allRows().filter(payload => {
+        const value = unwrap(payload).payload
+        return !(value && typeof value === 'object'
+          && (value as Record<string, unknown>).transactionId === values.at(-1))
+      })
+      return rows.map(payload => {
+        const value = unwrap(payload)
+        return {
+          payload: value.payload,
+          raw_payload: value.rawPayload,
+          provider_version: 'investec:txn:prior',
+        }
+      })
+    }
     if (/SELECT\s+payload(?:,\s*raw_payload,\s*provider_version)?\s+FROM\s+raw_observations/i.test(text)) {
       const rows = allRows().filter(payload => {
         if (!/payload->>'transactionId'\s*<>/i.test(text)) return true
@@ -481,6 +496,68 @@ describe('PrimeSaver identity supersession projection', () => {
     expect(fixture.enqueued[0].supersededResourceIds).toBeUndefined()
   })
 
+  it('does not reconcile PrimeSaver rows when direction evidence is missing', async () => {
+    const strongPayload = {
+      transactionId: 'synthetic-v2-unknown-direction-strong', accountId: 'acc-1', amount: '4000', currency: 'ZAR',
+      date: '2026-08-06', transactionDate: '2026-08-06',
+      description: 'Internal Transaction MBP9000000003 Synthetic Holder 9003', reference: null, cardNumber: null,
+      primeSaverIdentityKey: 'v2:unknown-direction-strong',
+    }
+    const weakPayload = {
+      ...strongPayload, transactionId: 'synthetic-v2-unknown-direction-weak',
+      description: 'Synthetic Holder 9003', primeSaverIdentityKey: 'v2:unknown-direction-weak',
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000097', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [{ payload: weakPayload, rawPayload: null }])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', connectionId: 'investec-connection',
+      apiKey: 'api-key', eligibleProductNames: ['PrimeSaver'], fromDate: '2026-08-01', toDate: '2026-08-07',
+    }
+    await deps.persistAndEnqueue(investecConnection, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: 'investec:txn:synthetic-v2-unknown-direction-strong', semanticHash: 'unknown-direction-hash',
+      hashSpecificationVersion: 3, observedAt: '2026-08-07T08:00:00.000Z', domain: 'cash_ledger',
+      payload: strongPayload, rawPayload: { runningBalance: '98765.43' },
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued[0].supersededResourceIds).toBeUndefined()
+  })
+
+  it('does not supersede a strong row when multiple weak identities match', async () => {
+    const strongPayload = {
+      transactionId: 'synthetic-v2-multiple-strong', accountId: 'acc-1', amount: '4000', currency: 'ZAR',
+      date: '2026-08-06', transactionDate: '2026-08-06', type: 'CREDIT',
+      description: 'Internal Transaction MBP9000000004 Synthetic Holder 9004', reference: null, cardNumber: null,
+    }
+    const weakPayload = (transactionId: string, identityKey: string) => ({
+      ...strongPayload, transactionId, description: 'Synthetic Holder 9004', primeSaverIdentityKey: identityKey,
+    })
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000098', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [
+      { payload: weakPayload('synthetic-v2-multiple-weak-a', 'v2:multiple-weak-a'), rawPayload: null },
+      { payload: weakPayload('synthetic-v2-multiple-weak-b', 'v2:multiple-weak-b'), rawPayload: { runningBalance: 0 } },
+    ])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', connectionId: 'investec-connection',
+      apiKey: 'api-key', eligibleProductNames: ['PrimeSaver'], fromDate: '2026-08-01', toDate: '2026-08-07',
+    }
+    await deps.persistAndEnqueue(investecConnection, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: 'investec:txn:synthetic-v2-multiple-strong', semanticHash: 'multiple-weak-hash',
+      hashSpecificationVersion: 3, observedAt: '2026-08-07T08:00:00.000Z', domain: 'cash_ledger',
+      payload: { ...strongPayload, primeSaverIdentityKey: 'v2:multiple-strong' },
+      rawPayload: { runningBalance: '98765.43' },
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued[0].supersededResourceIds).toBeUndefined()
+  })
+
   it('supersedes a previously projected weak PrimeSaver row when the strong row arrives', async () => {
     const strongPayload = {
       transactionId: 'synthetic-v2-strong', accountId: 'acc-1', amount: '3150', currency: 'ZAR',
@@ -516,6 +593,41 @@ describe('PrimeSaver identity supersession projection', () => {
       'dep-1:00000000-0000-0000-0000-000000000001:synthetic-v2-weak',
     ])
   })
+
+  it('reconciles a pre-raw-payload weak PrimeSaver row', async () => {
+    const strongPayload = {
+      transactionId: 'synthetic-v2-legacy-strong', accountId: 'acc-1', amount: '4000', currency: 'ZAR',
+      date: '2026-08-06', transactionDate: '2026-08-06', type: 'CREDIT',
+      description: 'Internal Transaction PMC Inbounds Value Date 06Aug26 MBP9000000002 Synthetic Holder 9002',
+      reference: null, cardNumber: null,
+    }
+    const weakPayload = {
+      ...strongPayload, transactionId: 'synthetic-v2-legacy-weak', description: 'Synthetic Holder 9002',
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000096', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [{
+      payload: { ...weakPayload, primeSaverIdentityKey: investecPrimeSaverIdentityKey(weakPayload), providerVersion: 'investec:txn:synthetic-v2-legacy-weak', semanticHash: 'legacy-weak-hash' },
+      rawPayload: null,
+    }])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', connectionId: 'investec-connection',
+      apiKey: 'api-key', eligibleProductNames: ['PrimeSaver'], fromDate: '2026-08-01', toDate: '2026-08-07',
+    }
+    await deps.persistAndEnqueue(investecConnection, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: 'investec:txn:synthetic-v2-legacy-strong', semanticHash: 'legacy-strong-hash',
+      hashSpecificationVersion: 3, observedAt: '2026-08-07T08:00:00.000Z', domain: 'cash_ledger',
+      payload: { ...strongPayload, primeSaverIdentityKey: investecPrimeSaverIdentityKey(strongPayload) },
+      rawPayload: { runningBalance: '98765.43' },
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued[0].supersededResourceIds).toEqual([
+      'dep-1:00000000-0000-0000-0000-000000000001:synthetic-v2-legacy-weak',
+    ])
+  })
 })
 
 describe('Investec card and poll lifecycle correlation', () => {
@@ -540,7 +652,8 @@ describe('Investec card and poll lifecycle correlation', () => {
   }
   const cardPayload = {
     transactionId: 'card-1', providerVersion: 'investec:card:card-1', semanticHash: 'card-hash',
-    observedAt: '2026-08-05T10:00:00.000Z', accountId: 'acc-1', amount: '-11.50', currency: 'USD',
+    observedAt: '2026-08-05T10:00:00.000Z', accountId: 'acc-1', amount: '-11.50', currency: 'ZAR',
+    originalAmount: '11.50', originalCurrency: 'USD', settlementCurrency: 'ZAR',
     date: '2026-08-05', description: 'SYNTHETIC SERVICE FEE', reference: 'ref-1', type: 'DEBIT',
     transactionType: 'CARD', cardNumber: '400000XXXXXX0011', status: 'pending', providerLifecycleTransactionId: 'settled-1',
   }
@@ -574,6 +687,25 @@ describe('Investec card and poll lifecycle correlation', () => {
     expect(activities.some(operation => operation.activity?.settlementCurrency === 'ZAR')).toBe(true)
     expect(activities.every(operation => operation.activity?.sourceGroupId === undefined)).toBe(true)
     expect(fixture.rawPayloads).toContainEqual({ wireTransactionId: currentPayload.transactionId })
+  })
+
+  it('does not invent original evidence while correlating a card without provider currency', async () => {
+    const { originalAmount: _originalAmount, originalCurrency: _originalCurrency, ...cardWithoutEvidence } = cardPayload
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000101', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settledPayload])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: String(cardWithoutEvidence.providerVersion), semanticHash: 'card-without-evidence-hash',
+      hashSpecificationVersion: 3, observedAt: String(cardWithoutEvidence.observedAt), domain: 'cash_ledger',
+      payload: cardWithoutEvidence,
+    }], { skipCurrentState: true })
+    const activities = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert').map(item => item.activity)
+    expect(activities).toHaveLength(2)
+    expect(activities.every(activity => activity?.originalAmount === undefined && activity?.originalCurrency === undefined)).toBe(true)
   })
 
   it('does not correlate a card and booked row without explicit provider linkage', async () => {

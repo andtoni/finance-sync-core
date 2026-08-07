@@ -456,6 +456,21 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
           const settlementAmount = providerDecimalField(txn, ['settlementAmount', 'accountAmount', 'localAmount']) ?? signed
           const settlementCurrency = providerCurrencyField(txn, ['settlementCurrency', 'accountCurrency', 'localCurrency']) ?? rawCurrency
           const providerLifecycleId = providerLifecycleTransactionId(txn)
+          const description = txn.description ?? null
+          const namedUsdPocket = providerTransactionType === 'MCPBAPOCKETTRANSFERS'
+            && typeof description === 'string'
+            && /USD\s+POCKET/i.test(description)
+          const completeOriginalEvidence = originalAmount !== undefined && originalCurrency !== undefined
+          const currencyEvidenceReview = namedUsdPocket && !completeOriginalEvidence
+          const currencyEvidence = providerTransactionType === 'MCPBAPOCKETTRANSFERS'
+            ? {
+                accountCurrency: rawCurrency,
+                originalAmount: completeOriginalEvidence ? originalAmount : null,
+                originalCurrency: completeOriginalEvidence ? originalCurrency : null,
+                fxRate: fxRate ?? null,
+                status: completeOriginalEvidence ? 'provider_explicit' : 'account_only',
+              }
+            : undefined
           const payload = {
             transactionId,
             accountId: account.accountId,
@@ -467,15 +482,14 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             ...(fee === undefined ? {} : { fee }),
             ...(tax === undefined ? {} : { tax }),
             ...(fxRate === undefined ? {} : { fxRate }),
-            ...(originalAmount === undefined ? {} : { originalAmount }),
-            ...(originalCurrency === undefined ? {} : { originalCurrency }),
+            ...(completeOriginalEvidence ? { originalAmount, originalCurrency } : {}),
             date,
             transactionDate,
             postingDate,
             actionDate,
             valueDate,
             settlementDate: postingDate ?? valueDate,
-            description: txn.description ?? null,
+            description,
             type: providerDirection,
             direction: providerDirection,
             sourceType: providerTransactionType,
@@ -485,6 +499,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             reference: txn.reference ?? null,
             ...(providerLifecycleId === undefined ? {} : { providerLifecycleTransactionId: providerLifecycleId }),
             status: status.toLowerCase(),
+            ...(currencyEvidenceReview ? { needsReview: true } : {}),
             ...(sourceGroupId === undefined ? {} : { sourceGroupId }),
             ...(identity.primeSaverIdentityKey === undefined ? {} : { primeSaverIdentityKey: identity.primeSaverIdentityKey }),
             metadata: {
@@ -499,6 +514,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
                   actionDate,
                   valueDate,
                   ...(sourceGroupId === undefined ? {} : { pocketSourceGroupId: sourceGroupId }),
+                  ...(currencyEvidence === undefined ? {} : { currencyEvidence }),
                 },
               },
             },

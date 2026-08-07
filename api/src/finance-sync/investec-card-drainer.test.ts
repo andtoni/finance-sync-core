@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { investecCardObservation } from './investec-card-drainer'
+import { investecCardObservation, reprojectRetainedInvestecCards } from './investec-card-drainer'
+import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
+import type { FinanceSyncSql } from './storage/pg'
 
 const input = {
   deploymentId: 'wealthfolio-production',
@@ -14,7 +16,7 @@ describe('Investec card observations', () => {
     const observation = investecCardObservation({
       ...input,
       payload: {
-        accountNumber: '10000000001', centsAmount: 576, currencyCode: 'usd', type: 'card',
+        accountNumber: '10000000001', centsAmount: 576, originalCentsAmount: 576, currencyCode: 'usd', type: 'card',
         dateTime: '2026-08-05T16:00:00.000Z', reference: '500000001',
         merchant: { name: 'SAASCO' }, card: { display: '400000XXXXXX0011' },
       },
@@ -36,6 +38,72 @@ describe('Investec card observations', () => {
     })
   })
 
+  it('does not invent an original currency or amount when the webhook omits card currency', () => {
+    const observation = investecCardObservation({
+      ...input,
+      payload: {
+        accountNumber: '10000000001', centsAmount: 100000, type: 'card',
+        dateTime: '2026-08-06T02:30:00.000Z', reference: '500000002',
+        merchant: { name: 'SYNTHETIC SERVICE FEE' },
+      },
+    })
+
+    expect(observation?.payload).toMatchObject({ amount: '-1000.00', currency: 'ZAR', settlementCurrency: 'ZAR' })
+    expect(observation?.payload.originalAmount).toBeUndefined()
+    expect(observation?.payload.originalCurrency).toBeUndefined()
+    expect(observation?.payload.metadata).toMatchObject({
+      providerOwned: { investec: { currencyEvidence: {
+        accountCurrency: 'ZAR', originalAmount: null, originalCurrency: null, status: 'account_only',
+      } } },
+    })
+  })
+
+  it('reprojects retained webhook payloads through the corrected normalizer', async () => {
+    const connection: RuntimeConnection = {
+      deploymentId: 'wealthfolio-production', provider: 'investec', connectionId: 'connection:provider-account',
+      clientId: 'client', clientSecret: 'secret', apiKey: 'key', localOwnerId: 'urn:wealthfolio:password#local',
+      sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001', accountIds: ['provider-account'],
+      wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, providerGeneration: 1,
+      receiverAccessGeneration: 1, secretReference: 'INVESTEC', eligibleProductNames: ['Private Bank Account'],
+      fromDate: '2026-08-01', toDate: '2026-08-07',
+    }
+    const rawPayload = {
+      accountNumber: '10000000001', centsAmount: 100000, type: 'card',
+      dateTime: '2026-08-06T02:30:00.000Z', reference: '500000002',
+      merchant: { name: 'SYNTHETIC SERVICE FEE' },
+    }
+    const sql = (async (strings: TemplateStringsArray) => {
+      const text = strings.join('?')
+      if (/FROM raw_observations/i.test(text)) return [{
+        payload: { transactionId: 'investec-card:provider-account:reference-500000002', accountId: 'provider-account' },
+        raw_payload: rawPayload,
+        semantic_hash: 'old-hash', observed_at: '2026-08-06T02:31:00.000Z',
+        source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+      }]
+      if (/FROM discovered_provider_accounts/i.test(text)) return [{
+        local_owner_id: connection.localOwnerId, connection_id: 'connection', provider_account_id: 'provider-account',
+        wealthfolio_account_id: 'wealthfolio-account', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+        currency: 'ZAR', mask: '3333',
+      }]
+      return []
+    }) as unknown as FinanceSyncSql
+    const persisted: ReadonlyArray<Readonly<Record<string, unknown>>>[] = []
+    const deps = {
+      loadConnections: async () => [connection],
+      persistAndEnqueue: async (_runtimeConnection: RuntimeConnection, observations: ReadonlyArray<{ payload: Readonly<Record<string, unknown>> }>) => {
+        persisted.push(observations.map(observation => observation.payload))
+        return observations.length
+      },
+      projectPending: async () => ({ delivered: 1, failed: 0 }),
+    } as unknown as SyncRuntimeDependencies
+
+    await expect(reprojectRetainedInvestecCards(sql, 'wealthfolio-production', deps)).resolves.toBe(1)
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0][0]).toMatchObject({ amount: '-1000.00', currency: 'ZAR' })
+    expect(persisted[0][0].originalAmount).toBeUndefined()
+    expect(persisted[0][0].originalCurrency).toBeUndefined()
+  })
+
   it('is deterministic for webhook redelivery and ignores the merchant currency leg', () => {
     const payload = {
       accountNumber: '10000000001', centsAmount: 576, currencyCode: 'usd', type: 'card',
@@ -46,7 +114,7 @@ describe('Investec card observations', () => {
     expect(first?.semanticHash).toBe(second?.semanticHash)
     expect(first?.payload.currency).toBe('ZAR')
     expect(first?.payload.originalAmount).toBeUndefined()
-    expect(first?.payload.originalCurrency).toBe('USD')
+    expect(first?.payload.originalCurrency).toBeUndefined()
     expect(first?.payload.settlementCurrency).toBe('ZAR')
     expect(first?.hashSpecificationVersion).toBe(3)
   })
