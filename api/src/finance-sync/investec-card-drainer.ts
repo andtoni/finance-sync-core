@@ -36,7 +36,7 @@ interface CardAccountMapping {
   readonly mask: string
 }
 
-const HASH_SPECIFICATION_VERSION = 3
+const HASH_SPECIFICATION_VERSION = 4
 
 function record(value: unknown): RecordValue | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : undefined
@@ -50,15 +50,25 @@ function sha256(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex')
 }
 
-function providerLifecycleTransactionId(payload: RecordValue): string | undefined {
+function providerLifecycleTransactionIds(payload: RecordValue): readonly string[] {
+  const ids = new Set<string>()
   for (const key of [
     'providerLifecycleTransactionId', 'pendingTransactionId', 'postedTransactionId', 'settlementTransactionId',
     'successorTransactionId', 'cardTransactionId', 'linkedTransactionId',
   ]) {
     const value = payload[key]
-    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (typeof value === 'string' && value.trim()) ids.add(value.trim())
   }
-  return undefined
+  return [...ids]
+}
+
+function providerLifecycleTransactionId(payload: RecordValue): string | undefined {
+  const ids = providerLifecycleTransactionIds(payload)
+  return ids.length === 1 ? ids[0] : undefined
+}
+
+function hasConflictingLifecycleIds(payload: RecordValue): boolean {
+  return providerLifecycleTransactionIds(payload).length > 1
 }
 
 function accountMask(value: unknown): string | undefined {
@@ -78,16 +88,6 @@ function decimalFromCents(value: unknown): string | undefined {
   return `${whole}.${fraction}`
 }
 
-function decimalFromValue(value: unknown): string | undefined {
-  const raw = typeof value === 'number' && Number.isFinite(value)
-    ? value.toFixed(2)
-    : typeof value === 'string' && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim())
-      ? value.trim()
-      : undefined
-  if (!raw || Number(raw) === 0) return undefined
-  return raw.replace(/^[+-]/, '')
-}
-
 function cardCredit(payload: InvestecCardPayload): boolean {
   if (String(payload.type).toUpperCase() === 'CREDIT') return true
   const rawAmount = payload.amount
@@ -95,35 +95,15 @@ function cardCredit(payload: InvestecCardPayload): boolean {
   return typeof rawAmount === 'string' && rawAmount.trim().startsWith('-')
 }
 
-function signedAmount(value: unknown, isCredit: boolean, cents: boolean): string | undefined {
-  const magnitude = cents ? decimalFromCents(value) : decimalFromValue(value)
+function signedAmount(value: unknown, isCredit: boolean): string | undefined {
+  const magnitude = decimalFromCents(value)
   if (!magnitude) return undefined
   return isCredit ? magnitude : `-${magnitude}`
 }
 
-function cardAmount(payload: InvestecCardPayload): string | undefined {
-  const isCredit = cardCredit(payload)
-  // Investec's centsAmount/amount is the debit to the admitted account. The
-  // merchant currency is a separate evidence leg and must not relabel it.
-  return signedAmount(payload.centsAmount, isCredit, true)
-    ?? signedAmount(payload.amount, isCredit, false)
-}
-
-function cardOriginalAmount(payload: InvestecCardPayload, isCredit: boolean): string | undefined {
-  for (const key of ['originalCentsAmount', 'foreignCentsAmount']) {
-    const amount = signedAmount(payload[key], isCredit, true)
-    if (amount !== undefined) return amount
-  }
-  for (const key of ['originalAmount', 'foreignAmount']) {
-    const amount = signedAmount(payload[key], isCredit, false)
-    if (amount !== undefined) return amount
-  }
-  return undefined
-}
-
 function merchantName(payload: InvestecCardPayload): string {
   const merchant = record(payload.merchant)
-  return stringValue(merchant?.name) ?? 'Card purchase'
+  return stringValue(merchant?.name) ?? stringValue(payload.merchant) ?? 'Card purchase'
 }
 
 function cardNumber(payload: InvestecCardPayload): string | null {
@@ -132,8 +112,9 @@ function cardNumber(payload: InvestecCardPayload): string | null {
 }
 
 function observedAt(payload: InvestecCardPayload, receivedAt: unknown): string {
-  const candidate = stringValue(payload.dateTime) ?? stringValue(receivedAt)
-  if (candidate && Number.isFinite(Date.parse(candidate))) return new Date(candidate).toISOString()
+  for (const candidate of [stringValue(payload.dateTime), stringValue(receivedAt)]) {
+    if (candidate && Number.isFinite(Date.parse(candidate))) return new Date(candidate).toISOString()
+  }
   return new Date().toISOString()
 }
 
@@ -152,41 +133,39 @@ export function investecCardObservation(input: {
   readonly receivedAt?: string
 }): ObservationOutput | null {
   const isCredit = cardCredit(input.payload)
-  const amount = cardAmount(input.payload)
   const providerDateTime = stringValue(input.payload.dateTime)
+  const hasProviderDateTime = providerDateTime !== undefined && Number.isFinite(Date.parse(providerDateTime))
   const dateTime = observedAt(input.payload, input.receivedAt)
   const date = dateTime.slice(0, 10)
   const merchant = merchantName(input.payload)
   const reference = stringValue(input.payload.reference)
+  if (hasConflictingLifecycleIds(input.payload)) return null
   const lifecycleTransactionId = providerLifecycleTransactionId(input.payload)
-  if (!amount || !date || !/^[A-Z]{3}$/.test(input.accountCurrency)) return null
+  const accountCurrency = stringValue(input.accountCurrency)?.toUpperCase() ?? ''
+  const authorizationCurrency = stringValue(input.payload.currencyCode)?.toUpperCase()
+  // centsAmount and currencyCode are a single provider-described authorization
+  // leg. Never substitute the admitted account currency for missing evidence.
+  const amount = signedAmount(input.payload.centsAmount, isCredit)
+  if (!amount || !date || !/^[A-Z]{3}$/.test(accountCurrency)
+    || !authorizationCurrency || !/^[A-Z]{3}$/.test(authorizationCurrency)) return null
   const identity = reference
     ? `reference-${reference}`
     : `fingerprint-${sha256([input.providerAccountId, dateTime, amount, merchant].join('\x00')).slice(0, 32)}`
   const transactionId = `investec-card:${input.providerAccountId}:${identity}`
-  const accountCurrency = input.accountCurrency.toUpperCase()
-  const suppliedOriginalCurrency = stringValue(input.payload.currencyCode)?.toUpperCase()
-  if (suppliedOriginalCurrency !== undefined && !/^[A-Z]{3}$/.test(suppliedOriginalCurrency)) return null
   const cardDisplay = cardNumber(input.payload)
-  const providerOriginalAmount = cardOriginalAmount(input.payload, isCredit)
-  // Never manufacture a foreign/original leg from the admitted account leg.
-  // Investec's card amount is the account debit; a separate original leg is
-  // meaningful only when the provider supplies both its amount and currency.
-  const originalCurrency = suppliedOriginalCurrency !== undefined && providerOriginalAmount !== undefined
-    ? suppliedOriginalCurrency
-    : undefined
-  const originalAmount = originalCurrency === undefined ? undefined : providerOriginalAmount
-  const currencyEvidenceStatus = originalCurrency === undefined ? 'account_only' : 'provider_explicit'
+  const originalCurrency = authorizationCurrency
+  const originalAmount = decimalFromCents(input.payload.centsAmount)
+  if (!originalAmount) return null
+  const currencyEvidenceStatus = 'provider_explicit'
   const payload = Object.freeze({
     transactionId,
     accountId: input.providerAccountId,
     amount,
-    currency: accountCurrency,
-    ...(originalAmount === undefined ? {} : { originalAmount }),
-    ...(originalCurrency === undefined ? {} : { originalCurrency }),
-    settlementCurrency: accountCurrency,
+    currency: originalCurrency,
+    originalAmount,
+    originalCurrency,
+    ...(hasProviderDateTime ? { transactionDate: date } : {}),
     date,
-    transactionDate: date,
     authorizationDateTime: dateTime,
     description: merchant,
     sourceType: 'CARD',
@@ -202,13 +181,14 @@ export function investecCardObservation(input: {
       providerOwned: {
         investec: {
           accountCurrency,
-          ...(originalCurrency === undefined ? {} : { cardCurrency: originalCurrency }),
+          cardCurrency: originalCurrency,
           cardNumber: cardDisplay,
           currencyEvidence: {
             accountCurrency,
-            originalCurrency: originalCurrency ?? null,
-            originalAmount: originalAmount ?? null,
+            originalCurrency,
+            originalAmount,
             status: currencyEvidenceStatus,
+            settlementCurrency: null,
           },
         },
       },
@@ -218,7 +198,7 @@ export function investecCardObservation(input: {
       amount,
       providerHint: {
         ...(reference ? { reference } : {}),
-        ...(originalCurrency === undefined ? {} : { currency: originalCurrency }),
+        currency: originalCurrency,
       },
     }),
   })
@@ -228,7 +208,7 @@ export function investecCardObservation(input: {
   const semanticHash = sha256([
     input.deploymentId, input.localOwnerId, input.sourceResourceIncarnationId,
     'cash_ledger', transactionId, amount, accountCurrency, originalAmount ?? '', originalCurrency ?? '',
-    currencyEvidenceStatus, reference ? (providerDateTime ?? '') : dateTime,
+    currencyEvidenceStatus, reference ? (hasProviderDateTime ? providerDateTime : '') : dateTime,
     merchant, cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
   ].join('\x00'))
   return Object.freeze({
@@ -269,6 +249,7 @@ interface RetainedCardObservationRow {
   readonly payload: unknown
   readonly raw_payload: unknown
   readonly semantic_hash: string
+  readonly hash_specification_version: number
   readonly observed_at: string | Date
   readonly source_resource_incarnation_id: string
 }
@@ -308,35 +289,43 @@ export async function reprojectRetainedInvestecCards(
   const rows = await sql<RetainedCardObservationRow[]>`
     WITH latest AS (
       SELECT DISTINCT ON (source_resource_incarnation_id, payload->>'transactionId')
-        payload, raw_payload, semantic_hash, observed_at, source_resource_incarnation_id::text
+        payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id::text
       FROM raw_observations
       WHERE deployment_id = ${deploymentId}
         AND provider_version LIKE 'investec:card:%'
         AND raw_payload IS NOT NULL
       ORDER BY source_resource_incarnation_id, payload->>'transactionId', recorded_at DESC, observation_id DESC
     )
-    SELECT payload, raw_payload, semantic_hash, observed_at, source_resource_incarnation_id
+    SELECT payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id
     FROM latest
   `
   if (rows.length === 0) return 0
   const connections = await deps.loadConnections(deploymentId)
   const batches = new Map<string, { connection: RuntimeConnection; observations: ObservationOutput[] }>()
   const seen = new Set<string>()
+  let unresolved = false
   for (const row of rows) {
     const normalizedPayload = record(row.payload)
     const providerAccountId = stringValue(normalizedPayload?.accountId)
     const rawPayload = record(row.raw_payload)
-    if (!providerAccountId || !rawPayload) continue
+    if (!providerAccountId || !rawPayload) {
+      unresolved = true
+      continue
+    }
     let mapping: CardAccountMapping
     try {
       mapping = await exactRetainedCardAccount(sql, deploymentId, providerAccountId, row.source_resource_incarnation_id)
     } catch {
+      unresolved = true
       continue
     }
     const connection = connections.find(candidate => candidate.provider === 'investec'
       && candidate.connectionId === `${mapping.connection_id}:${mapping.provider_account_id}`
       && candidate.sourceResourceIncarnationId === row.source_resource_incarnation_id)
-    if (!connection) continue
+    if (!connection) {
+      unresolved = true
+      continue
+    }
     const observation = investecCardObservation({
       deploymentId,
       localOwnerId: connection.localOwnerId,
@@ -346,14 +335,23 @@ export async function reprojectRetainedInvestecCards(
       payload: rawPayload as InvestecCardPayload,
       receivedAt: row.observed_at instanceof Date ? row.observed_at.toISOString() : row.observed_at,
     })
-    if (!observation || observation.semanticHash === row.semantic_hash) continue
+    if (!observation) {
+      unresolved = true
+      continue
+    }
+    if (observation.semanticHash === row.semantic_hash
+      && row.hash_specification_version === HASH_SPECIFICATION_VERSION) continue
     const identity = `${connection.connectionId}:${observation.semanticHash}`
-    if (seen.has(identity)) continue
+    if (seen.has(identity)) {
+      unresolved = true
+      continue
+    }
     seen.add(identity)
     const batch = batches.get(connection.connectionId) ?? { connection, observations: [] }
     batch.observations.push(observation)
     batches.set(connection.connectionId, batch)
   }
+  if (unresolved) throw new Error('Investec retained card projection is unresolved')
   let reprojected = 0
   let failed = false
   for (const { connection, observations } of batches.values()) {

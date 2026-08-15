@@ -309,15 +309,25 @@ function providerDecimalField(transaction: InvestecTransaction, names: readonly 
   return undefined
 }
 
-function providerLifecycleTransactionId(transaction: InvestecTransaction): string | undefined {
+function providerLifecycleTransactionIds(transaction: InvestecTransaction): readonly string[] {
+  const ids = new Set<string>()
   for (const value of [
     transaction.providerLifecycleTransactionId, transaction.pendingTransactionId, transaction.postedTransactionId,
     transaction.settlementTransactionId, transaction.successorTransactionId,
     transaction.cardTransactionId, transaction.linkedTransactionId,
   ]) {
-    if (typeof value === 'string' && value.trim()) return value.trim()
+    if (typeof value === 'string' && value.trim()) ids.add(value.trim())
   }
-  return undefined
+  return [...ids]
+}
+
+function providerLifecycleTransactionId(transaction: InvestecTransaction): string | undefined {
+  const ids = providerLifecycleTransactionIds(transaction)
+  return ids.length === 1 ? ids[0] : undefined
+}
+
+function hasConflictingLifecycleIds(transaction: InvestecTransaction): boolean {
+  return providerLifecycleTransactionIds(transaction).length > 1
 }
 
 function providerCurrencyField(transaction: InvestecTransaction, names: readonly string[]): string | undefined {
@@ -455,6 +465,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
           const originalCurrency = providerCurrencyField(txn, ['originalCurrency', 'cardCurrency', 'foreignCurrency'])
           const settlementAmount = providerDecimalField(txn, ['settlementAmount', 'accountAmount', 'localAmount']) ?? signed
           const settlementCurrency = providerCurrencyField(txn, ['settlementCurrency', 'accountCurrency', 'localCurrency']) ?? rawCurrency
+          const lifecycleIdConflict = hasConflictingLifecycleIds(txn)
           const providerLifecycleId = providerLifecycleTransactionId(txn)
           const description = txn.description ?? null
           const namedUsdPocket = providerTransactionType === 'MCPBAPOCKETTRANSFERS'
@@ -498,8 +509,9 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             cardNumber: txn.cardNumber ? redact(txn.cardNumber) : null,
             reference: txn.reference ?? null,
             ...(providerLifecycleId === undefined ? {} : { providerLifecycleTransactionId: providerLifecycleId }),
+            ...(lifecycleIdConflict ? { providerLifecycleIdConflict: true } : {}),
             status: status.toLowerCase(),
-            ...(currencyEvidenceReview ? { needsReview: true } : {}),
+            ...(currencyEvidenceReview || lifecycleIdConflict ? { needsReview: true } : {}),
             ...(sourceGroupId === undefined ? {} : { sourceGroupId }),
             ...(identity.primeSaverIdentityKey === undefined ? {} : { primeSaverIdentityKey: identity.primeSaverIdentityKey }),
             metadata: {
@@ -513,6 +525,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
                   postingDate,
                   actionDate,
                   valueDate,
+                  ...(lifecycleIdConflict ? { providerLifecycleIdConflict: true } : {}),
                   ...(sourceGroupId === undefined ? {} : { pocketSourceGroupId: sourceGroupId }),
                   ...(currencyEvidence === undefined ? {} : { currencyEvidence }),
                 },

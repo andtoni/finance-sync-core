@@ -352,13 +352,12 @@ function transactionId(payload: Readonly<Record<string, unknown>>): string | und
   return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
-const INVESTEC_SAME_CURRENCY_TOLERANCE = 0.01
-
 interface InvestecCounterpart {
   readonly payload: Readonly<Record<string, unknown>>
   readonly providerVersion: string
   readonly semanticHash: string
   readonly observedAt: string
+  readonly provenance: 'provider-explicit' | 'provider-facts-exact'
 }
 
 interface InvestecAmbiguousCounterpart {
@@ -378,13 +377,21 @@ function normalizedText(value: unknown): string {
   return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ').toUpperCase() : ''
 }
 
-function numericMagnitude(value: unknown): number | undefined {
+interface CashDecimalMagnitude {
+  readonly units: bigint
+  readonly scale: number
+}
+
+function cashDecimalMagnitude(value: unknown): CashDecimalMagnitude | undefined {
   const text = typeof value === 'number' && Number.isFinite(value) ? String(value)
     : typeof value === 'string' && /^[+-]?\d+(?:\.\d+)?$/.test(value.trim()) ? value.trim()
       : undefined
   if (!text) return undefined
-  const number = Math.abs(Number(text))
-  return Number.isFinite(number) ? number : undefined
+  const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(text)
+  if (!match || match[2].length > 30 || (match[3]?.length ?? 0) > 12) return undefined
+  const fraction = match[3] ?? ''
+  const units = BigInt(`${match[2]}${fraction}`)
+  return { units: units < 0n ? -units : units, scale: fraction.length }
 }
 
 function sameCurrencyAmountWithinTolerance(
@@ -393,28 +400,116 @@ function sameCurrencyAmountWithinTolerance(
 ): boolean {
   const leftCurrency = normalizedText(left.currency)
   const rightCurrency = normalizedText(right.currency)
-  const leftAmount = numericMagnitude(left.amount)
-  const rightAmount = numericMagnitude(right.amount)
-  return Boolean(leftCurrency && leftCurrency === rightCurrency && leftAmount !== undefined && rightAmount !== undefined
-    && Math.abs(leftAmount - rightAmount) <= INVESTEC_SAME_CURRENCY_TOLERANCE)
+  const leftAmount = cashDecimalMagnitude(left.amount)
+  const rightAmount = cashDecimalMagnitude(right.amount)
+  if (!leftCurrency || leftCurrency !== rightCurrency || leftAmount === undefined || rightAmount === undefined) return false
+  const scale = Math.max(2, leftAmount.scale, rightAmount.scale)
+  const factor = (value: CashDecimalMagnitude) => value.units * 10n ** BigInt(scale - value.scale)
+  const difference = factor(leftAmount) - factor(rightAmount)
+  return (difference < 0n ? -difference : difference) <= 10n ** BigInt(scale - 2)
+}
+
+function terminalFour(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const digits = value.replace(/\D/g, '')
+  return digits.length >= 4 ? digits.slice(-4) : undefined
+}
+
+function currencyCode(value: unknown): string | undefined {
+  const normalized = normalizedText(value)
+  return /^[A-Z]{3}$/.test(normalized) ? normalized : undefined
+}
+
+function providerCardAccountCurrency(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const metadata = recordPayload(payload.metadata)
+  const owned = recordPayload(metadata?.providerOwned)
+  const investec = recordPayload(owned?.investec)
+  return currencyCode(investec?.accountCurrency)
+}
+
+function providerTransactionType(payload: Readonly<Record<string, unknown>>): string | undefined {
+  for (const value of [payload.transactionType, payload.sourceType]) {
+    const direct = normalizedText(value)
+    if (direct === 'CARDPURCHASES') return direct
+  }
+  const metadata = recordPayload(payload.metadata)
+  const owned = recordPayload(metadata?.providerOwned)
+  const investec = recordPayload(owned?.investec)
+  return normalizedText(investec?.providerTransactionType) || undefined
+}
+
+function providerDirection(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const value = normalizedText(payload.direction ?? payload.type)
+  return value === 'DEBIT' || value === 'CREDIT' ? value : undefined
+}
+
+function merchantMatches(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+  const cardMerchant = normalizedText(card.description).normalize('NFKC')
+  const postedMerchant = normalizedText(settled.description).normalize('NFKC')
+  if (!cardMerchant || cardMerchant.length < 3 || !postedMerchant) return false
+  const escaped = cardMerchant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return postedMerchant === cardMerchant || new RegExp(`^${escaped}(?:\\s|$)`).test(postedMerchant)
+}
+
+function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+  if (hasConflictingLifecycleIds(card) || hasConflictingLifecycleIds(settled)
+    || providerLifecycleTransactionId(card) || providerLifecycleTransactionId(settled)
+    || normalizedText(card.status) !== 'PENDING' || normalizedText(settled.status) !== 'POSTED'
+    || providerTransactionType(settled) !== 'CARDPURCHASES') return false
+  const cardFour = terminalFour(card.cardNumber)
+  const settledFour = terminalFour(settled.cardNumber)
+  if (!cardFour || !settledFour || cardFour !== settledFour) return false
+  const cardDate = typeof card.transactionDate === 'string' ? card.transactionDate : undefined
+  const settledDate = typeof settled.transactionDate === 'string' ? settled.transactionDate : undefined
+  if (!cardDate || !settledDate || cardDate !== settledDate) return false
+  const cardDirection = providerDirection(card)
+  if (!cardDirection || cardDirection !== providerDirection(settled)) return false
+  if (!merchantMatches(card, settled)) return false
+  const originalAmount = typeof card.originalAmount === 'string' ? card.originalAmount : undefined
+  const originalCurrency = currencyCode(card.originalCurrency)
+  const cardCurrency = currencyCode(card.currency)
+  const settlementAmount = settled.settlementAmount ?? settled.amount
+  const settlementCurrency = currencyCode(settled.settlementCurrency ?? settled.currency)
+  const accountCurrency = providerCardAccountCurrency(card)
+  const originalMagnitude = cashDecimalMagnitude(originalAmount)
+  const settlementMagnitude = cashDecimalMagnitude(settlementAmount)
+  if (!originalAmount || !originalCurrency || !cardCurrency || cardCurrency !== originalCurrency
+    || !settlementAmount || !settlementCurrency || !accountCurrency || settlementCurrency !== accountCurrency
+    || originalMagnitude === undefined || originalMagnitude.units <= 0n
+    || settlementMagnitude === undefined || settlementMagnitude.units <= 0n) return false
+  // Foreign authorization and account settlement magnitudes are intentionally
+  // incomparable; only equal currencies receive the strict tolerance check.
+  return originalCurrency !== settlementCurrency || sameCurrencyAmountWithinTolerance(
+    { amount: originalAmount, currency: originalCurrency },
+    { amount: settlementAmount, currency: settlementCurrency },
+  )
 }
 
 function counterpartFromRow(row: InvestecCounterpartRow): InvestecCounterpart | undefined {
   const payload = recordPayload(row.payload)
   if (!payload || !transactionId(payload) || !row.semantic_hash || !row.observed_at) return undefined
-  return { payload, providerVersion: row.provider_version, semanticHash: row.semantic_hash, observedAt: row.observed_at }
+  return { payload, providerVersion: row.provider_version, semanticHash: row.semantic_hash, observedAt: row.observed_at, provenance: 'provider-explicit' }
+}
+
+function providerLifecycleTransactionIds(payload: Readonly<Record<string, unknown>>): readonly string[] {
+  const ids = new Set<string>()
+  for (const key of [
+    'pendingTransactionId', 'postedTransactionId', 'settlementTransactionId',
+    'successorTransactionId', 'cardTransactionId', 'linkedTransactionId', 'providerLifecycleTransactionId',
+  ]) {
+    const value = payload[key]
+    if (typeof value === 'string' && value.trim()) ids.add(value.trim())
+  }
+  return [...ids]
 }
 
 function providerLifecycleTransactionId(payload: Readonly<Record<string, unknown>>): string | undefined {
-  for (const key of [
-    'pendingTransactionId', 'postedTransactionId', 'settlementTransactionId',
-    'successorTransactionId', 'cardTransactionId', 'linkedTransactionId',
-  ]) {
-    const value = payload[key]
-    if (typeof value === 'string' && value.trim()) return value.trim()
-  }
-  const normalized = payload.providerLifecycleTransactionId
-  return typeof normalized === 'string' && normalized.trim() ? normalized.trim() : undefined
+  const ids = providerLifecycleTransactionIds(payload)
+  return ids.length === 1 ? ids[0] : undefined
+}
+
+function hasConflictingLifecycleIds(payload: Readonly<Record<string, unknown>>): boolean {
+  return payload.providerLifecycleIdConflict === true || providerLifecycleTransactionIds(payload).length > 1
 }
 
 async function findInvestecCounterpart(
@@ -429,61 +524,110 @@ async function findInvestecCounterpart(
   const linkedTransactionId = payload ? providerLifecycleTransactionId(payload) : undefined
   const currentTransactionId = payload ? transactionId(payload) : undefined
   const isCard = observation.providerVersion.startsWith('investec:card:')
-  const counterpartPrefix = isCard ? 'investec:txn:%' : 'investec:card:%'
-  // Investec must provide the counterpart transaction ID explicitly. Shared
-  // references, amounts, merchants, dates, and FX ratios are not lifecycle
-  // linkage and are intentionally never used to mutate identity. A one-way
-  // provider link is sufficient: search the stored counterpart for a backlink
-  // when the arriving row does not repeat the link.
-  if (!accountId || (!linkedTransactionId && !currentTransactionId)) return undefined
+  if (!payload || !accountId || (!linkedTransactionId && !currentTransactionId)) return undefined
+  if (hasConflictingLifecycleIds(payload)) return { ambiguous: true }
   const currentPrefix = isCard ? 'investec:card:%' : 'investec:txn:%'
-  const rows = await sql<InvestecCounterpartRow[]>`
-    SELECT DISTINCT ON (payload->>'transactionId') payload, provider_version, semantic_hash, observed_at
-    FROM raw_observations
-    WHERE deployment_id = ${deploymentId}
-      AND local_owner_id = ${connection.localOwnerId}
-      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
-      AND (provider_version LIKE ${counterpartPrefix} OR provider_version LIKE ${currentPrefix})
-      AND payload->>'accountId' = ${accountId}
-      AND (
-        payload->>'transactionId' = ${linkedTransactionId ?? ''}
-        OR payload->>'transactionId' = ${currentTransactionId ?? ''}
-        OR payload->>'providerLifecycleTransactionId' = ${linkedTransactionId ?? ''}
-        OR payload->>'providerLifecycleTransactionId' = ${currentTransactionId ?? ''}
+  const counterpartPrefix = isCard ? 'investec:txn:%' : 'investec:card:%'
+  if (!isCard && (normalizedText(payload.status) !== 'POSTED' || providerTransactionType(payload) !== 'CARDPURCHASES')) return undefined
+  // Explicit lifecycle IDs remain authoritative and are resolved before the
+  // deliberately narrower provider-fact matcher below.
+  if (linkedTransactionId || currentTransactionId) {
+    const rows = await sql<InvestecCounterpartRow[]>`
+      WITH latest AS (
+        SELECT DISTINCT ON (payload->>'transactionId')
+          payload, provider_version, semantic_hash, hash_specification_version, observed_at,
+          deployment_id, local_owner_id, source_resource_incarnation_id
+        FROM raw_observations
+        WHERE deployment_id = ${deploymentId} AND local_owner_id = ${connection.localOwnerId}
+          AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+          AND (provider_version LIKE ${counterpartPrefix} OR provider_version LIKE ${currentPrefix})
+          AND payload->>'accountId' = ${accountId}
+        ORDER BY payload->>'transactionId', recorded_at DESC, observed_at DESC, observation_id DESC
       )
-    ORDER BY payload->>'transactionId', observed_at DESC, recorded_at DESC
-  `
-  const parsedRows = rows.map(counterpartFromRow).filter((row): row is InvestecCounterpart => row !== undefined)
-  const candidates = parsedRows.filter(candidate => {
-    if (!candidate.providerVersion.startsWith(isCard ? 'investec:txn:' : 'investec:card:')) return false
-    const candidateId = transactionId(candidate.payload)
-    const candidateLink = providerLifecycleTransactionId(candidate.payload)
-    return Boolean(candidateId && (
-      (linkedTransactionId !== undefined && candidateId === linkedTransactionId)
-      || (currentTransactionId !== undefined && candidateLink === currentTransactionId)
-    ))
-  })
-  if (candidates.length !== 1) return candidates.length > 1 ? { ambiguous: true } : undefined
+      SELECT payload, provider_version, semantic_hash, observed_at
+      FROM latest
+      WHERE payload->>'isRemoved' IS DISTINCT FROM 'true'
+        AND (payload->>'transactionId' = ${linkedTransactionId ?? ''}
+          OR payload->>'transactionId' = ${currentTransactionId ?? ''}
+          OR payload->>'providerLifecycleTransactionId' = ${linkedTransactionId ?? ''}
+          OR payload->>'providerLifecycleTransactionId' = ${currentTransactionId ?? ''})
+        AND NOT EXISTS (
+          SELECT 1 FROM observation_quarantines q
+          WHERE q.deployment_id = latest.deployment_id AND q.local_owner_id = latest.local_owner_id
+            AND q.source_resource_incarnation_id = latest.source_resource_incarnation_id
+            AND q.provider_version = latest.provider_version AND q.semantic_hash = latest.semantic_hash
+            AND q.hash_specification_version = latest.hash_specification_version
+        )
+    `
+    const parsed = rows.map(counterpartFromRow).filter((row): row is InvestecCounterpart => row !== undefined)
+    const candidates = parsed.filter(candidate => candidate.providerVersion.startsWith(isCard ? 'investec:txn:' : 'investec:card:')
+      && (isCard
+        ? normalizedText(candidate.payload.status) === 'POSTED' && providerTransactionType(candidate.payload) === 'CARDPURCHASES'
+        : normalizedText(candidate.payload.status) === 'PENDING')
+      && ((linkedTransactionId !== undefined && transactionId(candidate.payload) === linkedTransactionId)
+        || (currentTransactionId !== undefined && providerLifecycleTransactionId(candidate.payload) === currentTransactionId)))
+    if (candidates.length === 1) {
+      if (hasConflictingLifecycleIds(candidates[0].payload)) return { ambiguous: true }
+      const candidateLink = providerLifecycleTransactionId(candidates[0].payload)
+      if (candidateLink !== undefined && candidateLink !== currentTransactionId) return { ambiguous: true }
+      return candidates[0]
+    }
+    if (candidates.length > 1 || linkedTransactionId) return candidates.length > 1 ? { ambiguous: true } : undefined
+  }
 
-  const candidate = candidates[0]
-  const candidateId = transactionId(candidate.payload)
-  if (!candidateId || (providerLifecycleTransactionId(candidate.payload) !== undefined
-    && providerLifecycleTransactionId(candidate.payload) !== currentTransactionId)) {
-    return { ambiguous: true }
-  }
-  const currentLinks = parsedRows.filter(row => row.providerVersion.startsWith(isCard ? 'investec:card:' : 'investec:txn:')
-    && transactionId(row.payload) !== currentTransactionId
-    && providerLifecycleTransactionId(row.payload) === candidateId)
-  const counterpartLinks = parsedRows.filter(row => row.providerVersion.startsWith(isCard ? 'investec:txn:' : 'investec:card:')
-    && providerLifecycleTransactionId(row.payload) === currentTransactionId)
-  const currentLinkCount = currentLinks.length + (linkedTransactionId === candidateId ? 1 : 0)
-  if ((linkedTransactionId !== undefined ? currentLinkCount !== 1 : currentLinkCount !== 0)
-    || (providerLifecycleTransactionId(candidate.payload) !== undefined
-      ? counterpartLinks.length !== 1
-      : counterpartLinks.length !== 0)) {
-    return { ambiguous: true }
-  }
-  return candidate
+  const providerDate = typeof payload.transactionDate === 'string' ? payload.transactionDate : undefined
+  if (!providerDate) return undefined
+  const rows = await sql<InvestecCounterpartRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (payload->>'transactionId')
+        payload, provider_version, semantic_hash, hash_specification_version, observed_at
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId} AND local_owner_id = ${connection.localOwnerId}
+        AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+        AND payload->>'accountId' = ${accountId}
+        AND (provider_version LIKE 'investec:card:%' OR provider_version LIKE 'investec:txn:%')
+      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, provider_version, semantic_hash, observed_at
+    FROM latest
+    WHERE payload->>'transactionDate' = ${providerDate}
+      AND payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND (
+        (provider_version LIKE 'investec:card:%' AND payload->>'status' = 'pending')
+        OR (provider_version LIKE 'investec:txn:%' AND payload->>'status' = 'posted'
+          AND (
+            payload->>'transactionType' = 'CARDPURCHASES'
+            OR payload->'metadata'->'providerOwned'->'investec'->>'providerTransactionType' = 'CARDPURCHASES'
+          ))
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = ${deploymentId} AND q.local_owner_id = ${connection.localOwnerId}
+          AND q.source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+          AND q.provider_version = latest.provider_version AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  const all = rows.map(counterpartFromRow).filter((row): row is InvestecCounterpart => row !== undefined)
+  const cards = all.filter(row => row.providerVersion.startsWith('investec:card:'))
+  const settled = all.filter(row => row.providerVersion.startsWith('investec:txn:') && providerTransactionType(row.payload) === 'CARDPURCHASES')
+  const currentCandidates = isCard
+    ? settled.filter(row => exactProviderFactPair(payload, row.payload))
+    : cards.filter(row => exactProviderFactPair(row.payload, payload))
+  if (currentCandidates.length !== 1) return currentCandidates.length > 1 ? { ambiguous: true } : undefined
+  const candidate = currentCandidates[0]
+  const currentId = currentTransactionId
+  const cardRows = isCard
+    ? [{ payload, providerVersion: observation.providerVersion, semanticHash: observation.semanticHash, observedAt: observation.observedAt, provenance: 'provider-facts-exact' as const }, ...cards.filter(row => transactionId(row.payload) !== currentId)]
+    : cards
+  const settledRows = isCard
+    ? settled
+    : [{ payload, providerVersion: observation.providerVersion, semanticHash: observation.semanticHash, observedAt: observation.observedAt, provenance: 'provider-facts-exact' as const }, ...settled.filter(row => transactionId(row.payload) !== currentId)]
+  const reverseCount = isCard
+    ? cardRows.filter(card => exactProviderFactPair(card.payload, candidate.payload)).length
+    : settledRows.filter(posted => exactProviderFactPair(candidate.payload, posted.payload)).length
+  if (reverseCount !== 1) return { ambiguous: true }
+  return { ...candidate, provenance: 'provider-facts-exact' }
 }
 
 function markInvestecReconciliationReview(
@@ -508,6 +652,7 @@ function markInvestecReconciliationReview(
 function correlatedInvestecPayload(
   card: Readonly<Record<string, unknown>>,
   settled: Readonly<Record<string, unknown>>,
+  provenance: 'provider-explicit' | 'provider-facts-exact',
 ): Readonly<Record<string, unknown>> {
   const cardId = transactionId(card)
   const settledId = transactionId(settled)
@@ -561,7 +706,7 @@ function correlatedInvestecPayload(
         investecCorrelation: {
           cardTransactionId: cardId,
           settlementTransactionId: settledId,
-          confidence: 'provider-explicit',
+          confidence: provenance,
           originalCurrency: originalCurrency ?? null,
           settlementCurrency: settlementCurrency ?? null,
           sameCurrencyRoundingMatch: sameCurrencyAmountWithinTolerance(card, settled),
@@ -608,9 +753,10 @@ async function investecProjectionOperations(
   const currentIsCard = observation.providerVersion.startsWith('investec:card:')
   const card = currentIsCard ? current : counterpart.payload
   const settled = currentIsCard ? counterpart.payload : current
-  const correlated = correlatedInvestecPayload(card, settled)
+  const correlated = correlatedInvestecPayload(card, settled, counterpart.provenance)
   const lifecycleSemanticHash = createHash('sha256').update([
-    'investec-card-settlement-v2',
+    'investec-card-settlement-v3',
+    counterpart.provenance,
     transactionId(card)!, transactionId(settled)!,
     String(card.amount ?? ''), String(card.currency ?? ''),
     String(settled.settlementAmount ?? settled.amount ?? ''), String(settled.settlementCurrency ?? settled.currency ?? ''),

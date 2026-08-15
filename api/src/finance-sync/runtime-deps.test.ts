@@ -647,7 +647,7 @@ describe('Investec card and poll lifecycle correlation', () => {
     transactionId: 'settled-1', providerVersion: 'investec:txn:settled-1', semanticHash: 'settled-hash',
     observedAt: '2026-08-06T10:00:00.000Z', accountId: 'acc-1', amount: '-123.45', currency: 'ZAR',
     date: '2026-08-06', postingDate: '2026-08-06', settlementDate: '2026-08-06',
-    description: 'SYNTHETIC CARD MERCHANT', reference: 'ref-1', type: 'DEBIT',
+    description: 'SYNTHETIC CARD MERCHANT', reference: 'ref-1', type: 'DEBIT', transactionType: 'CARDPURCHASES',
     status: 'posted', providerLifecycleTransactionId: 'card-1',
   }
   const cardPayload = {
@@ -687,6 +687,160 @@ describe('Investec card and poll lifecycle correlation', () => {
     expect(activities.some(operation => operation.activity?.settlementCurrency === 'ZAR')).toBe(true)
     expect(activities.every(operation => operation.activity?.sourceGroupId === undefined)).toBe(true)
     expect(fixture.rawPayloads).toContainEqual({ wireTransactionId: currentPayload.transactionId })
+  })
+
+  const inferredSettledPayload = {
+    transactionId: 'facts-settled-1', providerVersion: 'investec:txn:facts-settled-1', semanticHash: 'facts-settled-hash',
+    observedAt: '2026-08-14T22:00:00.000Z', accountId: 'acc-1', amount: '-191.13', currency: 'ZAR',
+    settlementAmount: '-191.13', settlementCurrency: 'ZAR', date: '2026-08-14', transactionDate: '2026-08-14',
+    postingDate: '2026-08-14', settlementDate: '2026-08-14', description: 'DMI* ACME SALES & SERV ACME.COM US',
+    type: 'DEBIT', direction: 'DEBIT', transactionType: 'CARDPURCHASES', cardNumber: '400000xxxxxx0011', status: 'posted',
+  }
+  const inferredCardPayload = {
+    transactionId: 'facts-card-1', providerVersion: 'investec:card:facts-card-1', semanticHash: 'facts-card-hash',
+    observedAt: '2026-08-14T17:00:00.000Z', accountId: 'acc-1', amount: '-1349.99', currency: 'USD',
+    originalAmount: '1349.99', originalCurrency: 'USD', date: '2026-08-14', transactionDate: '2026-08-14',
+    authorizationDateTime: '2026-08-14T17:00:00.000Z', description: 'DMI* ACME SALES & SERV',
+    type: 'DEBIT', direction: 'DEBIT', transactionType: 'CARD', cardNumber: '400000XXXXXX0011', status: 'pending',
+    metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } },
+  }
+
+  it.each([
+    ['card-first', inferredCardPayload, [inferredSettledPayload]],
+    ['poll-first', inferredSettledPayload, [inferredCardPayload]],
+  ])('correlates exact provider facts without a lifecycle ID (%s)', async (_label, currentPayload, priorPayloads) => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000102', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, priorPayloads)
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: String(currentPayload.providerVersion), semanticHash: String(currentPayload.semanticHash),
+      hashSpecificationVersion: 4, observedAt: String(currentPayload.observedAt), domain: 'cash_ledger',
+      payload: currentPayload,
+    }], { skipCurrentState: true })
+    const activities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
+    expect(activities).toHaveLength(2)
+    expect(activities[0].lifecycleSuccessorId).toBeUndefined()
+    expect(activities[1].lifecycleSuccessorId).toContain(':facts-settled-1')
+    expect(activities[1].activity).toMatchObject({
+      status: 'POSTED', activityType: 'WITHDRAWAL', amount: '191.13', currency: 'ZAR',
+      originalAmount: '1349.99', originalCurrency: 'USD', settlementCurrency: 'ZAR',
+    })
+    expect(activities[1].activity?.metadata).toMatchObject({
+      providerOwned: { investecCorrelation: { confidence: 'provider-facts-exact' } },
+    })
+  })
+
+  it('leaves ambiguous exact provider facts visible without a lifecycle successor', async () => {
+    const secondSettled = { ...inferredSettledPayload, transactionId: 'facts-settled-2', providerVersion: 'investec:txn:facts-settled-2', semanticHash: 'facts-settled-hash-2', amount: '-192.00', settlementAmount: '-192.00' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000103', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [inferredSettledPayload, secondSettled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: inferredCardPayload.providerVersion, semanticHash: 'facts-card-ambiguous-hash',
+      hashSpecificationVersion: 4, observedAt: inferredCardPayload.observedAt, domain: 'cash_ledger',
+      payload: inferredCardPayload,
+    }], { skipCurrentState: true })
+    const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operation.lifecycleSuccessorId).toBeUndefined()
+    expect(operation.activity?.needsReview).toBe(true)
+  })
+
+  it('does not infer a lifecycle when equal-currency amounts differ', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'same-currency-card', providerVersion: 'investec:card:same-currency-card', semanticHash: 'same-currency-card-hash', currency: 'ZAR', originalCurrency: 'ZAR', originalAmount: '10.00', amount: '-10.00' }
+    const settled = { ...inferredSettledPayload, transactionId: 'same-currency-settled', providerVersion: 'investec:txn:same-currency-settled', semanticHash: 'same-currency-settled-hash', description: 'DMI* ACME SALES & SERV ACME.COM ZA', amount: '-12.00', settlementAmount: '-12.00' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000104', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operation.lifecycleSuccessorId).toBeUndefined()
+    expect(operation.activity?.needsReview).toBeUndefined()
+  })
+
+  it('does not infer a lifecycle from malformed currency evidence', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'malformed-currency-card', providerVersion: 'investec:card:malformed-currency-card', semanticHash: 'malformed-currency-card-hash', currency: 'USDX', originalCurrency: 'USDX' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000108', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [inferredSettledPayload])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operation.lifecycleSuccessorId).toBeUndefined()
+  })
+
+  it('does not infer a lifecycle when an explicit link is unresolved', async () => {
+    const linkedCard = { ...inferredCardPayload, providerLifecycleTransactionId: 'missing-settlement' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000105', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [inferredSettledPayload])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: linkedCard.providerVersion, semanticHash: 'linked-card-hash',
+      hashSpecificationVersion: 4, observedAt: linkedCard.observedAt, domain: 'cash_ledger', payload: linkedCard,
+    }], { skipCurrentState: true })
+    const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operation.lifecycleSuccessorId).toBeUndefined()
+  })
+
+  it('marks a conflicting explicit backlink ambiguous', async () => {
+    const conflictingCard = { ...inferredCardPayload, providerLifecycleTransactionId: 'facts-settled-1' }
+    const conflictingSettled = { ...inferredSettledPayload, providerLifecycleTransactionId: 'different-card' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000107', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [conflictingSettled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: conflictingCard.providerVersion, semanticHash: 'conflicting-card-hash',
+      hashSpecificationVersion: 4, observedAt: conflictingCard.observedAt, domain: 'cash_ledger', payload: conflictingCard,
+    }], { skipCurrentState: true })
+    const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operation.lifecycleSuccessorId).toBeUndefined()
+    expect(operation.activity?.needsReview).toBe(true)
+  })
+
+  it('does not infer a lifecycle for a pocket transfer', async () => {
+    const pocket = { ...inferredSettledPayload, transactionId: 'pocket-settled', providerVersion: 'investec:txn:pocket-settled', semanticHash: 'pocket-hash', transactionType: 'MCPBAPOCKETTRANSFERS', sourceType: 'MCPBAPOCKETTRANSFERS', providerLifecycleTransactionId: 'pocket-card' }
+    const pocketCard = { ...inferredCardPayload, providerLifecycleTransactionId: 'pocket-settled' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000106', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [pocket])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: pocketCard.providerVersion, semanticHash: 'pocket-card-hash',
+      hashSpecificationVersion: 4, observedAt: pocketCard.observedAt, domain: 'cash_ledger', payload: pocketCard,
+    }], { skipCurrentState: true })
+    const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operation.lifecycleSuccessorId).toBeUndefined()
   })
 
   it('does not invent original evidence while correlating a card without provider currency', async () => {

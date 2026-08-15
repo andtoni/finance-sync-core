@@ -173,6 +173,19 @@ describe('Investec adapter G5', () => {
     expect((r.quarantine[0] as any).transactionRef).toBe('\u2026uuid')
   })
 
+  it('marks conflicting lifecycle identifiers for review', async () => {
+    const r = await runInvestecAdapter(BASE_CONFIG, makeTransport([{
+      uuid: 'conflict-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', transactionType: 'CARDPURCHASES',
+      amount: '10.00', transactionDate: '2026-08-05', pendingTransactionId: 'card-1', postedTransactionId: 'card-2',
+    }], undefined))
+    const [observation] = transactionObservations(r)
+    expect(observation.payload).toMatchObject({ needsReview: true, providerLifecycleIdConflict: true })
+    expect(observation.payload.providerLifecycleTransactionId).toBeUndefined()
+    expect(observation.payload.metadata).toMatchObject({
+      providerOwned: { investec: { providerLifecycleIdConflict: true } },
+    })
+  })
+
   it('preserves provider type, all provider dates, and pocket grouping evidence', async () => {
     const transport = makeTransport([{
       uuid: 'pocket-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', transactionType: 'MCPBAPocketTransfers', amount: '10.00',
