@@ -136,7 +136,7 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql!, directory);
     await migrate(sql!, directory);
     const rows = await sql!`select version from finance_sync_schema_migrations order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     const rawColumns = await sql!`
       select column_name from information_schema.columns
       where table_name = 'raw_observations' and column_name = 'raw_payload'
