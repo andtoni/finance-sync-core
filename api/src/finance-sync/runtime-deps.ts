@@ -403,10 +403,11 @@ function sameCurrencyAmountWithinTolerance(
   const leftAmount = cashDecimalMagnitude(left.amount)
   const rightAmount = cashDecimalMagnitude(right.amount)
   if (!leftCurrency || leftCurrency !== rightCurrency || leftAmount === undefined || rightAmount === undefined) return false
-  const scale = Math.max(2, leftAmount.scale, rightAmount.scale)
+  // Card authorization and same-currency settlement are the same economic leg;
+  // a one-cent tolerance can silently pair unrelated provider facts.
+  const scale = Math.max(leftAmount.scale, rightAmount.scale)
   const factor = (value: CashDecimalMagnitude) => value.units * 10n ** BigInt(scale - value.scale)
-  const difference = factor(leftAmount) - factor(rightAmount)
-  return (difference < 0n ? -difference : difference) <= 10n ** BigInt(scale - 2)
+  return factor(leftAmount) === factor(rightAmount)
 }
 
 function terminalFour(value: unknown): string | undefined {
@@ -657,8 +658,8 @@ function correlatedInvestecPayload(
   const cardId = transactionId(card)
   const settledId = transactionId(settled)
   if (!cardId || !settledId) throw new Error('Investec correlation requires both transaction identities')
-  const settlementAmount = settled.settlementAmount ?? settled.amount
-  const settlementCurrency = settled.settlementCurrency ?? settled.currency
+  const settlementAmount = typeof settled.settlementAmount === 'string' ? settled.settlementAmount : undefined
+  const settlementCurrency = typeof settled.settlementCurrency === 'string' ? settled.settlementCurrency : undefined
   const cardMetadata = recordPayload(card.metadata)
   const settledMetadata = recordPayload(settled.metadata)
   const cardProviderOwned = recordPayload(cardMetadata?.providerOwned)
@@ -672,7 +673,7 @@ function correlatedInvestecPayload(
   const settledWithoutOriginalEvidence: Record<string, unknown> = { ...settled }
   delete settledWithoutOriginalEvidence.originalAmount
   delete settledWithoutOriginalEvidence.originalCurrency
-  const settlementDate = settled.settlementDate ?? settled.postingDate ?? settled.valueDate ?? settled.date
+  const settlementDate = typeof settled.settlementDate === 'string' ? settled.settlementDate : undefined
   return Object.freeze({
     ...settledWithoutOriginalEvidence,
     transactionId: settledId,
@@ -680,14 +681,14 @@ function correlatedInvestecPayload(
     // The posted ledger fact must use the settlement/account leg for native
     // cash economics. Preserve the card leg as original evidence instead of
     // making a USD amount look like ZAR account cash (or vice versa).
-    amount: settlementAmount,
-    currency: settlementCurrency,
+    amount: settled.amount,
+    currency: settled.currency,
     ...(originalAmount === undefined ? {} : { originalAmount }),
     ...(originalCurrency === undefined ? {} : { originalCurrency }),
-    settlementAmount,
-    settlementCurrency,
+    ...(settlementAmount === undefined ? {} : { settlementAmount }),
+    ...(settlementCurrency === undefined ? {} : { settlementCurrency }),
     date: card.date ?? settled.date,
-    settlementDate,
+    ...(settlementDate === undefined ? {} : { settlementDate }),
     sourceType: card.sourceType ?? 'CARD',
     subtype: card.subtype ?? 'CARD_PURCHASE',
     ...(card.authorizationDateTime === undefined ? {} : { authorizationDateTime: card.authorizationDateTime }),
@@ -759,8 +760,8 @@ async function investecProjectionOperations(
     counterpart.provenance,
     transactionId(card)!, transactionId(settled)!,
     String(card.amount ?? ''), String(card.currency ?? ''),
-    String(settled.settlementAmount ?? settled.amount ?? ''), String(settled.settlementCurrency ?? settled.currency ?? ''),
-    String(settled.settlementDate ?? settled.postingDate ?? settled.date ?? ''),
+    String(settled.settlementAmount ?? ''), String(settled.settlementCurrency ?? ''),
+    String(settled.settlementDate ?? ''),
     canonicalJson(correlated),
   ].join('\\x00'), 'utf8').digest('hex')
   const lifecycleObservation: ObservationOutput = {
@@ -894,6 +895,157 @@ export function createRuntimeDependencies(
     bridgeToken = readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
   }
 
+  const persistAndEnqueueTx = async (
+    tx: FinanceSyncSql,
+    connection: RuntimeConnection,
+    observations: readonly ObservationOutput[],
+    options?: PersistEnqueueOptions,
+  ): Promise<number> => {
+    await assertDurableAuthority(tx, deploymentId, connection)
+    let insertedCount = 0
+    const enrichedObservations: Array<{ observation: ObservationOutput; wealthfolioAccountId: string }> = []
+    for (const observation of observations) {
+      if (observation.deploymentId !== deploymentId
+        || observation.localOwnerId !== connection.localOwnerId
+        || observation.sourceResourceIncarnationId !== connection.sourceResourceIncarnationId) {
+        throw new Error('observation authority mismatch')
+      }
+      if (observation.domain === 'provider_audit') {
+        await tx`
+          INSERT INTO raw_observations (
+            deployment_id, local_owner_id, observation_id, source_resource_incarnation_id,
+            provider_version, semantic_hash, hash_specification_version, payload, raw_payload, observed_at
+          ) VALUES (
+            ${observation.deploymentId}, ${observation.localOwnerId}, gen_random_uuid(),
+            ${observation.sourceResourceIncarnationId}::uuid, ${observation.providerVersion},
+            ${observation.semanticHash}, ${observation.hashSpecificationVersion},
+            ${tx.json(observation.payload as never)},
+            ${observation.rawPayload === undefined ? null : tx.json(observation.rawPayload as never)},
+            ${observation.observedAt}
+          ) ON CONFLICT DO NOTHING
+        `
+        continue
+      }
+      let accountId = typeof observation.payload.accountId === 'string' ? observation.payload.accountId : undefined
+      if (observation.payload.isRemoved === true && !accountId) {
+        const transactionId = observation.payload.transactionId
+        if (typeof transactionId !== 'string' || !transactionId) throw new Error('removed transaction identity is required')
+        const prior = await tx<{ account_id: string }[]>`
+          SELECT payload->>'accountId' AS account_id
+          FROM raw_observations
+          WHERE deployment_id = ${deploymentId}
+            AND local_owner_id = ${connection.localOwnerId}
+            AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+            AND provider_version = ${`${connection.provider}:txn:${transactionId}`}
+            AND payload ? 'accountId'
+          ORDER BY recorded_at DESC
+          LIMIT 1
+        `
+        accountId = prior[0]?.account_id
+      }
+      if (!accountId || !connection.accountIds.includes(accountId)) throw new Error('provider account is outside the admitted connection scope')
+      const wealthfolioAccountId = connection.wealthfolioAccountIds[accountId]
+      if (!wealthfolioAccountId) throw new Error('provider account has no Wealthfolio mapping')
+      const enriched: ObservationOutput = observation.payload.accountId === accountId
+        ? observation
+        : { ...observation, payload: Object.freeze({ ...observation.payload, accountId }) }
+      const inserted = await tx`
+        INSERT INTO raw_observations (
+          deployment_id, local_owner_id, observation_id, source_resource_incarnation_id,
+          provider_version, semantic_hash, hash_specification_version, payload, raw_payload, observed_at
+        ) VALUES (
+          ${enriched.deploymentId}, ${enriched.localOwnerId}, gen_random_uuid(),
+          ${enriched.sourceResourceIncarnationId}::uuid, ${enriched.providerVersion},
+          ${enriched.semanticHash}, ${enriched.hashSpecificationVersion},
+          ${tx.json(enriched.payload as never)},
+          ${enriched.rawPayload === undefined ? null : tx.json(enriched.rawPayload as never)},
+          ${enriched.observedAt}
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING observation_id
+      `
+      insertedCount += inserted.length
+      enrichedObservations.push({ observation: enriched, wealthfolioAccountId })
+    }
+
+    // Derive projections only after the whole batch is visible in the raw
+    // evidence table. This lets a weak PrimeSaver correction observe its
+    // strong counterpart regardless of provider arrival order and suppress
+    // the weak upsert before it reaches the outbox. A durable quarantine is
+    // checked by the exact immutable observation identity before projection.
+    const projectableObservations: typeof enrichedObservations = []
+    for (const candidate of enrichedObservations) {
+      if (!(await observationIsQuarantined(tx, deploymentId, connection.localOwnerId, candidate.observation))) {
+        projectableObservations.push(candidate)
+      }
+    }
+    const currentStates = options?.skipCurrentState ? [] : assembleCurrentState(
+      connection.provider,
+      projectableObservations.map(candidate => candidate.observation),
+      connection.accountIds.map(providerAccountId => ({
+        providerAccountId,
+        accountId: connection.wealthfolioAccountIds[providerAccountId],
+      })),
+      {
+        providerConnectionId: connection.connectionId,
+        providerIncarnationId: connection.sourceResourceIncarnationId,
+        providerGeneration: connection.providerGeneration,
+      },
+    )
+    for (const { observation: enriched, wealthfolioAccountId } of projectableObservations) {
+      const supersededResourceIds = await investecSupersededResourceIds(tx, deploymentId, connection, enriched)
+      const projectedObservation = supersededResourceIds.length === 0
+        ? enriched
+        : { ...enriched, supersededResourceIds }
+      const operations = connection.provider === 'investec'
+        ? await investecProjectionOperations(
+          tx,
+          deploymentId,
+          connection,
+          projectedObservation,
+          connection.receiverAccessGeneration,
+          wealthfolioAccountId,
+          connection.connectionId,
+        )
+        : (() => {
+          const operation = providerObservationToBridge(
+            connection.provider,
+            projectedObservation,
+            connection.receiverAccessGeneration,
+            wealthfolioAccountId,
+            connection.connectionId,
+          )
+          return operation ? [operation] : []
+        })()
+      for (const operation of operations) await tx`
+        INSERT INTO projection_outbox (
+          deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
+        ) VALUES (
+          ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
+          ${operation.idempotencyKey}, ${tx.json(operation as never)}
+        )
+        ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
+      `
+    }
+    for (const current of currentStates) {
+      const operation = currentStateToBridge({
+        deploymentId,
+        localOwnerId: connection.localOwnerId,
+        sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+      }, current.payload, current.semanticHash, connection.receiverAccessGeneration, connection.connectionId)
+      await tx`
+        INSERT INTO projection_outbox (
+          deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
+        ) VALUES (
+          ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
+          ${operation.idempotencyKey}, ${tx.json(operation as never)}
+        )
+        ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
+      `
+    }
+    return insertedCount
+  }
+
   return {
     loadConnections: async () => {
       if (fixtureRuntime) {
@@ -914,135 +1066,20 @@ export function createRuntimeDependencies(
       `)[0]?.cursor ?? null
     },
     runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
-    persistAndEnqueue: async (connection, observations, options?: PersistEnqueueOptions) => sql.begin(async transaction => {
+    persistAndEnqueue: async (connection, observations, options?: PersistEnqueueOptions) =>
+      sql.begin(async transaction => persistAndEnqueueTx(
+        transaction as unknown as FinanceSyncSql,
+        connection,
+        observations,
+        options,
+      )),
+    persistAndEnqueueBatch: async batches => sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
-      await assertDurableAuthority(tx, deploymentId, connection)
-      let insertedCount = 0
-      const enrichedObservations: Array<{ observation: ObservationOutput; wealthfolioAccountId: string }> = []
-      for (const observation of observations) {
-        if (observation.deploymentId !== deploymentId
-          || observation.localOwnerId !== connection.localOwnerId
-          || observation.sourceResourceIncarnationId !== connection.sourceResourceIncarnationId) {
-          throw new Error('observation authority mismatch')
-        }
-        let accountId = typeof observation.payload.accountId === 'string' ? observation.payload.accountId : undefined
-        if (observation.payload.isRemoved === true && !accountId) {
-          const transactionId = observation.payload.transactionId
-          if (typeof transactionId !== 'string' || !transactionId) throw new Error('removed transaction identity is required')
-          const prior = await tx<{ account_id: string }[]>`
-            SELECT payload->>'accountId' AS account_id
-            FROM raw_observations
-            WHERE deployment_id = ${deploymentId}
-              AND local_owner_id = ${connection.localOwnerId}
-              AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
-              AND provider_version = ${`${connection.provider}:txn:${transactionId}`}
-              AND payload ? 'accountId'
-            ORDER BY recorded_at DESC
-            LIMIT 1
-          `
-          accountId = prior[0]?.account_id
-        }
-        if (!accountId || !connection.accountIds.includes(accountId)) throw new Error('provider account is outside the admitted connection scope')
-        const wealthfolioAccountId = connection.wealthfolioAccountIds[accountId]
-        if (!wealthfolioAccountId) throw new Error('provider account has no Wealthfolio mapping')
-        const enriched: ObservationOutput = observation.payload.accountId === accountId
-          ? observation
-          : { ...observation, payload: Object.freeze({ ...observation.payload, accountId }) }
-        const inserted = await tx`
-          INSERT INTO raw_observations (
-            deployment_id, local_owner_id, observation_id, source_resource_incarnation_id,
-            provider_version, semantic_hash, hash_specification_version, payload, raw_payload, observed_at
-          ) VALUES (
-            ${enriched.deploymentId}, ${enriched.localOwnerId}, gen_random_uuid(),
-            ${enriched.sourceResourceIncarnationId}::uuid, ${enriched.providerVersion},
-            ${enriched.semanticHash}, ${enriched.hashSpecificationVersion},
-            ${tx.json(enriched.payload as never)},
-            ${enriched.rawPayload === undefined ? null : tx.json(enriched.rawPayload as never)},
-            ${enriched.observedAt}
-          )
-          ON CONFLICT DO NOTHING
-          RETURNING observation_id
-        `
-        insertedCount += inserted.length
-        enrichedObservations.push({ observation: enriched, wealthfolioAccountId })
+      let inserted = 0
+      for (const batch of batches) {
+        inserted += await persistAndEnqueueTx(tx, batch.connection, batch.observations, batch.options)
       }
-
-      // Derive projections only after the whole batch is visible in the raw
-      // evidence table. This lets a weak PrimeSaver correction observe its
-      // strong counterpart regardless of provider arrival order and suppress
-      // the weak upsert before it reaches the outbox. A durable quarantine is
-      // checked by the exact immutable observation identity before projection.
-      const projectableObservations: typeof enrichedObservations = []
-      for (const candidate of enrichedObservations) {
-        if (!(await observationIsQuarantined(tx, deploymentId, connection.localOwnerId, candidate.observation))) {
-          projectableObservations.push(candidate)
-        }
-      }
-      const currentStates = options?.skipCurrentState ? [] : assembleCurrentState(
-        connection.provider,
-        projectableObservations.map(candidate => candidate.observation),
-        connection.accountIds.map(providerAccountId => ({
-          providerAccountId,
-          accountId: connection.wealthfolioAccountIds[providerAccountId],
-        })),
-        {
-          providerConnectionId: connection.connectionId,
-          providerIncarnationId: connection.sourceResourceIncarnationId,
-          providerGeneration: connection.providerGeneration,
-        },
-      )
-      for (const { observation: enriched, wealthfolioAccountId } of projectableObservations) {
-        const supersededResourceIds = await investecSupersededResourceIds(tx, deploymentId, connection, enriched)
-        const projectedObservation = supersededResourceIds.length === 0
-          ? enriched
-          : { ...enriched, supersededResourceIds }
-        const operations = connection.provider === 'investec'
-          ? await investecProjectionOperations(
-            tx,
-            deploymentId,
-            connection,
-            projectedObservation,
-            connection.receiverAccessGeneration,
-            wealthfolioAccountId,
-            connection.connectionId,
-          )
-          : (() => {
-            const operation = providerObservationToBridge(
-              connection.provider,
-              projectedObservation,
-              connection.receiverAccessGeneration,
-              wealthfolioAccountId,
-              connection.connectionId,
-            )
-            return operation ? [operation] : []
-          })()
-        for (const operation of operations) await tx`
-          INSERT INTO projection_outbox (
-            deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
-          ) VALUES (
-            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
-            ${operation.idempotencyKey}, ${tx.json(operation as never)}
-          )
-          ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
-        `
-      }
-      for (const current of currentStates) {
-        const operation = currentStateToBridge({
-          deploymentId,
-          localOwnerId: connection.localOwnerId,
-          sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
-        }, current.payload, current.semanticHash, connection.receiverAccessGeneration, connection.connectionId)
-        await tx`
-          INSERT INTO projection_outbox (
-            deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
-          ) VALUES (
-            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
-            ${operation.idempotencyKey}, ${tx.json(operation as never)}
-          )
-          ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
-        `
-      }
-      return insertedCount
+      return inserted
     }),
     projectPending: async connection => {
       if (!bridgeUrl || !bridgeToken) return { delivered: 0, failed: 0 }

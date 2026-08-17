@@ -7,6 +7,7 @@ export type CanonicalDomain =
   | 'security'
   | 'cost_basis'
   | 'order'
+  | 'provider_audit'
 
 export interface ObservationEnvelope {
   readonly deploymentId: string

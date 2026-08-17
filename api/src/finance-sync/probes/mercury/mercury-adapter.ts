@@ -210,15 +210,29 @@ export async function runMercurySync(
         const currency = txn.currency ?? account.currency ?? 'USD'
         const domain = mercuryResourceKind(account.type)
         const effectiveDate = txn.postedAt ?? txn.createdAt
-        const providerTimestamp = effectiveDate === null ? Number.NaN : Date.parse(effectiveDate)
-        if (Number.isFinite(providerTimestamp)) latestProviderTimestamp = Math.max(latestProviderTimestamp ?? providerTimestamp, providerTimestamp)
+        if (effectiveDate === null) {
+          // A Mercury transaction without either provider timestamp has no
+          // defensible ledger date. Quarantine it without substituting poll time.
+          transactionsObserved++
+          quarantinedTransactions++
+          paginationComplete = false
+          continue
+        }
+        const providerTimestamp = Date.parse(effectiveDate)
+        if (!Number.isFinite(providerTimestamp)) {
+          transactionsObserved++
+          quarantinedTransactions++
+          paginationComplete = false
+          continue
+        }
+        latestProviderTimestamp = Math.max(latestProviderTimestamp ?? providerTimestamp, providerTimestamp)
 
         const payload = {
           transactionId: txn.id,
           accountId: txn.accountId,
           amount: decimalString(txn.amount),
           currency,
-          date: effectiveDate ?? null,
+          date: effectiveDate,
           counterpartyName: txn.counterpartyName ?? null,
           bankDescription: txn.bankDescription ?? null,
           note: txn.note ?? null,

@@ -83,6 +83,23 @@ suite('runtime dependencies with PostgreSQL', () => {
     expect(recovered).toEqual({ observations: 2, outbox: 2 })
   })
 
+  it('rolls every grouped batch back when a later batch member fails authority', async () => {
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    const transactionId = `grouped-${runId}`
+    const valid = observation(transactionId, {
+      transactionId, accountId: 'provider-account', amount: '3', currency: 'USD', date: '2026-07-17',
+    })
+    const invalid = { ...valid, sourceResourceIncarnationId: 'b0000000-0000-0000-0000-000000000099' }
+    await expect(deps.persistAndEnqueueBatch?.([
+      { connection, observations: [valid], options: { skipCurrentState: true } },
+      { connection, observations: [invalid], options: { skipCurrentState: true } },
+    ])).rejects.toThrow(/observation authority mismatch/)
+    const [counts] = await sql`SELECT
+      (SELECT count(*)::int FROM raw_observations WHERE deployment_id=${deploymentId} AND payload->>'transactionId'=${transactionId}) observations,
+      (SELECT count(*)::int FROM projection_outbox WHERE deployment_id=${deploymentId} AND payload->>'resourceId' LIKE ${`%${transactionId}`}) outbox`
+    expect(counts).toEqual({ observations: 0, outbox: 0 })
+  })
+
   it('recovers removal account identity but suppresses unresolved visible deletion', async () => {
     const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
     const original = observation('removed', { transactionId: 'removed', accountId: 'provider-account', amount: '2', currency: 'USD', date: '2026-07-17' })

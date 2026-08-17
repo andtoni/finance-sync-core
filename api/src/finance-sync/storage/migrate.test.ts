@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -59,6 +59,14 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/REVOKE UPDATE, DELETE ON observation_quarantines FROM finance_sync_runtime/i);
     expect(sql).toMatch(/observation quarantines are append-only/i);
     expect(sql).toMatch(/'suppressed'/i);
+  });
+
+  it("defines append-only Card Code ingress quarantine", () => {
+    const sql = readFileSync(resolve(root, "0015_card_ingress_quarantine.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS card_ingress_quarantines/i);
+    expect(sql).toMatch(/envelope jsonb NOT NULL/i);
+    expect(sql).toMatch(/REVOKE UPDATE, DELETE ON card_ingress_quarantines FROM finance_sync_runtime/i);
+    expect(sql).toMatch(/card ingress quarantines are append-only/i);
   });
 
   it("rejects checksum drift", () => {

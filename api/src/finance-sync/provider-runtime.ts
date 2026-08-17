@@ -246,6 +246,22 @@ export function createProviderTransportFactories(env: ProviderRuntimeEnv = proce
           if (!Array.isArray(data.accounts)) throw new Error('invalid Investec accounts response')
           return data.accounts as Awaited<ReturnType<InvestecTransport['listAccounts']>>
         },
+        async listCards() {
+          const value = record(await get(new URL('/za/v1/cards', base)), 'invalid Investec cards response')
+          const data = record(value.data, 'invalid Investec cards response')
+          if (!Array.isArray(data.cards)) throw new Error('invalid Investec cards response')
+          return data.cards.map(card => {
+            const row = record(card, 'invalid Investec card response')
+            return { cardKey: typeof row.CardKey === 'string' ? row.CardKey : undefined, accountId: typeof row.AccountId === 'string' ? row.AccountId : undefined, accountNumber: typeof row.AccountNumber === 'string' ? row.AccountNumber : undefined }
+          })
+        },
+        async listCardExecutions(cardKey) {
+          if (!cardKey || !/^[A-Za-z0-9_-]+$/.test(cardKey)) throw new Error('invalid Investec card key')
+          const value = record(await get(new URL(`/za/v1/cards/${encodeURIComponent(cardKey)}/code/executions`, base)), 'invalid Investec card executions response')
+          const data = record(value.data, 'invalid Investec card executions response')
+          if (!Array.isArray(data.result)) throw new Error('invalid Investec card executions response')
+          return data.result as Awaited<ReturnType<NonNullable<InvestecTransport['listCardExecutions']>>>
+        },
         async getBalance(accountId) {
           const value = record(await get(new URL(`/za/pb/v1/accounts/${encodeURIComponent(accountId)}/balance`, base)), 'invalid Investec balance response')
           return record(value.data, 'invalid Investec balance response') as Awaited<ReturnType<InvestecTransport['getBalance']>>
@@ -431,7 +447,7 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
         toDate: new Date().toISOString().slice(0, 10),
       }, factories.investec(connection))
       if (!run.paginationComplete) throw new Error('Investec pagination did not complete')
-      return { observations: run.observations, nextCursor: null }
+      return { observations: run.observations, transferAccounts: run.transferAccounts, nextCursor: null }
     }
     case 'mercury': {
       const run = await runMercurySync({ ...connection, since: cursor ?? connection.since }, factories.mercury(connection))

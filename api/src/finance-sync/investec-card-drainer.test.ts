@@ -12,6 +12,18 @@ const input = {
 }
 
 describe('Investec card observations', () => {
+  it('masks full PANs in normalized card evidence', () => {
+    const observation = investecCardObservation({
+      ...input,
+      payload: {
+        accountNumber: '90000000000', centsAmount: 1234, currencyCode: 'usd', type: 'card',
+        dateTime: '2026-01-05T16:00:00.000Z', reference: 'PAN-TEST',
+        merchant: { name: 'SYNTHETIC MERCHANT' }, card: { display: '4111 1111 1111 1111' },
+      },
+    })
+    expect(observation?.payload.cardNumber).toBe('••••1111')
+    expect(JSON.stringify(observation?.payload)).not.toContain('4111111111111111')
+  })
   it('preserves a card authorization as an explicitly pending native cash fact', () => {
     const observation = investecCardObservation({
       ...input,
@@ -69,7 +81,12 @@ describe('Investec card observations', () => {
       const text = strings.join('?')
       if (/FROM raw_observations/i.test(text)) return [{
         payload: { transactionId: 'investec-card:provider-account:reference-TEST-REF-002', accountId: 'provider-account' },
-        raw_payload: rawPayload,
+        raw_payload: {
+          schemaVersion: 1,
+          eventType: 'after_transaction',
+          providerEventTime: rawPayload.dateTime,
+          transaction: rawPayload,
+        },
         semantic_hash: 'old-hash', hash_specification_version: 3, observed_at: '2026-01-06T02:31:00.000Z',
         source_resource_incarnation_id: connection.sourceResourceIncarnationId,
       }]
@@ -201,7 +218,7 @@ describe('Investec card observations', () => {
     expect(first?.hashSpecificationVersion).toBe(4)
   })
 
-  it('falls back to receipt time without admitting an invalid provider date', () => {
+  it('rejects an invalid provider authorization time instead of using receipt time', () => {
     const observation = investecCardObservation({
       ...input,
       receivedAt: '2026-01-05T16:00:00.000Z',
@@ -210,9 +227,16 @@ describe('Investec card observations', () => {
         reference: 'invalid-date-1', merchant: { name: 'SYNTHETIC MERCHANT' },
       },
     })
-    expect(observation?.observedAt).toBe('2026-01-05T16:00:00.000Z')
-    expect(observation?.payload.date).toBe('2026-01-05')
-    expect(observation?.payload.transactionDate).toBeUndefined()
+    expect(observation).toBeNull()
+    for (const dateTime of ['2026-01-05', '2026-01-05T16:00:00', '2026-02-30T16:00:00Z']) {
+      expect(investecCardObservation({
+        ...input,
+        payload: {
+          centsAmount: 1234, currencyCode: 'usd', type: 'card', dateTime,
+          reference: 'invalid-date-2', merchant: { name: 'SYNTHETIC MERCHANT' },
+        },
+      })).toBeNull()
+    }
   })
 
   it('hashes a newly supplied provider authorization time even with a stable reference', () => {

@@ -2,6 +2,8 @@
 import { createHash } from 'node:crypto'
 import type { CanonicalDomain } from '../../domain'
 import { merchantContext } from '../shared/merchant-context'
+import { recoverInvestecCardExecution, sanitizeInvestecCardEnvelope } from '../../investec-card-code-v1'
+import { investecCardObservation } from '../../investec-card-observation'
 
 export function investecResourceKind(): CanonicalDomain {
   return 'cash_ledger'
@@ -33,6 +35,9 @@ interface InvestecTransaction {
   readonly actionDate?: string
   readonly transactionDate?: string
   readonly valueDate?: string
+  readonly settlementDate?: string
+  readonly settlementAmount?: string | number
+  readonly settlementCurrency?: string
   readonly description?: string
   readonly reference?: string
   readonly cardNumber?: string
@@ -46,8 +51,23 @@ interface InvestecTransaction {
   readonly providerLifecycleTransactionId?: string
 }
 
+export interface InvestecCardExecution {
+  readonly executionId?: string
+  readonly sandbox?: boolean
+  readonly type?: string
+  readonly authorizationApproved?: boolean | null
+  readonly logs?: readonly { createdAt?: string; content?: string }[]
+  readonly completedAt?: string
+  readonly error?: unknown
+  readonly Error?: unknown
+  readonly [key: string]: unknown
+}
+
 export interface InvestecTransport {
   listAccounts(): Promise<readonly { accountId: string; productName?: string; accountName?: string; accountNumber?: string; referenceName?: string }[]>
+  /** Official Card API audit/backstop; callers must ignore sandbox or incomplete executions. */
+  listCards?(): Promise<readonly { cardKey?: string; accountId?: string; accountNumber?: string }[]>
+  listCardExecutions?(cardKey: string): Promise<readonly InvestecCardExecution[]>
   getBalance(accountId: string): Promise<{ currency?: string; currentBalance?: string | number; availableBalance?: string | number }>
   getTransactionPage(accountId: string, window: { fromDate: string; toDate: string }, cursor?: string): Promise<{
     transactions: readonly InvestecTransaction[]
@@ -104,6 +124,7 @@ export async function discoverInvestecAccounts(
 
 export interface InvestecAdapterResult {
   readonly accounts: readonly { accountRef: string; eligible: boolean; currency: string; displayName: string }[]
+  readonly transferAccounts: Readonly<Record<string, string>>
   readonly observations: readonly ObservationOutput[]
   readonly quarantine: readonly { reason: string; accountRef: string; transactionRef?: string }[]
   readonly pagesPolled: number
@@ -111,7 +132,7 @@ export interface InvestecAdapterResult {
   readonly nextCursor: string | null
 }
 
-const HASH_SPEC_VERSION = 3
+const HASH_SPEC_VERSION = 4
 const PRIME_SAVER_IDENTITY_VERSION = 2
 
 function sha256(input: string): string {
@@ -348,6 +369,133 @@ function pocketSourceGroupId(
   return groupReference ? `investec:pocket:${providerScope}:${groupReference}` : undefined
 }
 
+function normalizedAccountNumber(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const digits = value.replace(/\D/g, '')
+  return digits.length >= 4 ? digits : undefined
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || value === undefined) return 'null'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (typeof value === 'object') return `{${Object.keys(value as object).sort().map(key => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`).join(',')}}`
+  return JSON.stringify(value)
+}
+
+function sanitizeAuditEvidence(value: unknown, key = '', parentKey = ''): unknown {
+  if (typeof value === 'string' && key === 'content') {
+    try { return JSON.stringify(sanitizeAuditEvidence(JSON.parse(value))) } catch { return value }
+  }
+  const panField = /(?:^pan$|cardnumber|card_number|display)/i.test(key)
+    || (parentKey.toLowerCase() === 'card' && key.toLowerCase() === 'number')
+  if (panField && (typeof value === 'string' || typeof value === 'number')) {
+    const digits = String(value).replace(/\D/g, '')
+    return digits.length >= 4 ? `••••${digits.slice(-4)}` : '[REDACTED]'
+  }
+  if (Array.isArray(value)) return value.map(item => sanitizeAuditEvidence(item, key, parentKey))
+  if (value && typeof value === 'object') return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .map(([name, item]) => [name, sanitizeAuditEvidence(item, name, key)]),
+  )
+  return value
+}
+
+function cardAuditObservation(config: InvestecAdapterConfig, execution: InvestecCardExecution, accountId: string | null, cardKey: string | null, outcome: string, reason: string): ObservationOutput | null {
+  const executionId = typeof execution.executionId === 'string' ? execution.executionId.trim() : ''
+  if (!executionId) return null
+  const payload = Object.freeze({ auditType: 'INVESTEC_CARD_EXECUTION', executionId, cardKey, accountId, outcome, reason })
+  const rawPayload = sanitizeAuditEvidence(execution)
+  return Object.freeze({ deploymentId: config.deploymentId, localOwnerId: config.localOwnerId, sourceResourceIncarnationId: config.sourceResourceIncarnationId, providerVersion: `investec:card-execution:${executionId}`, semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'investec_card_audit', executionId, canonicalJson(rawPayload), outcome, reason].join('\x00')), hashSpecificationVersion: HASH_SPEC_VERSION, domain: 'provider_audit', payload, rawPayload, observedAt: typeof execution.completedAt === 'string' && Number.isFinite(Date.parse(execution.completedAt)) ? new Date(execution.completedAt).toISOString() : new Date().toISOString() })
+}
+
+async function collectInvestecCardExecutions(
+  config: InvestecAdapterConfig,
+  transport: InvestecTransport,
+  accounts: readonly { accountId: string; accountNumber?: string }[],
+  accountCurrencies: ReadonlyMap<string, string>,
+  observations: ObservationOutput[],
+): Promise<void> {
+  if (!transport.listCards || !transport.listCardExecutions) return
+  const cards = await transport.listCards()
+  const uniqueAccounts = (rows: readonly { accountId: string; accountNumber?: string }[]) =>
+    [...new Map(rows.map(account => [account.accountId, account])).values()]
+
+  for (const card of cards) {
+    const cardKey = typeof card.cardKey === 'string' && card.cardKey.trim() ? card.cardKey.trim() : undefined
+    if (!cardKey) throw new Error('Investec Card API returned a card without a stable key')
+    const explicitAccountId = typeof card.accountId === 'string' && card.accountId.trim()
+      ? card.accountId.trim()
+      : undefined
+    const explicitAccountNumber = normalizedAccountNumber(card.accountNumber)
+    const byId = explicitAccountId
+      ? uniqueAccounts(accounts.filter(account => account.accountId === explicitAccountId))
+      : []
+    const byNumber = explicitAccountNumber
+      ? uniqueAccounts(accounts.filter(account => normalizedAccountNumber(account.accountNumber) === explicitAccountNumber))
+      : []
+
+    let mapped: { accountId: string; accountNumber?: string } | undefined
+    let mappingReason = 'AMBIGUOUS_CARD_ACCOUNT'
+    if (explicitAccountId && explicitAccountNumber) {
+      if (byId.length === 1 && byNumber.length === 1 && byId[0].accountId === byNumber[0].accountId) {
+        mapped = byId[0]
+      } else {
+        mappingReason = 'CONFLICTING_CARD_ACCOUNT_IDENTIFIERS'
+      }
+    } else {
+      const candidates = explicitAccountId ? byId : byNumber
+      if (candidates.length === 1) mapped = candidates[0]
+    }
+
+    const executions = await transport.listCardExecutions(cardKey)
+    for (const execution of executions) {
+      const executionId = typeof execution.executionId === 'string' ? execution.executionId.trim() : ''
+      if (!executionId) continue
+      const recovered = recoverInvestecCardExecution(execution)
+      let authorization: ObservationOutput | null = null
+      if (recovered && mapped) {
+        authorization = investecCardObservation({
+          deploymentId: config.deploymentId,
+          localOwnerId: config.localOwnerId,
+          sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+          providerAccountId: mapped.accountId,
+          accountCurrency: accountCurrencies.get(mapped.accountId) ?? '',
+          payload: recovered.transaction as never,
+          receivedAt: recovered.providerEventTime,
+        })
+      }
+
+      const outcome = authorization ? 'AUTHORIZATION_RECOVERED' : 'AUDIT_ONLY'
+      const reason = authorization
+        ? 'COMPLETE_AFTER_TRANSACTION'
+        : !mapped
+          ? mappingReason
+          : recovered
+            ? 'AUTHORIZATION_NORMALIZATION_FAILED'
+            : 'INCOMPLETE_OR_NON_TRANSACTION'
+      const audit = cardAuditObservation(
+        config,
+        execution,
+        mapped?.accountId ?? null,
+        cardKey,
+        outcome,
+        reason,
+      )
+      if (audit) observations.push(audit)
+      if (!authorization || !recovered) continue
+      observations.push(Object.freeze({
+        ...authorization,
+        rawPayload: sanitizeInvestecCardEnvelope({
+          schemaVersion: 1,
+          eventType: recovered.eventType,
+          providerEventTime: recovered.providerEventTime,
+          transaction: recovered.transaction,
+        }),
+      }))
+    }
+  }
+}
+
 export async function runInvestecAdapter(config: InvestecAdapterConfig, transport: InvestecTransport): Promise<InvestecAdapterResult> {
   const eligibleSet = new Set(config.eligibleProductNames)
   const admittedAccounts = config.accountIds ? new Set(config.accountIds) : undefined
@@ -355,6 +503,8 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
   const accounts: { accountRef: string; eligible: boolean; currency: string; displayName: string }[] = []
   const observations: ObservationOutput[] = []
   const quarantine: { reason: string; accountRef: string; transactionRef?: string }[] = []
+  const accountCurrencies = new Map<string, string>()
+  const transferAccounts: Record<string, string> = {}
   let pagesPolled = 0
   let paginationComplete = true
   let nextCursor: string | null = null
@@ -380,6 +530,9 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
     }
     const displayName = account.accountName ?? account.productName ?? accountRef
     accounts.push({ accountRef, eligible: true, currency: rawCurrency, displayName })
+    const fullAccountNumber = normalizedAccountNumber(account.accountNumber)
+    if (fullAccountNumber) transferAccounts[account.accountId] = fullAccountNumber
+    accountCurrencies.set(account.accountId, rawCurrency)
     const currentBalance = investecDecimal(balance.currentBalance)
     if (currentBalance === null) {
       quarantine.push({ reason: 'MISSING_CURRENT_BALANCE', accountRef })
@@ -463,8 +616,9 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
           const fxRate = providerDecimalField(txn, ['fxRate', 'exchangeRate', 'conversionRate'])
           const originalAmount = providerDecimalField(txn, ['originalAmount', 'cardAmount', 'foreignAmount'])
           const originalCurrency = providerCurrencyField(txn, ['originalCurrency', 'cardCurrency', 'foreignCurrency'])
-          const settlementAmount = providerDecimalField(txn, ['settlementAmount', 'accountAmount', 'localAmount']) ?? signed
-          const settlementCurrency = providerCurrencyField(txn, ['settlementCurrency', 'accountCurrency', 'localCurrency']) ?? rawCurrency
+          const settlementAmount = providerDecimalField(txn, ['settlementAmount'])
+          const settlementCurrency = providerCurrencyField(txn, ['settlementCurrency'])
+          const settlementDate = providerField(txn, ['settlementDate'])
           const lifecycleIdConflict = hasConflictingLifecycleIds(txn)
           const providerLifecycleId = providerLifecycleTransactionId(txn)
           const description = txn.description ?? null
@@ -488,8 +642,8 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             accountRef: redact(account.accountId),
             amount: signed,
             currency: rawCurrency,
-            settlementAmount,
-            settlementCurrency,
+            ...(settlementAmount === undefined ? {} : { settlementAmount }),
+            ...(settlementCurrency === undefined ? {} : { settlementCurrency }),
             ...(fee === undefined ? {} : { fee }),
             ...(tax === undefined ? {} : { tax }),
             ...(fxRate === undefined ? {} : { fxRate }),
@@ -499,7 +653,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             postingDate,
             actionDate,
             valueDate,
-            settlementDate: postingDate ?? valueDate,
+            ...(settlementDate === undefined ? {} : { settlementDate }),
             description,
             type: providerDirection,
             direction: providerDirection,
@@ -552,7 +706,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             semanticHash: sha256(semanticStr),
             hashSpecificationVersion: HASH_SPEC_VERSION,
             domain: 'cash_ledger',
-            payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+            payload: payload as Readonly<Record<string, unknown>>,
             rawPayload: txn,
             // Account transaction dates are date-only facts. Keep the real poll
             // observation time here rather than fabricating a midnight timestamp.
@@ -569,5 +723,160 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
     }
     if (!accountComplete) paginationComplete = false
   }
-  return Object.freeze({ accounts, observations, quarantine, pagesPolled, paginationComplete, nextCursor })
+  if (paginationComplete) {
+    const admittedCardAccounts = allAccounts.filter(account => !admittedAccounts || admittedAccounts.has(account.accountId))
+    await collectInvestecCardExecutions(
+      config,
+      transport,
+      admittedCardAccounts,
+      accountCurrencies,
+      observations,
+    )
+  }
+  if (paginationComplete) correlateExactOwnAccountTransfers(observations, allAccounts, config)
+  const finalizedObservations = observations.map(observation => {
+    const payload = Object.freeze({ ...observation.payload })
+    const semanticHash = observation.domain === 'cash_ledger'
+      && (payload.activityType !== undefined || payload.sourceGroupId !== undefined)
+      ? sha256([
+        config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
+        'cash_ledger', JSON.stringify(payload), 'investec-transfer-pair-v1',
+      ].join('\x00'))
+      : observation.semanticHash
+    return Object.freeze({ ...observation, payload, semanticHash })
+  })
+  return Object.freeze({ accounts, transferAccounts: Object.freeze(transferAccounts), observations: finalizedObservations, quarantine, pagesPolled, paginationComplete, nextCursor })
+}
+
+interface TransferCandidate {
+  readonly observation: ObservationOutput
+  readonly payload: Record<string, unknown>
+  readonly accountNumber: string
+  readonly direction: 'CREDIT' | 'DEBIT'
+  readonly amount: string
+  readonly currency: string
+  readonly date: string
+}
+
+function normalizedDecimal(value: unknown): string | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') return undefined
+  const text = String(value).trim().replace(/^\+/, '')
+  if (!/^-?\d+(?:\.\d+)?$/.test(text)) return undefined
+  const negative = text.startsWith('-')
+  const unsigned = text.replace(/^-/, '')
+  const [whole, fraction = ''] = unsigned.split('.')
+  const normalizedWhole = whole.replace(/^0+(?=\d)/, '') || '0'
+  const normalizedFraction = fraction.replace(/0+$/, '')
+  const magnitude = normalizedFraction ? `${normalizedWhole}.${normalizedFraction}` : normalizedWhole
+  return negative && magnitude !== '0' ? `-${magnitude}` : magnitude
+}
+
+function transferNarrative(payload: Readonly<Record<string, unknown>>): string {
+  return [payload.description, payload.reference].filter(value => typeof value === 'string').join(' ')
+}
+
+function narrativeContainsAccountNumber(payload: Readonly<Record<string, unknown>>, accountNumber: string): boolean {
+  if (!accountNumber) return false
+  for (const value of [payload.description, payload.reference]) {
+    if (typeof value !== 'string') continue
+    // Permit spaces/dashes within the account number, but do not allow digits
+    // from separate narrative fields or unrelated digit runs to concatenate.
+    const pattern = accountNumber.split('').join('[\\s-]*')
+    if (new RegExp(`(?:^|\\D)${pattern}(?:$|\\D)`).test(value)) return true
+  }
+  return false
+}
+
+export function correlateInvestecTransferObservations(
+  observations: readonly ObservationOutput[],
+  accountNumbers: Readonly<Record<string, string>>,
+  providerConnectionId: string,
+): ObservationOutput[] {
+  const cloned = observations.map(observation => ({ ...observation, payload: { ...observation.payload } }))
+  correlateExactOwnAccountTransfers(
+    cloned,
+    Object.entries(accountNumbers).map(([accountId, accountNumber]) => ({ accountId, accountNumber })),
+    { providerConnectionId, sourceResourceIncarnationId: providerConnectionId, deploymentId: observations[0]?.deploymentId ?? '', localOwnerId: observations[0]?.localOwnerId ?? '', fromDate: '', toDate: '', eligibleProductNames: [] },
+  )
+  return cloned
+}
+
+export function finalizeInvestecObservations(observations: readonly ObservationOutput[]): readonly ObservationOutput[] {
+  return observations.map(observation => {
+    const payload = Object.freeze({ ...observation.payload })
+    const semanticHash = observation.domain === 'cash_ledger'
+      && (payload.activityType !== undefined || payload.sourceGroupId !== undefined)
+      ? sha256([observation.deploymentId, observation.localOwnerId, observation.sourceResourceIncarnationId, 'cash_ledger', JSON.stringify(payload), 'investec-transfer-pair-v1'].join('\x00'))
+      : observation.semanticHash
+    return Object.freeze({ ...observation, payload, semanticHash })
+  })
+}
+
+function correlateExactOwnAccountTransfers(
+  observations: ObservationOutput[],
+  accounts: readonly { accountId: string; accountNumber?: string }[],
+  config: InvestecAdapterConfig,
+): void {
+  const accountNumbers = new Map<string, string>()
+  const invalidAccounts = new Set<string>()
+  const usedNumbers = new Map<string, string>()
+  for (const account of accounts) {
+    const accountId = typeof account.accountId === 'string' ? account.accountId : ''
+    const number = normalizedAccountNumber(account.accountNumber)
+    if (!accountId || !number || invalidAccounts.has(accountId)) continue
+    const existing = accountNumbers.get(accountId)
+    const owner = usedNumbers.get(number)
+    if ((existing && existing !== number) || (owner && owner !== accountId)) {
+      invalidAccounts.add(accountId)
+      if (existing) accountNumbers.delete(accountId)
+      if (owner && owner !== accountId) {
+        invalidAccounts.add(owner)
+        accountNumbers.delete(owner)
+      }
+      continue
+    }
+    accountNumbers.set(accountId, number)
+    usedNumbers.set(number, accountId)
+  }
+  const candidates: TransferCandidate[] = []
+  for (const observation of observations) {
+    if (observation.domain !== 'cash_ledger') continue
+    const payload = observation.payload as Record<string, unknown>
+    const sourceType = identityText(payload.sourceType)
+    if (sourceType === 'MCPBAPOCKETTRANSFERS' || sourceType === 'CARD' || payload.providerLifecycleIdConflict === true) continue
+    const accountId = typeof payload.accountId === 'string' ? payload.accountId : ''
+    const accountNumber = accountNumbers.get(accountId)
+    const direction = identityText(payload.direction ?? payload.type)
+    const amount = normalizedDecimal(payload.amount)
+    const currency = identityText(payload.currency)
+    const date = typeof payload.transactionDate === 'string' ? payload.transactionDate
+      : typeof payload.date === 'string' ? payload.date : ''
+    if (!accountNumber || invalidAccounts.has(accountId) || !['CREDIT', 'DEBIT'].includes(direction) || !amount || !currency || !date) continue
+    candidates.push({ observation, payload, accountNumber, direction: direction as 'CREDIT' | 'DEBIT', amount: amount.replace(/^-/, ''), currency, date })
+  }
+  const edges = new Map<TransferCandidate, TransferCandidate[]>()
+  for (const candidate of candidates) {
+    const counterparties = candidates.filter(other => other !== candidate
+      && other.payload.accountId !== candidate.payload.accountId
+      && other.direction !== candidate.direction
+      && other.amount === candidate.amount
+      && other.currency === candidate.currency
+      && other.date === candidate.date
+      && narrativeContainsAccountNumber(candidate.payload, accountNumbers.get(String(other.payload.accountId)) ?? '')
+      && narrativeContainsAccountNumber(other.payload, candidate.accountNumber))
+    edges.set(candidate, counterparties)
+  }
+  for (const [candidate, counterparties] of edges) {
+    if (counterparties.length !== 1) continue
+    const counterpart = counterparties[0]
+    if (edges.get(counterpart)?.length !== 1 || edges.get(counterpart)?.[0] !== candidate) continue
+    const ids = [String(candidate.payload.transactionId), String(counterpart.payload.transactionId)].sort()
+    const scope = config.providerConnectionId ?? config.sourceResourceIncarnationId
+    const framed = ['investec-transfer-group-v1', scope, ...ids].map(value => `${value.length}:${value}`).join('\x00')
+    const groupId = `investec:transfer:v1:${sha256(framed)}`
+    for (const leg of [candidate, counterpart]) {
+      leg.payload.activityType = leg.direction === 'DEBIT' ? 'TRANSFER_OUT' : 'TRANSFER_IN'
+      leg.payload.sourceGroupId = groupId
+    }
+  }
 }

@@ -156,6 +156,20 @@ describe('Mercury provider adapter G6', () => {
     expect(result.observations.find(o => o.providerVersion === 'mercury:txn:pending-1')?.payload).toMatchObject({ status: 'pending' })
   })
 
+  it('quarantines sent/posted/pending transactions without provider timestamps', async () => {
+    const result = await runMercurySync({ deploymentId: 'g6-test', localOwnerId: 'alexis', sourceResourceIncarnationId: 'mercury:org-1' }, mockTransport({
+      fetchTransactions: async () => ({ transactions: [
+        mockTransaction({ id: 'sent-no-date', status: 'sent', postedAt: null, createdAt: null }),
+        mockTransaction({ id: 'posted-no-date', status: 'posted', postedAt: null, createdAt: null }),
+        mockTransaction({ id: 'pending-no-date', status: 'pending', postedAt: null, createdAt: null }),
+        mockTransaction({ id: 'posted-invalid-date', status: 'posted', postedAt: 'not-a-date' }),
+      ], total: 4 }),
+    }))
+    expect(result.observations.some(item => item.providerVersion.includes('no-date'))).toBe(false)
+    expect(result.quarantinedTransactions).toBe(4)
+    expect(result.paginationComplete).toBe(false)
+  })
+
   it('drops cancelled/failed transactions from observations', async () => {
     const transport = mockTransport({
       fetchTransactions: async () => ({

@@ -24,6 +24,7 @@ export interface BridgeActivityPayload {
   readonly activityType: string
   readonly status: string
   readonly activityDate: string
+  readonly activityDatePrecision: 'DATE' | 'INSTANT'
   /** Economic amount in the activity/account currency. Card original is separate. */
   readonly amount: string
   readonly currency: string
@@ -151,6 +152,7 @@ export function bridgeOperationToWire(operation: BridgeDisclosureOperation): Rec
     activity_type: operation.activity.activityType,
     status: operation.activity.status,
     activity_date: operation.activity.activityDate,
+    activity_date_precision: operation.activity.activityDatePrecision,
     amount: operation.activity.amount,
     currency: operation.activity.currency,
     ...(operation.activity.settlementDate === undefined ? {} : { settlement_date: operation.activity.settlementDate }),
@@ -270,6 +272,19 @@ function absoluteDecimal(value: unknown): string {
   return parts.magnitude
 }
 
+export function providerActivityDate(payload: Readonly<Record<string, unknown>>): { value: string; precision: 'DATE' | 'INSTANT' } {
+  const value = optionalString(payload, 'authorizationDateTime') ?? optionalString(payload, 'date')
+  if (!value) throw new Error('provider activity date is required')
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const date = new Date(`${value}T00:00:00Z`)
+    if (date.toISOString().slice(0, 10) === value) return { value, precision: 'DATE' }
+  }
+  if (/^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))) {
+    return { value, precision: 'INSTANT' }
+  }
+  throw new Error('invalid provider activity date')
+}
+
 function optionalCurrency(payload: Readonly<Record<string, unknown>>, key: string): string | undefined {
   const value = optionalString(payload, key)?.toUpperCase()
   return value && /^[A-Z]{3}$/.test(value) ? value : undefined
@@ -311,6 +326,7 @@ export function cashObservationToBridge(
       // Re-project existing provider facts once when their display description
       // becomes part of the native activity payload.
       'merchant-notes-v1',
+      'activity-date-precision-v1',
       ...(observation.supersededResourceIds ?? []).slice().sort(),
     ]),
     subject,
@@ -334,6 +350,7 @@ export function cashObservationToBridge(
   const settlementAmount = p.settlementAmount === undefined ? undefined : absoluteDecimal(p.settlementAmount)
   const settlementCurrency = optionalCurrency(p, 'settlementCurrency')
   const sourceRecordId = optionalString(p, 'sourceRecordId') ?? transactionId
+  const activityDate = providerActivityDate(p)
   return {
     ...common,
     kind: 'ActivityUpsert',
@@ -345,7 +362,8 @@ export function cashObservationToBridge(
       status: isPending ? 'PENDING' : 'POSTED',
       // Preserve real card authorization time; account feeds that only provide
       // a date remain date-only rather than receiving a fabricated timestamp.
-      activityDate: optionalString(p, 'authorizationDateTime') ?? (p.date as string) ?? observation.observedAt.slice(0, 10),
+      activityDate: activityDate.value,
+      activityDatePrecision: activityDate.precision,
       amount: parsedAmount.magnitude,
       currency,
       ...(optionalString(p, 'settlementDate') === undefined ? {} : { settlementDate: optionalString(p, 'settlementDate') }),

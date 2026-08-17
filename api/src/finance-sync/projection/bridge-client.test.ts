@@ -6,6 +6,7 @@ import {
   commitObservationBatch,
   bridgeOperationToWire,
   currentStateToBridge,
+  providerObservationToBridge,
   type BridgeTransport,
   type BridgeDisclosureOperation,
   type BridgeReceipt,
@@ -58,10 +59,18 @@ function boundReceipt(op: BridgeDisclosureOperation, overrides: Partial<BridgeRe
 const mockTransport = (): BridgeTransport => ({ commit: async op => boundReceipt(op) })
 
 describe('Bridge client', () => {
+  it('does not project provider audit observations or include them in current state', () => {
+    const operation = providerObservationToBridge('investec', {
+      deploymentId: 'dep-1', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'a'.repeat(64), domain: 'provider_audit', observedAt: '2026-01-01T00:00:00Z',
+      payload: { auditType: 'INVESTEC_CARD_EXECUTION', executionId: 'exec-1', outcome: 'AUDIT_ONLY' },
+    }, 1, 'account-1')
+    expect(operation).toBeNull()
+  })
   it('requires an issuer-qualified subject', () => {
     expect(() => cashObservationToBridge({
       deploymentId: 'g8-test', localOwnerId: 'alexis', sourceResourceIncarnationId: 'inc-1',
-      semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '1.00' },
+      semanticHash: 'abc123', payload: { transactionId: 'txn-1', amount: '1.00', currency: 'USD', date: '2026-07-11' },
       observedAt: '2026-07-11T00:00:00.000Z',
     }, 1, 'wf-acc-uuid-1')).toThrow('issuer-qualified')
   })
@@ -70,6 +79,23 @@ describe('Bridge client', () => {
     expect(idempotencyKey('dep-1', 'hash-a')).toBe(idempotencyKey('dep-1', 'hash-a'))
     expect(idempotencyKey('dep-1', 'hash-a')).not.toBe(idempotencyKey('dep-2', 'hash-a'))
     expect(idempotencyKey('dep-1', 'hash-a')).toHaveLength(40)
+  })
+
+  it('marks date-only provider facts as DATE and real authorizations as INSTANT', () => {
+    const dateOnly = cashObservationToBridge({
+      deploymentId: 'g8-test', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'date-only', payload: { transactionId: 'txn-date', amount: '42.50', currency: 'ZAR', date: '2026-07-11' },
+      observedAt: '2026-07-11T00:00:00.000Z',
+    }, 1, 'acc-1')
+    const instant = cashObservationToBridge({
+      deploymentId: 'g8-test', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',
+      semanticHash: 'instant', payload: { transactionId: 'txn-instant', amount: '42.50', currency: 'USD', date: '2026-07-11', authorizationDateTime: '2026-07-11T16:00:00Z' },
+      observedAt: '2026-07-11T16:07:01.000Z',
+    }, 1, 'acc-1')
+    expect(dateOnly.activity?.activityDatePrecision).toBe('DATE')
+    expect(instant.activity?.activityDatePrecision).toBe('INSTANT')
+    expect(bridgeOperationToWire(dateOnly).activity).toMatchObject({ activity_date_precision: 'DATE' })
+    expect(bridgeOperationToWire(instant).activity).toMatchObject({ activity_date_precision: 'INSTANT' })
   })
 
   it('normalizes Plaid positive spending to withdrawal', () => {
