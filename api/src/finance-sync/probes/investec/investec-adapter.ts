@@ -416,13 +416,24 @@ async function collectInvestecCardExecutions(
   observations: ObservationOutput[],
 ): Promise<void> {
   if (!transport.listCards || !transport.listCardExecutions) return
-  const cards = await transport.listCards()
+  let cards: readonly { cardKey?: string; accountId?: string; accountNumber?: string }[]
+  try {
+    cards = await transport.listCards()
+  } catch {
+    // Card execution recovery is additive evidence. A provider-side outage or
+    // unsupported Card API must not block the ordinary PB ledger cycle.
+    console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED')
+    return
+  }
   const uniqueAccounts = (rows: readonly { accountId: string; accountNumber?: string }[]) =>
     [...new Map(rows.map(account => [account.accountId, account])).values()]
 
   for (const card of cards) {
     const cardKey = typeof card.cardKey === 'string' && card.cardKey.trim() ? card.cardKey.trim() : undefined
-    if (!cardKey) throw new Error('Investec Card API returned a card without a stable key')
+    if (!cardKey) {
+      console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED')
+      continue
+    }
     const explicitAccountId = typeof card.accountId === 'string' && card.accountId.trim()
       ? card.accountId.trim()
       : undefined
@@ -447,7 +458,13 @@ async function collectInvestecCardExecutions(
       if (candidates.length === 1) mapped = candidates[0]
     }
 
-    const executions = await transport.listCardExecutions(cardKey)
+    let executions: readonly InvestecCardExecution[]
+    try {
+      executions = await transport.listCardExecutions(cardKey)
+    } catch {
+      console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED')
+      continue
+    }
     for (const execution of executions) {
       const executionId = typeof execution.executionId === 'string' ? execution.executionId.trim() : ''
       if (!executionId) continue

@@ -143,11 +143,27 @@ describe('Investec adapter G5', () => {
     })
   })
 
-  it('fails the provider run when the official Card API backstop is unavailable', async () => {
-    const transport = makeTransport([], undefined, [{ accountId: 'acc-1', accountNumber: '10001111', productName: 'Private Bank Account' }])
+  it('keeps the PB cycle healthy when the official Card API backstop is unavailable', async () => {
+    const transport = makeTransport([
+      { uuid: 'pb-1', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'PB' },
+    ], undefined, [{ accountId: 'acc-1', accountNumber: '10001111', productName: 'Private Bank Account' }])
     transport.listCards = async () => { throw new Error('scope unavailable') }
     transport.listCardExecutions = async () => []
-    await expect(runInvestecAdapter(BASE_CONFIG, transport)).rejects.toThrow('scope unavailable')
+    const result = await runInvestecAdapter(BASE_CONFIG, transport)
+    expect(transactionObservations(result)).toHaveLength(1)
+    expect(result.paginationComplete).toBe(true)
+  })
+
+  it('keeps the PB cycle healthy when one card has no stable key or execution endpoint', async () => {
+    const transport = makeTransport([
+      { uuid: 'pb-2', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'PB' },
+    ], undefined, [{ accountId: 'acc-1', accountNumber: '10001111', productName: 'Private Bank Account' }])
+    transport.listCards = async () => [{ cardKey: '' }, { cardKey: 'card-1', accountNumber: '10001111' }]
+    transport.listCardExecutions = async () => { throw new Error('execution endpoint unavailable') }
+    const result = await runInvestecAdapter(BASE_CONFIG, transport)
+    expect(transactionObservations(result)).toHaveLength(1)
+    expect(result.paginationComplete).toBe(true)
+    expect(executionObservations(result)).toHaveLength(0)
   })
 
   it('deduplicates provider rows and lets explicit admission own product eligibility', async () => {
