@@ -666,6 +666,11 @@ function correlatedInvestecPayload(
   const settledProviderOwned = recordPayload(settledMetadata?.providerOwned)
   const cardInvestecMetadata = recordPayload(cardProviderOwned?.investec)
   const settledInvestecMetadata = recordPayload(settledProviderOwned?.investec)
+  const cardInvestecMetadataWithoutProvisional = Object.fromEntries(
+    Object.entries(cardInvestecMetadata ?? {}).filter(
+      ([key]) => key !== 'provisionalSpending' && key !== 'provisionalSpendingReason',
+    ),
+  )
   const originalCurrency = typeof card.originalCurrency === 'string' ? card.originalCurrency : undefined
   const originalAmount = originalCurrency !== undefined && typeof card.originalAmount === 'string'
     ? card.originalAmount
@@ -702,7 +707,7 @@ function correlatedInvestecPayload(
         ...(settledProviderOwned ?? {}),
         investec: {
           ...(settledInvestecMetadata ?? {}),
-          ...(cardInvestecMetadata ?? {}),
+          ...cardInvestecMetadataWithoutProvisional,
         },
         investecCorrelation: {
           cardTransactionId: cardId,

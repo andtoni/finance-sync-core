@@ -287,4 +287,54 @@ describe('Investec card observations', () => {
       payload: { accountNumber: '90000000000', centsAmount: 0, dateTime: '2026-01-05T13:40:00.000Z', merchant: { name: 'SYNTHETIC PROVISIONING' } },
     })).toBeNull()
   })
+
+  it('marks debit authorizations as provisional spending', () => {
+    const observation = investecCardObservation({
+      ...input,
+      payload: {
+        centsAmount: 1234, currencyCode: 'usd', type: 'card',
+        dateTime: '2026-01-05T16:00:00.000Z', reference: 'debit-provisional',
+        merchant: { name: 'DEBIT MERCHANT' },
+      },
+    })
+    expect(observation).not.toBeNull()
+    const metadata = observation?.payload.metadata as { providerOwned?: { investec?: Record<string, unknown> } } | undefined
+    expect(metadata?.providerOwned?.investec?.provisionalSpending).toBe(true)
+    expect(metadata?.providerOwned?.investec?.provisionalSpendingReason).toBe('AUTHORIZED_NO_SETTLEMENT')
+    expect(observation?.payload.type).toBe('DEBIT')
+  })
+
+  it('does not mark credit/refund authorizations as provisional spending', () => {
+    const observation = investecCardObservation({
+      ...input,
+      payload: {
+        centsAmount: 1234, currencyCode: 'usd', type: 'CREDIT',
+        dateTime: '2026-01-05T16:00:00.000Z', reference: 'credit-no-provisional',
+        merchant: { name: 'CREDIT MERCHANT' },
+      },
+    })
+    expect(observation).not.toBeNull()
+    const metadata = observation?.payload.metadata as { providerOwned?: { investec?: Record<string, unknown> } } | undefined
+    expect(metadata?.providerOwned?.investec?.provisionalSpending).toBeUndefined()
+    expect(metadata?.providerOwned?.investec?.provisionalSpendingReason).toBeUndefined()
+    expect(observation?.payload.type).toBe('CREDIT')
+  })
+
+  it('has distinct hashes for debit and credit with same reference', () => {
+    const base = {
+      ...input,
+      payload: {
+        centsAmount: 1234, currencyCode: 'usd',
+        dateTime: '2026-01-05T16:00:00.000Z', reference: 'same-ref',
+        merchant: { name: 'SAME MERCHANT' },
+      },
+    }
+    const debit = investecCardObservation({ ...base, payload: { ...base.payload, type: 'card' } })
+    const credit = investecCardObservation({ ...base, payload: { ...base.payload, type: 'CREDIT' } })
+    expect(debit).not.toBeNull()
+    expect(credit).not.toBeNull()
+    expect(debit?.semanticHash).not.toBe(credit?.semanticHash)
+    expect(debit?.payload.amount).toBe('-12.34')
+    expect(credit?.payload.amount).toBe('12.34')
+  })
 })

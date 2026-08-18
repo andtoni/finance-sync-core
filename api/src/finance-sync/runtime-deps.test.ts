@@ -734,6 +734,45 @@ describe('Investec card and poll lifecycle correlation', () => {
     })
   })
 
+  it('strips provisional spending metadata from the settled successor', async () => {
+    const cardWithProvisional = {
+      ...inferredCardPayload,
+      transactionId: 'provisional-card',
+      providerVersion: 'investec:card:provisional-card',
+      semanticHash: 'provisional-card-hash',
+      metadata: { providerOwned: { investec: { accountCurrency: 'ZAR', provisionalSpending: true, provisionalSpendingReason: 'AUTHORIZED_NO_SETTLEMENT' } } },
+    }
+    const settled = {
+      ...inferredSettledPayload,
+      transactionId: 'provisional-settled',
+      providerVersion: 'investec:txn:provisional-settled',
+      semanticHash: 'provisional-settled-hash',
+      description: 'DMI* ACME SALES & SERV',
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000105', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: cardWithProvisional.providerVersion, semanticHash: cardWithProvisional.semanticHash,
+      hashSpecificationVersion: 4, observedAt: cardWithProvisional.observedAt, domain: 'cash_ledger',
+      payload: cardWithProvisional,
+    }], { skipCurrentState: true })
+    const activities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
+    expect(activities).toHaveLength(2)
+    const settledActivity = activities.find(op => op.lifecycleSuccessorId?.endsWith(':provisional-settled'))?.activity
+    expect(settledActivity).toBeDefined()
+    expect(settledActivity?.metadata).not.toMatchObject({
+      providerOwned: { investec: { provisionalSpending: true, provisionalSpendingReason: 'AUTHORIZED_NO_SETTLEMENT' } },
+    })
+    expect(settledActivity?.metadata).toMatchObject({
+      providerOwned: { investecCorrelation: expect.anything() },
+    })
+  })
+
   it('leaves ambiguous exact provider facts visible without a lifecycle successor', async () => {
     const secondSettled = { ...inferredSettledPayload, transactionId: 'facts-settled-2', providerVersion: 'investec:txn:facts-settled-2', semanticHash: 'facts-settled-hash-2', amount: '-192.00', settlementAmount: '-192.00' }
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000103', payload: {

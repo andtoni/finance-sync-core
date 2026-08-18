@@ -178,6 +178,7 @@ export function investecCardObservation(input: {
             status: currencyEvidenceStatus,
             settlementCurrency: null,
           },
+          ...(!isCredit ? { provisionalSpending: true, provisionalSpendingReason: 'AUTHORIZED_NO_SETTLEMENT' } : {}),
         },
       },
     },
@@ -196,7 +197,7 @@ export function investecCardObservation(input: {
   const semanticHash = sha256([
     input.deploymentId, input.localOwnerId, input.sourceResourceIncarnationId,
     'cash_ledger', transactionId, amount, accountCurrency, originalAmount ?? '', originalCurrency ?? '',
-    currencyEvidenceStatus, dateTime,
+    currencyEvidenceStatus, 'provisional-spending-v1', dateTime,
     merchant, cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
   ].join('\x00'))
   return Object.freeze({
