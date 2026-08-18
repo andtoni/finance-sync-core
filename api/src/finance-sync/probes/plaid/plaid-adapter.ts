@@ -71,6 +71,8 @@ export interface PlaidSyncConfig {
   readonly deploymentId: string
   readonly localOwnerId: string
   readonly sourceResourceIncarnationId: string
+  /** Per-account native resource identity for item-level multi-account sync. */
+  readonly sourceResourceIncarnationIds?: Readonly<Record<string, string>>
   readonly accountIds: readonly string[]
   readonly initialCursor?: string
   readonly maxPages?: number
@@ -117,6 +119,12 @@ export async function runPlaidSync(
   let observations: ObservationOutput[] = []
   let mutationRestarts = 0
   let pagesStaged = 0
+  const sourceFor = (accountId: string): string =>
+    config.sourceResourceIncarnationIds?.[accountId] ?? config.sourceResourceIncarnationId
+  const removedSourceIds = (): readonly string[] => {
+    const ids = Object.values(config.sourceResourceIncarnationIds ?? {})
+    return ids.length > 0 ? [...new Set(ids)] : [config.sourceResourceIncarnationId]
+  }
 
   for (let attempt = 0; attempt < 3; attempt++) {
     let cursor = config.initialCursor
@@ -147,6 +155,7 @@ export async function runPlaidSync(
           if (!currency) continue // quarantine: no currency
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
+          const sourceResourceIncarnationId = sourceFor(txn.account_id)
           const payload = {
             transactionId: txn.transaction_id,
             accountId: txn.account_id,
@@ -167,7 +176,7 @@ export async function runPlaidSync(
             }),
           }
           const semanticPayload = [
-            config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
+            config.deploymentId, config.localOwnerId, sourceResourceIncarnationId,
             domain, txn.transaction_id, JSON.stringify(payload), JSON.stringify(txn),
           ].join('\x00')
           const semanticHash = sha256(semanticPayload)
@@ -176,7 +185,7 @@ export async function runPlaidSync(
           observations.push({
             deploymentId: config.deploymentId,
             localOwnerId: config.localOwnerId,
-            sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+            sourceResourceIncarnationId,
             providerVersion: `plaid:txn:${txn.transaction_id}`,
             semanticHash,
             hashSpecificationVersion,
@@ -195,6 +204,7 @@ export async function runPlaidSync(
           if (!currency) continue
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
+          const sourceResourceIncarnationId = sourceFor(txn.account_id)
           const payload = {
             transactionId: txn.transaction_id,
             accountId: txn.account_id,
@@ -212,7 +222,7 @@ export async function runPlaidSync(
             }),
           }
           const semanticPayload = [
-            config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
+            config.deploymentId, config.localOwnerId, sourceResourceIncarnationId,
             domain, txn.transaction_id, JSON.stringify(payload), JSON.stringify(txn), 'modified',
           ].join('\x00')
           const semanticHash = sha256(semanticPayload)
@@ -220,7 +230,7 @@ export async function runPlaidSync(
           observations.push({
             deploymentId: config.deploymentId,
             localOwnerId: config.localOwnerId,
-            sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+            sourceResourceIncarnationId,
             providerVersion: `plaid:txn:${txn.transaction_id}`,
             semanticHash,
             hashSpecificationVersion: HASH_SPEC_VERSION,
@@ -231,30 +241,34 @@ export async function runPlaidSync(
           })
         }
 
-        // Removed: tombstone observations
+        // Removed: tombstone observations. Plaid omits account_id from removal
+        // rows, so item-level runs stage one tombstone per admitted native
+        // resource; persistence keeps only the resource with matching history.
         for (const rem of page.removed) {
           const payload = {
             transactionId: rem.transaction_id,
             isRemoved: true,
           }
-          const semanticPayload = [
-            config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId,
-            rem.transaction_id, 'removed',
-          ].join('\x00')
-          const semanticHash = sha256(semanticPayload)
+          for (const sourceResourceIncarnationId of removedSourceIds()) {
+            const semanticPayload = [
+              config.deploymentId, config.localOwnerId, sourceResourceIncarnationId,
+              rem.transaction_id, 'removed',
+            ].join('\x00')
+            const semanticHash = sha256(semanticPayload)
 
-          observations.push({
-            deploymentId: config.deploymentId,
-            localOwnerId: config.localOwnerId,
-            sourceResourceIncarnationId: config.sourceResourceIncarnationId,
-            providerVersion: `plaid:removed:${rem.transaction_id}`,
-            semanticHash,
-            hashSpecificationVersion: HASH_SPEC_VERSION,
-            domain: 'cash_ledger',
-            payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
-            rawPayload: rem,
-            observedAt: new Date().toISOString(),
-          })
+            observations.push({
+              deploymentId: config.deploymentId,
+              localOwnerId: config.localOwnerId,
+              sourceResourceIncarnationId,
+              providerVersion: `plaid:removed:${rem.transaction_id}`,
+              semanticHash,
+              hashSpecificationVersion: HASH_SPEC_VERSION,
+              domain: 'cash_ledger',
+              payload: Object.freeze(payload) as Readonly<Record<string, unknown>>,
+              rawPayload: rem,
+              observedAt: new Date().toISOString(),
+            })
+          }
         }
 
         if (!page.has_more) {
@@ -269,6 +283,7 @@ export async function runPlaidSync(
             if (!account || account.balances.current === null || !Number.isFinite(account.balances.current)) throw new Error('INCOMPLETE_ACCOUNT_BALANCE')
             const accountCurrency = account.balances.iso_currency_code
             if (!accountCurrency) throw new Error('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY')
+            const sourceResourceIncarnationId = sourceFor(accountId)
             const balancePayload = Object.freeze({
               accountId,
               currentBalance: String(account.balances.current),
@@ -279,9 +294,9 @@ export async function runPlaidSync(
             })
             observations.push({
               deploymentId: config.deploymentId, localOwnerId: config.localOwnerId,
-              sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+              sourceResourceIncarnationId,
               providerVersion: `plaid:balance:${accountId}`,
-              semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'balance', JSON.stringify(balancePayload)].join('\x00')),
+              semanticHash: sha256([config.deploymentId, config.localOwnerId, sourceResourceIncarnationId, 'balance', JSON.stringify(balancePayload)].join('\x00')),
               hashSpecificationVersion: HASH_SPEC_VERSION,
               domain: plaidResourceKind(account.type), payload: balancePayload, rawPayload: account, observedAt: snapshotObservedAt,
             })
@@ -290,9 +305,9 @@ export async function runPlaidSync(
               const liabilityPayload = Object.freeze({ accountId, currentBalance: String(Math.abs(account.balances.current)), currency: accountCurrency, details })
               observations.push({
                 deploymentId: config.deploymentId, localOwnerId: config.localOwnerId,
-                sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+                sourceResourceIncarnationId,
                 providerVersion: `plaid:liability:${accountId}`,
-                semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'liability', JSON.stringify(liabilityPayload)].join('\x00')),
+                semanticHash: sha256([config.deploymentId, config.localOwnerId, sourceResourceIncarnationId, 'liability', JSON.stringify(liabilityPayload)].join('\x00')),
                 hashSpecificationVersion: HASH_SPEC_VERSION,
                 domain: 'liability', payload: liabilityPayload, rawPayload: details, observedAt: snapshotObservedAt,
               })

@@ -195,4 +195,261 @@ describe('configured sync runtime', () => {
     expect(result.failures).toBe(1)
     expect(checkpointed).toBe(false)
   })
+
+  it('Plaid item cursor: one provider call per item, shared cursor, observations for both accounts, cursor promoted only after both succeed', async () => {
+    const itemConnectionId = 'plaid-item-1'
+    const accountA = 'acc-checking'
+    const accountB = 'acc-credit'
+    const wfA = 'wf-acc-checking'
+    const wfB = 'wf-acc-credit'
+    const sourceA = 'plaid:item-1:acc-checking'
+    const sourceB = 'plaid:item-1:acc-credit'
+    const connA = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountA}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: sourceA,
+      sourceResourceIncarnationIds: { [accountA]: sourceA, [accountB]: sourceB },
+      accountIds: [accountA],
+      wealthfolioAccountIds: { [accountA]: wfA },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c',
+      clientSecret: 's',
+      accessToken: 'tok',
+    }
+    const connB = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountB}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: sourceB,
+      sourceResourceIncarnationIds: { [accountA]: sourceA, [accountB]: sourceB },
+      accountIds: [accountB],
+      wealthfolioAccountIds: { [accountB]: wfB },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c',
+      clientSecret: 's',
+      accessToken: 'tok',
+    }
+    const observationsA: ObservationOutput[] = []
+    const observationsB: ObservationOutput[] = []
+    let providerCalls = 0
+    let savedCursor: string | null = null
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [connA, connB],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      runProvider: async (connection) => {
+        providerCalls++
+        // Item-level connection has combined accountIds
+        const allIds = connection.accountIds
+        // Build observations for both accounts with correct sourceResourceIncarnationId per account
+        const obs = [...allIds].map((acctId, idx) => ({
+          deploymentId: 'd',
+          localOwnerId: 'owner',
+          sourceResourceIncarnationId: acctId === accountA ? sourceA : sourceB,
+          providerVersion: `plaid:txn:txn-${idx}`,
+          semanticHash: 'a'.repeat(64),
+          hashSpecificationVersion: 1,
+          domain: 'cash_ledger' as const,
+          observedAt: '2026-07-11T00:00:00.000Z',
+          payload: { accountId: acctId, transactionId: `txn-${idx}`, amount: '1', currency: 'USD', date: '2026-07-11' },
+        }))
+        return { nextCursor: 'item-cursor-1', observations: obs }
+      },
+      persistAndEnqueue: async (connection, obs) => {
+        if (connection.connectionId.includes(accountA)) observationsA.push(...obs)
+        else if (connection.connectionId.includes(accountB)) observationsB.push(...obs)
+        return obs.length
+      },
+      projectPending: async () => ({ delivered: 1, failed: 0 }),
+      saveCheckpoint: async () => {},
+      savePlaidItemCheckpoint: async (_connection, cursor) => { savedCursor = cursor },
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(providerCalls).toBe(1)
+    expect(observationsA.length).toBe(1)
+    expect(observationsB.length).toBe(1)
+    expect(observationsA[0].sourceResourceIncarnationId).toBe(sourceA)
+    expect(observationsB[0].sourceResourceIncarnationId).toBe(sourceB)
+    expect(savedCursor).toBe('item-cursor-1')
+    expect(result.observations).toBe(2)
+    expect(result.failures).toBe(0)
+  })
+
+  it('Plaid item fails closed on credential mismatch', async () => {
+    const itemConnectionId = 'plaid-item-mismatch'
+    const accountA = 'acc-a'
+    const accountB = 'acc-b'
+    const connA = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountA}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: 'src-a',
+      sourceResourceIncarnationIds: { [accountA]: 'src-a', [accountB]: 'src-b' },
+      accountIds: [accountA],
+      wealthfolioAccountIds: { [accountA]: 'wf-a' },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c1',
+      clientSecret: 's1',
+      accessToken: 'tok',
+    }
+    const connB = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountB}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: 'src-b',
+      sourceResourceIncarnationIds: { [accountA]: 'src-a', [accountB]: 'src-b' },
+      accountIds: [accountB],
+      wealthfolioAccountIds: { [accountB]: 'wf-b' },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c2',
+      clientSecret: 's1',
+      accessToken: 'tok',
+    }
+    let providerCalls = 0
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [connA, connB],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      runProvider: async () => { providerCalls++; return { nextCursor: 'c', observations: [] } },
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+      savePlaidItemCheckpoint: async () => {},
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(providerCalls).toBe(0)
+    expect(result.failures).toBeGreaterThan(0)
+  })
+
+  it('Plaid item fails closed on overlapping account IDs', async () => {
+    const itemConnectionId = 'plaid-item-overlap'
+    const accountA = 'acc-same'
+    const connA = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountA}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: 'src-a',
+      sourceResourceIncarnationIds: { [accountA]: 'src-a' },
+      accountIds: [accountA],
+      wealthfolioAccountIds: { [accountA]: 'wf-a' },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c',
+      clientSecret: 's',
+      accessToken: 'tok',
+    }
+    const connB = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountA}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: 'src-b',
+      sourceResourceIncarnationIds: { [accountA]: 'src-b' },
+      accountIds: [accountA],
+      wealthfolioAccountIds: { [accountA]: 'wf-a' },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c',
+      clientSecret: 's',
+      accessToken: 'tok',
+    }
+    let providerCalls = 0
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [connA, connB],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      runProvider: async () => { providerCalls++; return { nextCursor: 'c', observations: [] } },
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+      savePlaidItemCheckpoint: async () => {},
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(providerCalls).toBe(0)
+    expect(result.failures).toBeGreaterThan(0)
+  })
+
+  it('Plaid item fails closed when second account projection fails', async () => {
+    const itemConnectionId = 'plaid-item-failure'
+    const accountA = 'acc-a'
+    const accountB = 'acc-b'
+    const sourceA = 'src-a'
+    const sourceB = 'src-b'
+    const connA = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountA}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: sourceA,
+      sourceResourceIncarnationIds: { [accountA]: sourceA, [accountB]: sourceB },
+      accountIds: [accountA],
+      wealthfolioAccountIds: { [accountA]: 'wf-a' },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c',
+      clientSecret: 's',
+      accessToken: 'tok',
+    }
+    const connB = {
+      provider: 'plaid' as const,
+      connectionId: `${itemConnectionId}:${accountB}`,
+      providerConnectionId: itemConnectionId,
+      deploymentId: 'd',
+      localOwnerId: 'owner',
+      sourceResourceIncarnationId: sourceB,
+      sourceResourceIncarnationIds: { [accountA]: sourceA, [accountB]: sourceB },
+      accountIds: [accountB],
+      wealthfolioAccountIds: { [accountB]: 'wf-b' },
+      providerGeneration: 1,
+      receiverAccessGeneration: 1,
+      secretReference: 'TEST_SLOT',
+      clientId: 'c',
+      clientSecret: 's',
+      accessToken: 'tok',
+    }
+    let saved = false
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [connA, connB],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      runProvider: async () => ({ nextCursor: 'item-cursor-2', observations: [
+        { deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: sourceA, providerVersion: 'plaid:txn:1', semanticHash: 'a'.repeat(64), hashSpecificationVersion: 1, domain: 'cash_ledger' as const, observedAt: '2026-07-11T00:00:00.000Z', payload: { accountId: accountA, transactionId: '1', amount: '1', currency: 'USD', date: '2026-07-11' } },
+        { deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: sourceB, providerVersion: 'plaid:txn:2', semanticHash: 'b'.repeat(64), hashSpecificationVersion: 1, domain: 'cash_ledger' as const, observedAt: '2026-07-11T00:00:00.000Z', payload: { accountId: accountB, transactionId: '2', amount: '1', currency: 'USD', date: '2026-07-11' } },
+      ] }),
+      persistAndEnqueue: async () => 1,
+      projectPending: async (connection) => {
+        if (connection.connectionId.includes(accountA)) return { delivered: 1, failed: 0 }
+        return { delivered: 0, failed: 1 }
+      },
+      saveCheckpoint: async () => {},
+      savePlaidItemCheckpoint: async () => { saved = true },
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(saved).toBe(false)
+    expect(result.failures).toBeGreaterThan(0)
+  })
 })

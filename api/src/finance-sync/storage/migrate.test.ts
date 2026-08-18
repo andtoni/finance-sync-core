@@ -8,8 +8,15 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
+  });
+
+  it("defines Plaid item-level checkpoints", () => {
+    const sql = readFileSync(resolve(root, "0016_plaid_item_checkpoints.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS plaid_item_checkpoints/i);
+    expect(sql).toMatch(/PRIMARY KEY \(deployment_id, local_owner_id, provider_connection_id, provider_generation\)/i);
+    expect(sql).toMatch(/provider_generation integer NOT NULL/i);
   });
 
   it("defines generation-bound admissions, checkpoint/outbox identities, and rotation supersession", () => {

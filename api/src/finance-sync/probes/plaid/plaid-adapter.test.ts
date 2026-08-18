@@ -153,4 +153,49 @@ describe('Plaid adapter G4', () => {
       accountIds: ['acc-1'],
     }, transport)).rejects.toThrow('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY')
   })
+
+  it('uses per-account sourceResourceIncarnationIds for checking and credit accounts', async () => {
+    const transport = mockTransport({
+      syncTransactions: async () => ({
+        added: [
+          { transaction_id: 'txn-checking', account_id: 'acc-checking', amount: 10, date: '2026-07-10', name: 'CHECK' },
+          { transaction_id: 'txn-credit', account_id: 'acc-credit', amount: 20, date: '2026-07-10', name: 'CREDIT' },
+        ],
+        modified: [],
+        removed: [],
+        accounts: [
+          { account_id: 'acc-checking', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 1000, iso_currency_code: 'USD' } },
+          { account_id: 'acc-credit', name: 'Credit Card', type: 'credit', subtype: 'credit card', balances: { current: -200, iso_currency_code: 'USD' } },
+        ],
+        next_cursor: 'cursor-1',
+        has_more: false,
+      }),
+      getLiabilities: async () => ({ credit: [{ account_id: 'acc-credit' }] }),
+    })
+    const result = await runPlaidSync({
+      accessToken: 'access-sandbox-abc',
+      deploymentId: 'g4-test',
+      localOwnerId: 'alexis',
+      sourceResourceIncarnationId: 'plaid:item-fallback',
+      sourceResourceIncarnationIds: {
+        'acc-checking': 'src-checking',
+        'acc-credit': 'src-credit',
+      },
+      accountIds: ['acc-checking', 'acc-credit'],
+    }, transport)
+    const txnObs = result.observations.filter(o => o.providerVersion.startsWith('plaid:txn:'))
+    expect(txnObs).toHaveLength(2)
+    const checkingTxn = txnObs.find(o => o.payload.accountId === 'acc-checking')!
+    const creditTxn = txnObs.find(o => o.payload.accountId === 'acc-credit')!
+    expect(checkingTxn.sourceResourceIncarnationId).toBe('src-checking')
+    expect(creditTxn.sourceResourceIncarnationId).toBe('src-credit')
+    const balanceObs = result.observations.filter(o => o.providerVersion.startsWith('plaid:balance:'))
+    expect(balanceObs).toHaveLength(2)
+    expect(balanceObs.find(o => o.payload.accountId === 'acc-checking')!.sourceResourceIncarnationId).toBe('src-checking')
+    expect(balanceObs.find(o => o.payload.accountId === 'acc-credit')!.sourceResourceIncarnationId).toBe('src-credit')
+    const liabilityObs = result.observations.filter(o => o.providerVersion.startsWith('plaid:liability:'))
+    expect(liabilityObs).toHaveLength(1)
+    expect(liabilityObs[0].payload.accountId).toBe('acc-credit')
+    expect(liabilityObs[0].sourceResourceIncarnationId).toBe('src-credit')
+  })
 })

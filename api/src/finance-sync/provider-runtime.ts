@@ -55,6 +55,17 @@ function optionalString(c: Record<string, unknown>, name: string): string | unde
   if (typeof value !== 'string' || value.length === 0) throw new Error(`connection ${name} must be a non-empty string`)
   return value
 }
+function optionalStringRecord(c: Record<string, unknown>, name: string): Readonly<Record<string, string>> | undefined {
+  const value = c[name]
+  if (value === undefined) return undefined
+  const recordValue = record(value, `connection ${name} must be an object`)
+  const result: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(recordValue)) {
+    if (!key || typeof entry !== 'string' || entry.length === 0) throw new Error(`connection ${name} must contain non-empty strings`)
+    result[key] = entry
+  }
+  return Object.freeze(result)
+}
 function stringArray(c: Record<string, unknown>, name: string): string[] {
   const value = c[name]
   if (!Array.isArray(value) || value.length === 0 || !value.every(x => typeof x === 'string' && x.length > 0)) {
@@ -120,7 +131,7 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
     if (!Number.isSafeInteger(providerGeneration) || (providerGeneration as number) < 1) throw new Error('connection providerGeneration must be positive')
     if (!Number.isSafeInteger(receiverAccessGeneration) || (receiverAccessGeneration as number) < 1) throw new Error('connection receiverAccessGeneration must be positive')
     const common = {
-      provider: provider as ProviderName, connectionId, deploymentId, localOwnerId,
+      provider: provider as ProviderName, connectionId, providerConnectionId: optionalString(metadata, 'providerConnectionId'), deploymentId, localOwnerId,
       sourceResourceIncarnationId: string(c, 'sourceResourceIncarnationId'), accountIds,
       wealthfolioAccountIds: Object.freeze(wealthfolioAccountIds), providerGeneration: providerGeneration as number,
       receiverAccessGeneration: receiverAccessGeneration as number,
@@ -129,7 +140,7 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
     switch (provider) {
       case 'plaid': return {
         ...common, provider, clientId: string(c, 'clientId'), clientSecret: string(c, 'clientSecret'),
-        accessToken: string(c, 'accessToken'), maxPages: optionalPositive(c, 'maxPages'),
+        accessToken: string(c, 'accessToken'), sourceResourceIncarnationIds: optionalStringRecord(c, 'sourceResourceIncarnationIds'), maxPages: optionalPositive(c, 'maxPages'),
       }
       case 'investec': return {
         ...common, provider, clientId: string(c, 'clientId'), clientSecret: string(c, 'clientSecret'), apiKey: string(c, 'apiKey'),

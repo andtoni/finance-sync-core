@@ -4,6 +4,8 @@ import { getProviderEntry, type ProviderName } from './probes/provider-registry'
 interface RuntimeConnectionBase {
   readonly provider: ProviderName
   readonly connectionId: string
+  /** Stable provider-connection identity shared by all admitted accounts. */
+  readonly providerConnectionId?: string
   readonly deploymentId: string
   readonly localOwnerId: string
   readonly sourceResourceIncarnationId: string
@@ -23,6 +25,8 @@ export interface PlaidRuntimeConnection extends RuntimeConnectionBase {
   readonly clientId: string
   readonly clientSecret: string
   readonly accessToken: string
+  /** Per-account native resource identity retained while one Plaid item is synced once. */
+  readonly sourceResourceIncarnationIds?: Readonly<Record<string, string>>
   readonly maxPages?: number
 }
 
@@ -75,6 +79,7 @@ export interface PersistEnqueueOptions { readonly skipCurrentState?: boolean }
 export interface SyncRuntimeDependencies {
   loadConnections(deploymentId: string): Promise<readonly RuntimeConnection[]>
   loadCheckpoint(connection: RuntimeConnection): Promise<string | null>
+  loadPlaidItemCheckpoint?(connection: Extract<RuntimeConnection, { provider: 'plaid' }>): Promise<string | null>
   runProvider(connection: RuntimeConnection, cursor: string | null): Promise<ProviderRun>
   persistAndEnqueue(connection: RuntimeConnection, observations: readonly ObservationOutput[], options?: PersistEnqueueOptions): Promise<number>
   persistAndEnqueueBatch?(batches: readonly {
@@ -84,11 +89,75 @@ export interface SyncRuntimeDependencies {
   }[]): Promise<number>
   projectPending(connection: RuntimeConnection): Promise<{ delivered: number; failed: number }>
   saveCheckpoint(connection: RuntimeConnection, cursor: string | null): Promise<void>
+  savePlaidItemCheckpoint?(connection: Extract<RuntimeConnection, { provider: 'plaid' }>, cursor: string | null): Promise<void>
 }
 export interface SyncCycleResult { readonly connections: number; readonly observations: number; readonly delivered: number; readonly failures: number }
 export interface SyncCycleControls { readonly providersEnabled: boolean; readonly projectionEnabled: boolean }
 
 const enabledByDefault: SyncCycleControls = Object.freeze({ providersEnabled: true, projectionEnabled: true })
+
+function connectionPrefix(connection: RuntimeConnection): string {
+  const accountId = connection.accountIds[0]
+  const suffix = accountId === undefined ? undefined : `:${accountId}`
+  return suffix !== undefined && connection.connectionId.endsWith(suffix)
+    ? connection.connectionId.slice(0, -suffix.length)
+    : connection.connectionId
+}
+
+function connectionGroupId(connection: RuntimeConnection): string {
+  return connection.providerConnectionId ?? connectionPrefix(connection)
+}
+
+function plaidItemConnection(connections: readonly PlaidRuntimeConnection[]): PlaidRuntimeConnection {
+  const first = connections[0]
+  if (!first) throw new Error('Plaid item has no admitted accounts')
+  const generations = new Set(connections.map(connection => connection.providerGeneration))
+  const accessGenerations = new Set(connections.map(connection => connection.receiverAccessGeneration))
+  if (generations.size !== 1 || accessGenerations.size !== 1) throw new Error('Plaid item authority generations are ambiguous')
+  // Fail closed on conflicting item identity and credentials
+  const providerConnectionId = first.providerConnectionId
+  if (!providerConnectionId) throw new Error('Plaid item providerConnectionId is required')
+  for (const connection of connections) {
+    if (connection.providerConnectionId !== providerConnectionId) throw new Error('Plaid item providerConnectionId mismatch')
+    if (connection.secretReference !== first.secretReference) throw new Error('Plaid item secretReference mismatch')
+    if (connection.clientId !== first.clientId) throw new Error('Plaid item clientId mismatch')
+    if (connection.clientSecret !== first.clientSecret) throw new Error('Plaid item clientSecret mismatch')
+    if (connection.accessToken !== first.accessToken) throw new Error('Plaid item accessToken mismatch')
+    if (connection.deploymentId !== first.deploymentId) throw new Error('Plaid item deploymentId mismatch')
+    if (connection.localOwnerId !== first.localOwnerId) throw new Error('Plaid item localOwnerId mismatch')
+  }
+  // Detect duplicate/overlapping account IDs
+  const accountSeen = new Map<string, string>()
+  const accountToWealthfolio = new Map<string, string>()
+  for (const connection of connections) {
+    for (const accountId of connection.accountIds) {
+      if (accountSeen.has(accountId)) throw new Error('Plaid item accountIds overlap')
+      accountSeen.set(accountId, connection.connectionId)
+      const wf = connection.wealthfolioAccountIds[accountId]
+      if (!wf) throw new Error('Plaid item account mapping is incomplete')
+      if (accountToWealthfolio.has(accountId) && accountToWealthfolio.get(accountId) !== wf) {
+        throw new Error('Plaid item wealthfolioAccountIds conflict')
+      }
+      accountToWealthfolio.set(accountId, wf)
+    }
+  }
+  const accountIds = [...accountSeen.keys()].sort()
+  const wealthfolioAccountIds = Object.fromEntries(accountIds.map(accountId => [accountId, accountToWealthfolio.get(accountId)!]))
+  const sourceResourceIncarnationIds = Object.fromEntries(accountIds.map(accountId => {
+    const owner = connections.find(connection => connection.sourceResourceIncarnationIds?.[accountId] !== undefined
+      || connection.accountIds.includes(accountId))
+    const source = owner?.sourceResourceIncarnationIds?.[accountId] ?? owner?.sourceResourceIncarnationId
+    if (!source) throw new Error('Plaid item source resource mapping is incomplete')
+    return [accountId, source]
+  }))
+  return {
+    ...first,
+    connectionId: connectionPrefix(first),
+    accountIds,
+    wealthfolioAccountIds,
+    sourceResourceIncarnationIds,
+  }
+}
 
 /** Read-only provider ingestion. With projection enabled, cursor promotion waits for full outbox delivery. */
 export async function runConfiguredSyncCycle(
@@ -100,8 +169,22 @@ export async function runConfiguredSyncCycle(
   const connections = await deps.loadConnections(deploymentId)
   let observations = 0; let delivered = 0; let failures = 0
   const runs: Array<{ connection: RuntimeConnection; cursor: string | null; run: ProviderRun }> = []
+  const plaidGroups = new Map<string, PlaidRuntimeConnection[]>()
+  for (const connection of connections) {
+    if (connection.provider !== 'plaid') continue
+    const key = JSON.stringify([connection.deploymentId, connection.localOwnerId, connectionGroupId(connection)])
+    const group = plaidGroups.get(key) ?? []
+    group.push(connection)
+    plaidGroups.set(key, group)
+  }
+  const plaidItemCursorEnabled = typeof deps.loadPlaidItemCheckpoint === 'function'
+    && typeof deps.savePlaidItemCheckpoint === 'function'
+  const plaidItemConnections = new Set<RuntimeConnection>(plaidItemCursorEnabled
+    ? [...plaidGroups.values()].flat()
+    : [])
   for (const connection of connections) {
     getProviderEntry(connection.provider)
+    if (connection.provider === 'plaid' && plaidItemConnections.has(connection)) continue
     try {
       const cursor = await deps.loadCheckpoint(connection)
       const run = await deps.runProvider(connection, cursor)
@@ -112,6 +195,54 @@ export async function runConfiguredSyncCycle(
       console.error('Finance Sync connection cycle failed')
     }
   }
+  // Plaid Transactions Sync cursors are item-level. Keep the existing
+  // per-account runtime connections for source identities, persistence, and
+  // projection, but perform one provider request per item and commit its
+  // cursor only after every admitted account has projected successfully.
+  if (plaidItemCursorEnabled) {
+    for (const expected of plaidGroups.values()) {
+      if (expected.length === 0) continue
+      try {
+        const item = plaidItemConnection(expected)
+        const cursor = await deps.loadPlaidItemCheckpoint!(item)
+        const run = await deps.runProvider(item, cursor)
+        const bySourceResource = new Map<string, ObservationOutput[]>()
+        for (const observation of run.observations) {
+          const rows = bySourceResource.get(observation.sourceResourceIncarnationId) ?? []
+          rows.push(observation)
+          bySourceResource.set(observation.sourceResourceIncarnationId, rows)
+        }
+        let itemFailed = false
+        for (const connection of expected) {
+          const accountObservations = connection.accountIds.flatMap(accountId =>
+            bySourceResource.get(connection.sourceResourceIncarnationIds?.[accountId] ?? connection.sourceResourceIncarnationId) ?? [])
+          try {
+            observations += await deps.persistAndEnqueue(connection, accountObservations)
+            if (!controls.projectionEnabled) continue
+            const projection = await deps.projectPending(connection)
+            delivered += projection.delivered
+            failures += projection.failed
+            if (projection.failed > 0) itemFailed = true
+          } catch {
+            itemFailed = true
+            failures += 1
+            console.error('Finance Sync connection cycle failed')
+          }
+        }
+        if (itemFailed) {
+          failures += 1
+          console.error('Finance Sync Plaid item cursor held')
+        } else {
+          await deps.savePlaidItemCheckpoint!(item, run.nextCursor)
+          console.log('FINANCE_SYNC_PLAID_ITEM_SYNC')
+        }
+      } catch {
+        failures += 1
+        console.error('Finance Sync connection cycle failed')
+      }
+    }
+  }
+
   // Investec durable admissions are one account per runtime connection. Pair
   // only after every expected sibling in the same provider principal has
   // completed, so a failed sibling cannot silently degrade to singleton

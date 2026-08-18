@@ -942,6 +942,12 @@ export function createRuntimeDependencies(
           LIMIT 1
         `
         accountId = prior[0]?.account_id
+        if (!accountId) {
+          // No history for this source resource; safely ignore the tombstone only for Plaid
+          if (connection.provider === 'plaid') {
+            continue
+          }
+        }
       }
       if (!accountId || !connection.accountIds.includes(accountId)) throw new Error('provider account is outside the admitted connection scope')
       const wealthfolioAccountId = connection.wealthfolioAccountIds[accountId]
@@ -1064,6 +1070,48 @@ export function createRuntimeDependencies(
         WHERE deployment_id = ${deploymentId} AND connection_id = ${connection.connectionId}
           AND provider_generation = ${connection.providerGeneration}
       `)[0]?.cursor ?? null
+    },
+    loadPlaidItemCheckpoint: async connection => {
+      const providerConnectionId = connection.providerConnectionId
+      if (!providerConnectionId) throw new Error('Plaid item provider connection identity is required')
+      const authority = await sql<{ authorized: number }[]>`
+        SELECT 1 AS authorized
+        FROM provider_connections
+        WHERE deployment_id = ${deploymentId}
+          AND local_owner_id = ${connection.localOwnerId}
+          AND provider = 'plaid'
+          AND provider_connection_id = ${providerConnectionId}
+          AND provider_generation = ${connection.providerGeneration}
+          AND state = 'active'
+          AND disabled_at IS NULL
+        LIMIT 1
+      `
+      if (authority.length !== 1) throw new Error('plaid item authority is stale')
+      const current = await sql<{ cursor: string | null }[]>`
+        SELECT cursor FROM plaid_item_checkpoints
+        WHERE deployment_id = ${deploymentId}
+          AND local_owner_id = ${connection.localOwnerId}
+          AND provider_connection_id = ${providerConnectionId}
+          AND provider_generation = ${connection.providerGeneration}
+      `
+      if (current.length > 0) return current[0].cursor
+
+      // Existing per-account checkpoints are usable only when every admitted
+      // account has the same non-null item cursor. Otherwise restart from the
+      // provider's item origin and let idempotent observations converge.
+      const legacy = await sql<{ cursor: string | null }[]>`
+        SELECT cursor FROM sync_checkpoints
+        WHERE deployment_id = ${deploymentId}
+          AND provider = 'plaid'
+          AND connection_id LIKE ${`${connection.connectionId}:%`}
+          AND provider_generation = ${connection.providerGeneration}
+        ORDER BY connection_id
+      `
+      const cursors = legacy.map(row => row.cursor)
+      if (cursors.length === connection.accountIds.length
+        && cursors.every(cursor => cursor !== null)
+        && new Set(cursors).size === 1) return cursors[0]
+      return null
     },
     runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
     persistAndEnqueue: async (connection, observations, options?: PersistEnqueueOptions) =>
@@ -1216,6 +1264,32 @@ export function createRuntimeDependencies(
         `
         return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
       })
+    },
+    savePlaidItemCheckpoint: async (connection, cursor) => {
+      const providerConnectionId = connection.providerConnectionId
+      if (!providerConnectionId) throw new Error('Plaid item provider connection identity is required')
+      const authority = await sql<{ authorized: number }[]>`
+        SELECT 1 AS authorized
+        FROM provider_connections
+        WHERE deployment_id = ${deploymentId}
+          AND local_owner_id = ${connection.localOwnerId}
+          AND provider = 'plaid'
+          AND provider_connection_id = ${providerConnectionId}
+          AND provider_generation = ${connection.providerGeneration}
+          AND state = 'active'
+          AND disabled_at IS NULL
+        LIMIT 1
+      `
+      if (authority.length !== 1) throw new Error('plaid item authority is stale')
+      await sql`
+        INSERT INTO plaid_item_checkpoints (
+          deployment_id, local_owner_id, provider_connection_id, provider_generation, cursor
+        ) VALUES (
+          ${deploymentId}, ${connection.localOwnerId}, ${providerConnectionId}, ${connection.providerGeneration}, ${cursor}
+        )
+        ON CONFLICT (deployment_id, local_owner_id, provider_connection_id, provider_generation)
+        DO UPDATE SET cursor = EXCLUDED.cursor, updated_at = now()
+      `
     },
     saveCheckpoint: async (connection, cursor) => sql.begin(async transaction => {
       const tx = transaction as unknown as FinanceSyncSql
