@@ -19,7 +19,7 @@ import { PostgresOnboardingRepository } from './onboarding-repository'
 import { createNativeProviderOnboarding } from './server-onboarding'
 import { createProviderTransportFactories } from './provider-runtime'
 import { fixtureModeEnabled } from './fixture-runtime'
-import { reprojectRetainedInvestecCards, startInvestecCardDrainer } from './investec-card-drainer'
+import { replayQuarantinedInvestecCards, reprojectRetainedInvestecCards, startInvestecCardDrainer } from './investec-card-drainer'
 import { createObservationQuarantineControl } from './observation-quarantine'
 import type { DrainerHandle } from '../drain/drainer'
 
@@ -38,6 +38,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
   let webhookDrainer: DrainerHandle | undefined
   let databaseReady = false; let cycleReady = false; let cycleFailed = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
   let retainedCardReplayNeeded = true
+  let quarantinedCardReplayNeeded = true
   const cycle = async () => {
     if (!config.providersEnabled) {
       connectionCount = 0
@@ -79,6 +80,20 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       // Keep the health server and normal retry loop available when the bridge
       // is transiently unavailable or another outbox row is unresolved.
       console.error('FINANCE_SYNC_RETAINED_CARD_REPROJECTION_FAILED')
+    }
+  }
+  const replayQuarantinedCards = async () => {
+    if (!quarantinedCardReplayNeeded) return
+    if (!deps || !config.projectionEnabled) {
+      quarantinedCardReplayNeeded = false
+      return
+    }
+    try {
+      const replayedCards = await replayQuarantinedInvestecCards(sql, config.deploymentId, deps)
+      quarantinedCardReplayNeeded = false
+      if (replayedCards > 0) console.log('FINANCE_SYNC_CARD_QUARANTINE_REPLAY_OK')
+    } catch {
+      console.error('FINANCE_SYNC_CARD_QUARANTINE_REPLAY_FAILED')
     }
   }
   const replay = async () => {
@@ -127,6 +142,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     }
     await cycle()
     await reprojectRetainedCards()
+    await replayQuarantinedCards()
     if (args.once) { if (!databaseReady || cycleFailed || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
@@ -142,7 +158,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       webhookDrainer = startInvestecCardDrainer(sql, config.deploymentId, deps, process.env)
       console.log(webhookDrainer ? 'FINANCE_SYNC_WEBHOOK_DRAINER_STARTED' : 'FINANCE_SYNC_WEBHOOK_DRAINER_DISABLED')
     }
-    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await reprojectRetainedCards(); if (!stopping) schedule() }, config.intervalMs) }
+    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await reprojectRetainedCards(); await replayQuarantinedCards(); if (!stopping) schedule() }, config.intervalMs) }
     if (config.schedulesEnabled) schedule()
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); webhookDrainer?.stop(); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); webhookDrainer?.stop(); await webhookDrainer?.done; await sql.end() }

@@ -31,6 +31,8 @@ import {
 
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
 const MAX_PROJECTION_BATCH = 25
+const INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS = 3
+const DAY_MS = 86_400_000
 const PLAID_HOSTS = new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com'])
 
 async function ensureFixtureAuthority(sql: FinanceSyncSql, deploymentId: string): Promise<void> {
@@ -457,6 +459,14 @@ function merchantMatches(card: Readonly<Record<string, unknown>>, settled: Reado
   return postedMerchant === cardMerchant || new RegExp(`^${escaped}(?:\\s|$)`).test(postedMerchant)
 }
 
+function cardSettlementDateMatches(cardDate: string, settledDate: string): boolean {
+  const cardMs = Date.parse(`${cardDate}T00:00:00Z`)
+  const settledMs = Date.parse(`${settledDate}T00:00:00Z`)
+  if (!Number.isFinite(cardMs) || !Number.isFinite(settledMs)) return false
+  const days = (settledMs - cardMs) / DAY_MS
+  return Number.isInteger(days) && days >= 0 && days <= INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS
+}
+
 function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
   if (hasConflictingLifecycleIds(card) || hasConflictingLifecycleIds(settled)
     || providerLifecycleTransactionId(card) || providerLifecycleTransactionId(settled)
@@ -474,7 +484,7 @@ function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled:
   if ((!cardFour || !settledFour) && !referencesMatch) return false
   const cardDate = typeof card.transactionDate === 'string' ? card.transactionDate : undefined
   const settledDate = typeof settled.transactionDate === 'string' ? settled.transactionDate : undefined
-  if (!cardDate || !settledDate || cardDate !== settledDate) return false
+  if (!cardDate || !settledDate || !cardSettlementDateMatches(cardDate, settledDate)) return false
   const cardDirection = providerDirection(card)
   if (!cardDirection || cardDirection !== providerDirection(settled)) return false
   if (!merchantMatches(card, settled)) return false
@@ -603,7 +613,9 @@ async function findInvestecCounterpart(
     )
     SELECT payload, provider_version, semantic_hash, observed_at
     FROM latest
-    WHERE payload->>'transactionDate' = ${providerDate}
+    WHERE (payload->>'transactionDate')::date BETWEEN
+        (${providerDate}::date - INTERVAL '3 days')::date
+        AND (${providerDate}::date + INTERVAL '3 days')::date
       AND payload->>'isRemoved' IS DISTINCT FROM 'true'
       AND (
         (provider_version LIKE 'investec:card:%' AND payload->>'status' = 'pending')

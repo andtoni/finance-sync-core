@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseInvestecCardCodeEnvelope, recoverInvestecCardExecution, sanitizeInvestecCardEnvelope } from './investec-card-code-v1'
+import { parseInvestecCardCodeEnvelope, parseInvestecCardDelivery, recoverInvestecCardExecution, sanitizeInvestecCardEnvelope } from './investec-card-code-v1'
 
 describe('Investec Card Code v1 envelope', () => {
   it('accepts a complete after-transaction envelope and normalizes its provider time', () => {
@@ -14,6 +14,19 @@ describe('Investec Card Code v1 envelope', () => {
       providerEventTime: '2026-08-14T17:00:00.000Z',
       transaction: { accountNumber: '1234' },
     })
+  })
+
+  it('wraps the direct transaction body emitted by the admitted queue producer', () => {
+    expect(parseInvestecCardDelivery({
+      accountNumber: '1234', centsAmount: 100, currencyCode: 'USD', type: 'card',
+      dateTime: '2026-08-14T17:00:00+00:00', reference: 'direct-1',
+    })).toMatchObject({
+      schemaVersion: 1,
+      eventType: 'after_transaction',
+      providerEventTime: '2026-08-14T17:00:00.000Z',
+      transaction: { accountNumber: '1234', centsAmount: 100 },
+    })
+    expect(parseInvestecCardDelivery({ accountNumber: '1234', centsAmount: 100, currencyCode: 'USD' })).toBeUndefined()
   })
 
   it('recovers only complete non-sandbox after-transaction execution evidence', () => {

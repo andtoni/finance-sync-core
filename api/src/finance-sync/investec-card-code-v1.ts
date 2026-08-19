@@ -78,3 +78,26 @@ export function parseInvestecCardCodeEnvelope(value: unknown): InvestecCardCodeE
     providerEventTime: new Date(row.providerEventTime).toISOString(),
   }
 }
+
+/**
+ * Accept the direct transaction body emitted by the currently admitted queue
+ * producer as well as the documented v1 wrapper. The transaction normalizer
+ * remains the authority for amount, currency, account, and provider-time
+ * validity; this parser only supplies the missing delivery envelope.
+ */
+export function parseInvestecCardDelivery(value: unknown): InvestecCardCodeEnvelope | undefined {
+  const versioned = parseInvestecCardCodeEnvelope(value)
+  if (versioned) return versioned
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>
+  if (typeof row.accountNumber !== 'string' || !row.accountNumber.trim()
+    || (typeof row.centsAmount !== 'number' && typeof row.centsAmount !== 'string')
+    || typeof row.currencyCode !== 'string' || !row.currencyCode.trim()
+    || typeof row.dateTime !== 'string' || !Number.isFinite(Date.parse(row.dateTime))) return undefined
+  return {
+    schemaVersion: INVESTEC_CARD_CODE_SCHEMA_VERSION,
+    eventType: 'after_transaction',
+    transaction: row,
+    providerEventTime: new Date(row.dateTime).toISOString(),
+  }
+}

@@ -3,7 +3,7 @@ import type { ObservationOutput } from './probes/investec/investec-adapter'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
 import { readExclusiveInput } from './secret-input'
-import { parseInvestecCardCodeEnvelope, sanitizeInvestecCardEnvelope } from './investec-card-code-v1'
+import { parseInvestecCardDelivery, sanitizeInvestecCardEnvelope } from './investec-card-code-v1'
 import { investecCardObservation, accountMask, type InvestecCardPayload } from './investec-card-observation'
 export { investecCardObservation, accountMask, type InvestecCardPayload } from './investec-card-observation'
 
@@ -100,8 +100,8 @@ export async function reprojectRetainedInvestecCards(
     const providerAccountId = stringValue(normalizedPayload?.accountId)
     const rawEvidence = record(row.raw_payload)
     const versioned = rawEvidence && (
-      parseInvestecCardCodeEnvelope(rawEvidence)
-      ?? parseInvestecCardCodeEnvelope(record(rawEvidence.payload))
+      parseInvestecCardDelivery(rawEvidence)
+      ?? parseInvestecCardDelivery(record(rawEvidence.payload))
     )
     const rawPayload = versioned?.transaction ?? (rawEvidence?.schemaVersion === undefined ? rawEvidence : undefined)
     // Legacy retained card observations without an exact provider date are
@@ -163,10 +163,65 @@ export async function reprojectRetainedInvestecCards(
   return reprojected
 }
 
+interface CardIngressQuarantineRow {
+  readonly quarantine_id: string
+  readonly envelope: unknown
+}
+
+function decodeStoredCardEnvelope(value: unknown): RecordValue | undefined {
+  const decoded = record(value)
+  if (decoded) return decoded
+  if (typeof value !== 'string') return undefined
+  try {
+    return record(JSON.parse(value))
+  } catch {
+    return undefined
+  }
+}
+
+function nonZeroCardCents(value: unknown): boolean {
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0
+  return typeof value === 'string' && /^\d+$/.test(value.trim()) && !/^0+$/.test(value.trim())
+}
+
+/** Replay retained direct card deliveries without mutating the quarantine evidence. */
+export async function replayQuarantinedInvestecCards(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  deps: SyncRuntimeDependencies,
+): Promise<number> {
+  const rows = await sql<CardIngressQuarantineRow[]>`
+    SELECT quarantine_id, envelope
+    FROM card_ingress_quarantines
+    WHERE deployment_id = ${deploymentId}
+      AND source = 'investec_card_code'
+      AND reason = 'INVALID_CARD_CODE_V1'
+    ORDER BY created_at, quarantine_id
+  `
+  if (rows.length === 0) return 0
+  const connections = await deps.loadConnections(deploymentId)
+  let replayed = 0
+  for (const row of rows) {
+    const envelope = decodeStoredCardEnvelope(row.envelope)
+    const payload = record(envelope?.payload)
+    const versioned = payload ? parseInvestecCardDelivery(payload) : undefined
+    if (!versioned || versioned.eventType !== 'after_transaction' || !nonZeroCardCents(versioned.transaction.centsAmount)) continue
+    await handleInvestecCardMessage(
+      sql,
+      deploymentId,
+      deps,
+      { lease_id: `quarantine:${row.quarantine_id}`, id: row.quarantine_id, attempts: 0, envelope },
+      connections,
+    )
+    replayed++
+  }
+  return replayed
+}
+
 async function quarantineCardIngress(sql: FinanceSyncSql, deploymentId: string, reason: string, envelope: unknown): Promise<void> {
   await sql`
     INSERT INTO card_ingress_quarantines (deployment_id, source, reason, envelope)
-    VALUES (${deploymentId}, 'investec_card_code', ${reason}, ${JSON.stringify(sanitizeInvestecCardEnvelope(envelope))}::jsonb)
+    VALUES (${deploymentId}, 'investec_card_code', ${reason}, ${sql.json(sanitizeInvestecCardEnvelope(envelope) as never)})
   `
 }
 
@@ -181,7 +236,7 @@ async function handleInvestecCardMessage(
   if (envelope?.source !== 'investec') return false
   const rawPayload = record(envelope.payload)
   if (!rawPayload) { await quarantineCardIngress(sql, deploymentId, 'MISSING_PAYLOAD', envelope); return true }
-  const versioned = parseInvestecCardCodeEnvelope(rawPayload)
+  const versioned = parseInvestecCardDelivery(rawPayload)
   if (!versioned) { await quarantineCardIngress(sql, deploymentId, 'INVALID_CARD_CODE_V1', envelope); return true }
   if (versioned.eventType === 'after_decline') { await quarantineCardIngress(sql, deploymentId, 'AFTER_DECLINE', envelope); return true }
   const payload = versioned.transaction as InvestecCardPayload
