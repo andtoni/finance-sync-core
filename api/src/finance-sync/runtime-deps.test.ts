@@ -773,6 +773,38 @@ describe('Investec card and poll lifecycle correlation', () => {
     })
   })
 
+  it('correlates an exact settlement when the booked row omits card last four', async () => {
+    const card = {
+      ...inferredCardPayload,
+      transactionId: 'reference-card-1',
+      providerVersion: 'investec:card:reference-card-1',
+      semanticHash: 'reference-card-hash',
+      cardNumber: undefined,
+      reference: 'AMAZON-0001',
+    }
+    const settled = {
+      ...inferredSettledPayload,
+      transactionId: 'reference-settled-1',
+      providerVersion: 'investec:txn:reference-settled-1',
+      semanticHash: 'reference-settled-hash',
+      cardNumber: undefined,
+      reference: 'AMAZON-0001',
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000109', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    const operations = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operations).toHaveLength(2)
+    expect(operations.some(operation => operation.lifecycleSuccessorId?.endsWith(':reference-settled-1'))).toBe(true)
+  })
   it('leaves ambiguous exact provider facts visible without a lifecycle successor', async () => {
     const secondSettled = { ...inferredSettledPayload, transactionId: 'facts-settled-2', providerVersion: 'investec:txn:facts-settled-2', semanticHash: 'facts-settled-hash-2', amount: '-192.00', settlementAmount: '-192.00' }
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000103', payload: {

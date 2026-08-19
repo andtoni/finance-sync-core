@@ -444,6 +444,11 @@ function providerDirection(payload: Readonly<Record<string, unknown>>): string |
   return value === 'DEBIT' || value === 'CREDIT' ? value : undefined
 }
 
+function providerReference(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const value = normalizedText(payload.reference)
+  return value || undefined
+}
+
 function merchantMatches(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
   const cardMerchant = normalizedText(card.description).normalize('NFKC')
   const postedMerchant = normalizedText(settled.description).normalize('NFKC')
@@ -459,7 +464,14 @@ function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled:
     || providerTransactionType(settled) !== 'CARDPURCHASES') return false
   const cardFour = terminalFour(card.cardNumber)
   const settledFour = terminalFour(settled.cardNumber)
-  if (!cardFour || !settledFour || cardFour !== settledFour) return false
+  const cardReference = providerReference(card)
+  const settledReference = providerReference(settled)
+  const referencesMatch = cardReference !== undefined && cardReference === settledReference
+  // Investec's booked CARDPURCHASES response does not always repeat the card
+  // last four. An exact shared provider reference is an equally strong link in
+  // that shape; conflicting last-four evidence still fails closed.
+  if (cardFour && settledFour && cardFour !== settledFour) return false
+  if ((!cardFour || !settledFour) && !referencesMatch) return false
   const cardDate = typeof card.transactionDate === 'string' ? card.transactionDate : undefined
   const settledDate = typeof settled.transactionDate === 'string' ? settled.transactionDate : undefined
   if (!cardDate || !settledDate || cardDate !== settledDate) return false
