@@ -63,7 +63,8 @@ function providerPayload(rawPayload: unknown, normalized: RecordValue): Investec
   const transaction = versioned?.transaction ?? record(raw?.transaction) ?? raw
   if (transaction) return transaction as InvestecCardPayload
   const transactionDate = stringValue(normalized.authorizationDateTime)
-    ?? (stringValue(normalized.transactionDate) ? `${normalized.transactionDate}T00:00:00.000Z` : undefined)
+    ?? (stringValue(normalized.transactionDate ?? normalized.date)
+      ? `${normalized.transactionDate ?? normalized.date}T00:00:00.000Z` : undefined)
   const amount = stringValue(normalized.amount)?.replace('-', '')
   if (!transactionDate || !amount) throw new InvestecCardCurrencyCorrectionError(422, 'retained card payload lacks provider time or amount evidence')
   const centsAmount = positiveDecimalToCents(amount)

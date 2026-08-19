@@ -33,7 +33,7 @@ describe('owner-authorized Investec card currency correction', () => {
     const persisted: unknown[] = []
     const sql = (async () => [{
       observation_id: 'observation-1', quarantine_id: 'quarantine-1',
-      payload: sourceObservation.payload, raw_payload: sourcePayload,
+      payload: sourceObservation.payload, raw_payload: null,
       observed_at: sourceObservation.observedAt, provider_account_id: providerAccountId,
       account_currency: 'ZAR',
     }]) as unknown as FinanceSyncSql
