@@ -1,7 +1,7 @@
 /** Finance Sync durable runner: read-only provider ingestion, canonical persistence, bridge outbox projection. */
 import { createServer } from 'node:http'
 import { resolve } from 'node:path'
-import { assertBridgeConfiguration, createRuntimeDependencies } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles } from './runtime-deps'
 import { runConfiguredSyncCycle } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
@@ -21,6 +21,7 @@ import { createProviderTransportFactories } from './provider-runtime'
 import { fixtureModeEnabled } from './fixture-runtime'
 import { replayQuarantinedInvestecCards, reprojectRetainedInvestecCards, startInvestecCardDrainer } from './investec-card-drainer'
 import { createObservationQuarantineControl } from './observation-quarantine'
+import { createInvestecCardCurrencyCorrectionControl } from './investec-card-correction'
 import type { DrainerHandle } from '../drain/drainer'
 
 interface CliArgs { help?: boolean; once?: boolean }
@@ -96,6 +97,24 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       console.error('FINANCE_SYNC_CARD_QUARANTINE_REPLAY_FAILED')
     }
   }
+  const sweepInvestecCardLifecycles = async () => {
+    if (!deps || !config.projectionEnabled) return
+    try {
+      const connections = await deps.loadConnections(config.deploymentId)
+      let swept = 0
+      for (const connection of connections) {
+        if (connection.provider !== 'investec') continue
+        swept += await reconcileInvestecCardLifecycles(sql, config.deploymentId, connection, deps)
+        const projection = await deps.projectPending(connection)
+        if (projection.failed > 0) throw new Error('Investec lifecycle sweep projection is unresolved')
+      }
+      if (swept > 0) console.log('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_OK')
+    } catch {
+      cycleReady = false
+      cycleFailed = true
+      console.error('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_FAILED')
+    }
+  }
   const replay = async () => {
     try { await sql`SELECT 1`; databaseReady = true }
     catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
@@ -143,12 +162,14 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     await cycle()
     await reprojectRetainedCards()
     await replayQuarantinedCards()
+    await sweepInvestecCardLifecycles()
     if (args.once) { if (!databaseReady || cycleFailed || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
       providersEnabled: config.providersEnabled,
       connect,
       quarantine: createObservationQuarantineControl(sql, config.deploymentId),
+      investecCardCorrection: deps ? createInvestecCardCurrencyCorrectionControl(sql, config.deploymentId, deps) : undefined,
       health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount, cycleFailed); return { status: body.ok ? 200 : 503, body } },
     })
     const server = createServer((request, response) => { void handler(request, response) })
@@ -158,7 +179,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       webhookDrainer = startInvestecCardDrainer(sql, config.deploymentId, deps, process.env)
       console.log(webhookDrainer ? 'FINANCE_SYNC_WEBHOOK_DRAINER_STARTED' : 'FINANCE_SYNC_WEBHOOK_DRAINER_DISABLED')
     }
-    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await reprojectRetainedCards(); await replayQuarantinedCards(); if (!stopping) schedule() }, config.intervalMs) }
+    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await reprojectRetainedCards(); await replayQuarantinedCards(); await sweepInvestecCardLifecycles(); if (!stopping) schedule() }, config.intervalMs) }
     if (config.schedulesEnabled) schedule()
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); webhookDrainer?.stop(); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); webhookDrainer?.stop(); await webhookDrainer?.done; await sql.end() }

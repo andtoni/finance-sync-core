@@ -27,6 +27,10 @@ describe('Investec Card Code v1 envelope', () => {
       transaction: { accountNumber: '1234', centsAmount: 100 },
     })
     expect(parseInvestecCardDelivery({ accountNumber: '1234', centsAmount: 100, currencyCode: 'USD' })).toBeUndefined()
+    expect(parseInvestecCardDelivery({
+      accountNumber: '1234', centsAmount: '100', currencyCode: 'USD', type: 'card',
+      dateTime: '2026-08-14T17:00:00Z', reference: 'direct-string-1', deliveryAttempt: 2,
+    })).toMatchObject({ transaction: { centsAmount: '100', reference: 'direct-string-1' } })
   })
 
   it('recovers only complete non-sandbox after-transaction execution evidence', () => {

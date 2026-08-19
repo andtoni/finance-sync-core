@@ -821,6 +821,83 @@ async function investecProjectionOperations(
   return pending ? [pending, lifecycle] : [lifecycle]
 }
 
+interface InvestecPostedCardLifecycleRow {
+  readonly payload: unknown
+  readonly raw_payload: unknown
+  readonly provider_version: string
+  readonly semantic_hash: string
+  readonly hash_specification_version: number
+  readonly observed_at: string
+}
+
+/**
+ * Re-run every latest posted Investec CARDPURCHASES fact through the lifecycle
+ * matcher. Provider cursors and queue delivery are independent, so a posted
+ * row can be re-observed after its authorization or after a prior matcher
+ * defect. The raw row is immutable and the outbox is idempotent; this sweep is
+ * the durable convergence mechanism, not a second source of activity facts.
+ */
+export async function reconcileInvestecCardLifecycles(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  deps: SyncRuntimeDependencies,
+): Promise<number> {
+  if (connection.provider !== 'investec') return 0
+  const rows = await sql<InvestecPostedCardLifecycleRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (payload->>'transactionId')
+        payload, raw_payload, provider_version, semantic_hash,
+        hash_specification_version, observed_at, deployment_id,
+        local_owner_id, source_resource_incarnation_id
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND local_owner_id = ${connection.localOwnerId}
+        AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+        AND provider_version LIKE 'investec:txn:%'
+      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, raw_payload, provider_version, semantic_hash,
+      hash_specification_version, observed_at
+    FROM latest
+    WHERE payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND payload->>'status' = 'posted'
+      AND (
+        payload->>'transactionType' = 'CARDPURCHASES'
+        OR payload->'metadata'->'providerOwned'->'investec'->>'providerTransactionType' = 'CARDPURCHASES'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = latest.deployment_id
+          AND q.local_owner_id = latest.local_owner_id
+          AND q.source_resource_incarnation_id = latest.source_resource_incarnation_id
+          AND q.provider_version = latest.provider_version
+          AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  const observations: ObservationOutput[] = []
+  for (const row of rows) {
+    const payload = observationPayload(row.payload)
+    if (!payload || typeof payload.transactionId !== 'string' || typeof payload.accountId !== 'string') continue
+    observations.push({
+      deploymentId,
+      localOwnerId: connection.localOwnerId,
+      sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+      providerVersion: row.provider_version,
+      semanticHash: row.semantic_hash,
+      hashSpecificationVersion: row.hash_specification_version,
+      domain: 'cash_ledger',
+      payload,
+      ...(row.raw_payload === null || row.raw_payload === undefined ? {} : { rawPayload: row.raw_payload }),
+      observedAt: row.observed_at,
+    })
+  }
+  if (observations.length === 0) return 0
+  await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
+  return observations.length
+}
+
 export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {
   const allowedBridgeHosts = bridgeHosts(env)
   requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture)

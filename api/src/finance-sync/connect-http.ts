@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { ConnectControlError, FinanceSyncConnectControl } from './connect-control'
 import { ObservationQuarantineError, type ObservationQuarantineRequest } from './observation-quarantine'
+import { InvestecCardCurrencyCorrectionError, type InvestecCardCurrencyCorrectionRequest } from './investec-card-correction'
 
 const MAX_JSON_BODY_BYTES = 16 * 1024
 
@@ -42,6 +43,7 @@ export function createFinanceSyncHttpHandler(input: {
   readonly providersEnabled: boolean
   readonly connect?: FinanceSyncConnectControl
   readonly quarantine?: { create(rawSubject: string, request: ObservationQuarantineRequest): Promise<unknown> }
+  readonly investecCardCorrection?: { create(rawSubject: string, request: InvestecCardCurrencyCorrectionRequest): Promise<unknown> }
   readonly health: () => { readonly status: number; readonly body: unknown }
 }) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -64,6 +66,36 @@ export function createFinanceSyncHttpHandler(input: {
     const connect = input.connect
 
     try {
+      if (request.method === 'POST' && path === '/control/v1/investec/card-currency-corrections') {
+        if (!input.investecCardCorrection) return send(response, 503, { error: 'projection_control_disabled' })
+        const body = await jsonBody(request)
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        const sourceResourceIncarnationId = body.sourceResourceIncarnationId
+        const providerVersion = body.providerVersion
+        const semanticHash = body.semanticHash
+        const hashSpecificationVersion = body.hashSpecificationVersion
+        const amount = body.amount
+        const currency = body.currency
+        const reason = body.reason
+        if (typeof sourceResourceIncarnationId !== 'string' || !uuid.test(sourceResourceIncarnationId)
+          || typeof providerVersion !== 'string' || !providerVersion.startsWith('investec:card:') || providerVersion.length > 512
+          || typeof semanticHash !== 'string' || !/^[a-f0-9]{64}$/i.test(semanticHash)
+          || typeof hashSpecificationVersion !== 'number' || !Number.isSafeInteger(hashSpecificationVersion) || hashSpecificationVersion < 1
+          || typeof amount !== 'string' || !/^\d+(?:\.\d{1,2})?$/.test(amount) || /^0+(?:\.0{1,2})?$/.test(amount)
+          || typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency)
+          || typeof reason !== 'string' || reason.trim().length < 1 || reason.trim().length > 2048) {
+          throw new ConnectControlError(400, 'invalid Investec card currency correction request')
+        }
+        return send(response, 200, await input.investecCardCorrection.create(rawSubject, {
+          sourceResourceIncarnationId,
+          providerVersion,
+          semanticHash: semanticHash.toLowerCase(),
+          hashSpecificationVersion,
+          amount,
+          currency,
+          reason: reason.trim(),
+        }))
+      }
       if (request.method === 'POST' && path === '/control/v1/observation-quarantines') {
         if (!input.quarantine) return send(response, 503, { error: 'projection_control_disabled' })
         const body = await jsonBody(request)
@@ -138,7 +170,9 @@ export function createFinanceSyncHttpHandler(input: {
       }
       return send(response, 404, { error: 'not_found' })
     } catch (error) {
-      const status = error instanceof ConnectControlError || error instanceof ObservationQuarantineError ? error.status : 500
+      const status = error instanceof ConnectControlError
+        || error instanceof ObservationQuarantineError
+        || error instanceof InvestecCardCurrencyCorrectionError ? error.status : 500
       return send(response, status, { error: 'request_failed' })
     }
   }

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { assertBridgeConfiguration, createRuntimeDependencies } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles } from './runtime-deps'
 import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
-import type { RuntimeConnection } from './runtime'
+import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
 
 const CONNECTION: RuntimeConnection = {
@@ -760,6 +760,45 @@ describe('Investec card and poll lifecycle correlation', () => {
     const operations = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
     expect(operations).toHaveLength(2)
     expect(operations.some(operation => operation.lifecycleSuccessorId?.endsWith(':date-drift-settled'))).toBe(true)
+  })
+
+  it('sweeps retained posted card facts through lifecycle projection even without a new provider row', async () => {
+    let persisted: readonly unknown[] = []
+    const sql = (async () => [{
+      payload: inferredSettledPayload, raw_payload: null,
+      provider_version: inferredSettledPayload.providerVersion, semantic_hash: 'sweep-settled-hash',
+      hash_specification_version: 4, observed_at: inferredSettledPayload.observedAt,
+    }]) as unknown as FinanceSyncSql
+    const deps = {
+      persistAndEnqueue: async (_connection: RuntimeConnection, observations: readonly unknown[]) => { persisted = observations; return 1 },
+    } as unknown as SyncRuntimeDependencies
+    await expect(reconcileInvestecCardLifecycles(sql, 'dep-1', INVESTEC_CONNECTION, deps)).resolves.toBe(1)
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]).toMatchObject({ providerVersion: inferredSettledPayload.providerVersion, semanticHash: 'sweep-settled-hash' })
+  })
+
+  it('correlates a posted-first one-day date-drift settlement on a later pass', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'posted-first-date-drift-card', providerVersion: 'investec:card:posted-first-date-drift-card', semanticHash: 'posted-first-date-drift-card-hash' }
+    const settled = {
+      ...inferredSettledPayload,
+      transactionId: 'posted-first-date-drift-settled',
+      providerVersion: 'investec:txn:posted-first-date-drift-settled',
+      semanticHash: 'posted-first-date-drift-settled-hash',
+      date: '2026-08-15', transactionDate: '2026-08-15', postingDate: '2026-08-15', settlementDate: '2026-08-15',
+    }
+    const fixture = outboxSql({ id: '00000000-0000-4000-8000-000000000111', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [card])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: settled.providerVersion, semanticHash: settled.semanticHash,
+      hashSpecificationVersion: 4, observedAt: settled.observedAt, domain: 'cash_ledger', payload: settled,
+    }], { skipCurrentState: true })
+    const operations = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
+    expect(operations.some(operation => operation.lifecycleSuccessorId?.endsWith(':posted-first-date-drift-settled'))).toBe(true)
   })
 
   it('strips provisional spending metadata from the settled successor', async () => {

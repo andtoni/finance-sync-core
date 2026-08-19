@@ -9,10 +9,12 @@ let server: ReturnType<typeof createServer>
 let base: string
 let admitted: Record<string, unknown>[]
 let quarantined: Record<string, unknown>[]
+let corrected: Record<string, unknown>[]
 
 beforeEach(async () => {
   admitted = []
   quarantined = []
+  corrected = []
   const connect = new FinanceSyncConnectControl({
     deploymentId: 'deployment-1',
     connections: [],
@@ -46,6 +48,13 @@ beforeEach(async () => {
       create: async (rawSubject, request) => {
         const result = { rawSubject, ...request, quarantineId: 'quarantine-1' }
         quarantined.push(result)
+        return result
+      },
+    },
+    investecCardCorrection: {
+      create: async (rawSubject, request) => {
+        const result = { rawSubject, ...request, correctionId: 'correction-1' }
+        corrected.push(result)
         return result
       },
     },
@@ -136,6 +145,27 @@ describe('Finance Sync internal Connect HTTP routes', () => {
       baselineKind: 'relink', priorProviderGeneration: 2, databaseStateDigest: relinkDigest })
   })
 
+  it('creates an owner-authorized Investec card currency correction request', async () => {
+    const request = {
+      sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
+      providerVersion: 'investec:card:investec-card:account:reference-1',
+      semanticHash: 'a'.repeat(64), hashSpecificationVersion: 1,
+      amount: '1000.00', currency: 'USD', reason: 'owner authorized USD card evidence',
+    }
+    const response = await fetch(`${base}/control/v1/investec/card-currency-corrections`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify(request),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ ...request, rawSubject: subject, correctionId: 'correction-1' })
+    expect(corrected).toEqual([{ ...request, rawSubject: subject, correctionId: 'correction-1' }])
+
+    const invalid = await fetch(`${base}/control/v1/investec/card-currency-corrections`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ ...request, amount: '0.00' }),
+    })
+    expect(invalid.status).toBe(400)
+  })
+
   it('creates an exact authenticated observation quarantine request', async () => {
     const request = {
       sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
@@ -189,6 +219,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
         ['/control/v1/provider-connections/mercury/start', { method: 'POST' }],
         ['/control/v1/provider-connections/snaptrade/start', { method: 'POST' }],
         ['/control/v1/observation-quarantines', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
+        ['/control/v1/investec/card-currency-corrections', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
       ] as const
       for (const [path, init] of requests) {
         const response = await fetch(`${disabledBase}${path}`, { ...init, headers: headers('headers' in init ? init.headers : {}) })
