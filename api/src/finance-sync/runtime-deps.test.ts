@@ -1090,7 +1090,7 @@ describe('projectPending transaction and receipt contract', () => {
       expect(fixture.queries.some(query => /FOR UPDATE SKIP LOCKED/i.test(query))).toBe(true)
       expect(fixture.queries.filter(query => /projection_outbox/i.test(query))
         .every(query => /provider_generation/i.test(query))).toBe(true)
-      expect(fixture.queries.some(query => /ORDER BY \(payload->>'kind' = 'CurrentStateUpsert'\) DESC/i.test(query))).toBe(true)
+      expect(fixture.queries.some(query => /ORDER BY \(payload->>'kind' = 'CurrentStateUpsert'\) DESC,[\s\S]*CASE WHEN payload->>'kind' = 'CurrentStateUpsert' THEN created_at END DESC/i.test(query))).toBe(true)
     } finally {
       globalThis.fetch = originalFetch
     }
