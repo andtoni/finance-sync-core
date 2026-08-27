@@ -1240,29 +1240,52 @@ export function createRuntimeDependencies(
       return sql.begin(async transaction => {
         const tx = transaction as unknown as FinanceSyncSql
         await assertDurableAuthority(tx, deploymentId, connection)
-        const unresolvedBefore = await tx<{ count: number }[]>`
-          SELECT count(*)::integer AS count
+        const deadLetters = await tx<{ kind: string | null; count: number }[]>`
+          SELECT payload->>'kind' AS kind, count(*)::integer AS count
           FROM projection_outbox
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
             AND provider_generation = ${connection.providerGeneration}
             AND state = 'dead_letter'
+          GROUP BY payload->>'kind'
         `
-        if ((unresolvedBefore[0]?.count ?? 0) > 0) return { delivered: 0, failed: unresolvedBefore[0].count }
+        const deadLetterCount = deadLetters.reduce((total, row) => total + row.count, 0)
+        const currentStateDeadLetterCount = deadLetters
+          .filter(row => row.kind === 'CurrentStateUpsert')
+          .reduce((total, row) => total + row.count, 0)
+        // A failed current-state write can make later snapshots unsafe to apply,
+        // so retain the original full-stop behavior for that lane. An activity or
+        // lifecycle dead letter is independent of a later account snapshot; let
+        // the snapshot through while keeping activity delivery and the checkpoint
+        // fenced until the dead letter is explicitly resolved.
+        if (currentStateDeadLetterCount > 0) return { delivered: 0, failed: deadLetterCount }
 
         let delivered = 0
         let deliveryFailures = 0
-        const rows = await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
-          SELECT id, payload, attempts, state
-          FROM projection_outbox
-          WHERE deployment_id = ${deploymentId}
-            AND connection_id = ${connection.connectionId}
-            AND provider_generation = ${connection.providerGeneration}
-            AND state IN ('pending', 'uncertain')
-          ORDER BY created_at, (payload ? 'lifecycleSuccessorId'), id
-          LIMIT ${MAX_PROJECTION_BATCH}
-          FOR UPDATE SKIP LOCKED
-        `
+        const rows = deadLetterCount > 0
+          ? await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
+            SELECT id, payload, attempts, state
+            FROM projection_outbox
+            WHERE deployment_id = ${deploymentId}
+              AND connection_id = ${connection.connectionId}
+              AND provider_generation = ${connection.providerGeneration}
+              AND state IN ('pending', 'uncertain')
+              AND payload->>'kind' = 'CurrentStateUpsert'
+            ORDER BY created_at, (payload ? 'lifecycleSuccessorId'), id
+            LIMIT ${MAX_PROJECTION_BATCH}
+            FOR UPDATE SKIP LOCKED
+          `
+          : await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
+            SELECT id, payload, attempts, state
+            FROM projection_outbox
+            WHERE deployment_id = ${deploymentId}
+              AND connection_id = ${connection.connectionId}
+              AND provider_generation = ${connection.providerGeneration}
+              AND state IN ('pending', 'uncertain')
+            ORDER BY created_at, (payload ? 'lifecycleSuccessorId'), id
+            LIMIT ${MAX_PROJECTION_BATCH}
+            FOR UPDATE SKIP LOCKED
+          `
         for (const row of rows) {
           const markDelivered = async () => {
             await tx`

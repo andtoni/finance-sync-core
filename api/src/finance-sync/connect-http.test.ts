@@ -17,9 +17,16 @@ beforeEach(async () => {
   corrected = []
   const connect = new FinanceSyncConnectControl({
     deploymentId: 'deployment-1',
-    connections: [],
+    connections: [{
+      provider: 'plaid' as const, connectionId: 'runtime-connection', providerConnectionId: 'item-1', deploymentId: 'deployment-1',
+      localOwnerId: subject, sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
+      accountIds: ['account-1'], wealthfolioAccountIds: { 'account-1': 'wf-1' },
+      providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'PLAID_SLOT_A',
+      clientId: 'client-id', clientSecret: 'client-secret', accessToken: 'durable-secret',
+    }],
     plaid: {
       createLinkToken: async () => ({ linkToken: 'link-token' }),
+      createUpdateLinkToken: async () => ({ linkToken: 'update-link-token' }),
       exchangePublicToken: async () => ({ clientId: 'client-id', clientSecret: 'client-secret', accessToken: 'durable-secret', itemId: 'item-1' }),
       listAccounts: async () => [{ providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', assets: [] }],
     },
@@ -27,7 +34,13 @@ beforeEach(async () => {
       available: true, allowedSlots: ['PLAID_SLOT_A', 'PLAID_SLOT_B'],
       storePlaidAccessToken: async () => 'PLAID_SLOT_A',
     },
-    sessionStore: { create: async () => 'continuation-token', consume: async () => 'PLAID_SLOT_A', release: async () => undefined },
+    sessionStore: {
+      create: async () => 'continuation-token',
+      consume: async input => input.flow === 'update'
+        ? { secretReference: 'PLAID_SLOT_A', flow: 'update' as const, providerConnectionId: 'item-1', providerGeneration: 1 }
+        : { secretReference: 'PLAID_SLOT_A', flow: 'new' as const },
+      release: async () => undefined,
+    },
     onboarding: {
       listPending: async boundSubject => [{ connectionId: 'connection-1', providerGeneration: 3, providerAccountId: 'account-1', name: boundSubject, type: 'checking', currency: 'USD', assets: [] }],
       admit: async input => {
@@ -41,6 +54,7 @@ beforeEach(async () => {
         receiverAccessGeneration: 7, baselineStatus: 'verified', baselineDigest: 'sha256:baseline', assetMappingDigest: 'sha256:empty' }),
     },
     onPlaidConnected: async () => undefined,
+    onPlaidAccountsUpdated: async () => undefined,
   })
   const handler = createFinanceSyncHttpHandler({
     controlToken, providersEnabled: true, connect,
@@ -84,6 +98,16 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     const started = await fetch(`${base}/control/v1/provider-connections/plaid/start`, { method: 'POST', headers: headers() })
     expect(started.status).toBe(200)
     expect(await started.json()).toMatchObject({ provider: 'plaid', status: 'link_ready', message: 'Plaid Link is ready.', linkToken: 'link-token', continuationToken: 'continuation-token' })
+
+    const update = await fetch(`${base}/control/v1/provider-connections/plaid/update`, { method: 'POST', headers: headers() })
+    expect(update.status).toBe(200)
+    expect(await update.json()).toMatchObject({ provider: 'plaid', status: 'link_ready', message: 'Plaid Link is ready to add accounts.', linkToken: 'update-link-token', continuationToken: 'continuation-token' })
+
+    const updateComplete = await fetch(`${base}/control/v1/provider-connections/plaid/update/complete`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ continuationToken: 'continuation-token' }),
+    })
+    expect(updateComplete.status).toBe(200)
+    expect(await updateComplete.json()).toEqual({ provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' })
   })
 
   it('requires bounded JSON for Plaid completion and returns only a redacted typed response', async () => {
@@ -213,7 +237,9 @@ describe('Finance Sync internal Connect HTTP routes', () => {
         ['/control/v1/provider-connections/plaid/admissions/connection-1/account-1', { method: 'GET' }],
         ['/control/v1/provider-connections/plaid/admit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
         ['/control/v1/provider-connections/plaid/start', { method: 'POST' }],
+        ['/control/v1/provider-connections/plaid/update', { method: 'POST' }],
         ['/control/v1/provider-connections/plaid/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ publicToken: 'token', continuationToken: 'token' }) }],
+        ['/control/v1/provider-connections/plaid/update/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ continuationToken: 'token' }) }],
         ['/control/v1/provider-connections/plaid/connection-1', { method: 'DELETE' }],
         ['/control/v1/provider-connections/investec/start', { method: 'POST' }],
         ['/control/v1/provider-connections/mercury/start', { method: 'POST' }],

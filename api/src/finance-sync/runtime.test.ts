@@ -3,7 +3,7 @@ import { runConfiguredSyncCycle, type SyncRuntimeDependencies } from './runtime'
 import type { ObservationOutput } from './probes/investec/investec-adapter'
 
 const plaidConnection = (connectionId: string, accessToken: string, accountId = 'a') => ({
-  provider: 'plaid' as const, connectionId, deploymentId: 'd', clientId: 'client', clientSecret: 'secret', accessToken,
+  provider: 'plaid' as const, connectionId, providerConnectionId: connectionId, deploymentId: 'd', clientId: 'client', clientSecret: 'secret', accessToken,
   localOwnerId: 'owner', sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
   accountIds: [accountId], wealthfolioAccountIds: { [accountId]: 'wf-a' }, providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'TEST_SLOT',
 })
@@ -282,6 +282,25 @@ describe('configured sync runtime', () => {
     expect(savedCursor).toBe('item-cursor-1')
     expect(result.observations).toBe(2)
     expect(result.failures).toBe(0)
+  })
+
+  it('holds the Plaid item cursor when current-state delivery succeeds but activity work remains unresolved', async () => {
+    const connection = plaidConnection('plaid-held-cursor', 'token')
+    let checkpointed = false
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [connection],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      runProvider: async () => ({ nextCursor: 'item-cursor-after-current-state', observations: [] }),
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 1, failed: 1 }),
+      saveCheckpoint: async () => {},
+      savePlaidItemCheckpoint: async () => { checkpointed = true },
+    }
+    const result = await runConfiguredSyncCycle('d', deps)
+    expect(result.delivered).toBe(1)
+    expect(result.failures).toBeGreaterThan(0)
+    expect(checkpointed).toBe(false)
   })
 
   it('Plaid item fails closed on credential mismatch', async () => {

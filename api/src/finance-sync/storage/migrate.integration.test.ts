@@ -136,7 +136,7 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql!, directory);
     await migrate(sql!, directory);
     const rows = await sql!`select version from finance_sync_schema_migrations order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
     const rawColumns = await sql!`
       select column_name from information_schema.columns
       where table_name = 'raw_observations' and column_name = 'raw_payload'
@@ -147,6 +147,11 @@ suite("PostgreSQL migrations (integration)", () => {
       where table_name = 'card_ingress_quarantines'
     `;
     expect(cardIngressQuarantine).toHaveLength(1);
+    const plaidSessionColumns = await sql!`
+      select column_name from information_schema.columns
+      where table_name = 'provider_connect_sessions' and column_name in ('flow_kind', 'provider_connection_id', 'provider_generation')
+    `;
+    expect(plaidSessionColumns.map((row) => row.column_name).sort()).toEqual(['flow_kind', 'provider_connection_id', 'provider_generation']);
 
     await sql!`insert into finance_sync_migrations (deployment_id, version, name, checksum) values ('conflicting-legacy', 1, 'identity', ${'0'.repeat(64)})`;
     await expect(migrate(sql!, directory)).rejects.toThrow(/checksum conflict/i);

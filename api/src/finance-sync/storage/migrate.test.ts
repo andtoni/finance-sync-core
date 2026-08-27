@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -37,6 +37,14 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/ALTER COLUMN selected_secret_reference SET NOT NULL/i);
     expect(sql).toMatch(/provider_connect_sessions_live_slot_idx/i);
     expect(sql).toMatch(/selected_secret_reference\)\s*WHERE released_at IS NULL/i);
+  });
+
+  it("binds Plaid update sessions to the existing Item and flow", () => {
+    const sql = readFileSync(resolve(root, "0017_plaid_update_sessions.sql"), "utf8");
+    expect(sql).toMatch(/flow_kind text NOT NULL DEFAULT 'new'/i);
+    expect(sql).toMatch(/provider_connection_id text/i);
+    expect(sql).toMatch(/provider_generation integer/i);
+    expect(sql).toMatch(/flow_kind = 'update'[\s\S]*provider_connection_id IS NOT NULL[\s\S]*provider_generation IS NOT NULL/i);
   });
 
   it("rebinds active admissions and unresolved bridge work to the latest receiver access generation", () => {

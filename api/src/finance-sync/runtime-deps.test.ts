@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles } from './runtime-deps'
 import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
+import { bridgeOperationToWire, currentStateToBridge, validateBridgeReceipt } from './projection/bridge-client'
+import { currentStateSemanticHash } from './projection/current-state'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
@@ -157,6 +159,9 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
         return { payload, raw_payload: null, provider_version: 'investec:txn:prior' }
       })
     }
+    if (/GROUP BY payload->>'kind'/i.test(text)) {
+      return state === 'dead_letter' ? [{ kind: row.payload.kind, count: 1 }] : []
+    }
     if (/count\(\*\)/i.test(text)) {
       const count = /state\s*=\s*'dead_letter'/i.test(text)
         ? Number(state === 'dead_letter')
@@ -177,6 +182,46 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
   ;(sql as unknown as { begin: (fn: (tx: FinanceSyncSql) => Promise<unknown>) => Promise<unknown> }).begin = fn => fn(sql)
   ;(sql as unknown as { json: (value: unknown) => unknown }).json = value => value
   return { sql, state: () => state, attempts: () => attempts, queries, enqueued, rawPayloads }
+}
+
+function projectOutboxSql(input: readonly { id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' }[]) {
+  const rows = input.map(row => ({ ...row }))
+  const queries: string[] = []
+  const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const text = strings.join('?')
+    queries.push(text)
+    if (/GROUP BY payload->>'kind'/i.test(text)) {
+      const counts = new Map<string | null, number>()
+      for (const row of rows.filter(row => row.state === 'dead_letter')) {
+        const kind = row.payload.kind ?? null
+        counts.set(kind, (counts.get(kind) ?? 0) + 1)
+      }
+      return [...counts.entries()].map(([kind, count]) => ({ kind, count }))
+    }
+    if (/SELECT\s+id,\s*payload,\s*attempts/i.test(text)) {
+      const currentOnly = /payload->>'kind'\s*=\s*'CurrentStateUpsert'/i.test(text)
+      return rows.filter(row => (row.state === 'pending' || row.state === 'uncertain')
+        && (!currentOnly || row.payload.kind === 'CurrentStateUpsert'))
+    }
+    if (/UPDATE\s+projection_outbox/i.test(text)) {
+      const id = values.find(value => typeof value === 'string' && rows.some(row => row.id === value))
+      const row = rows.find(candidate => candidate.id === id)
+      if (row) {
+        row.attempts += 1
+        if (/state = 'delivered'/i.test(text)) row.state = 'delivered'
+        if (/state = 'uncertain'/i.test(text)) row.state = 'uncertain'
+        if (/state = 'dead_letter'/i.test(text)) row.state = 'dead_letter'
+      }
+      return []
+    }
+    if (/count\(\*\)/i.test(text)) {
+      return [{ count: rows.filter(row => row.state === 'pending' || row.state === 'uncertain' || row.state === 'dead_letter').length }]
+    }
+    return []
+  }) as unknown as FinanceSyncSql
+  ;(sql as unknown as { begin: (fn: (tx: FinanceSyncSql) => Promise<unknown>) => Promise<unknown> }).begin = fn => fn(sql)
+  ;(sql as unknown as { json: (value: unknown) => unknown }).json = value => value
+  return { sql, rows, queries }
 }
 
 describe('createRuntimeDependencies startup validation', () => {
@@ -1061,6 +1106,87 @@ describe('projectPending transaction and receipt contract', () => {
       expect(fixture.attempts()).toBe(3)
       await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
       expect(fixture.state()).toBe('uncertain')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('delivers current state past an activity dead letter but keeps later activity fenced', async () => {
+    const state = {
+      accountId: 'wf-acc-1', providerConnectionId: 'item-1',
+      providerIncarnationId: CONNECTION.sourceResourceIncarnationId, providerGeneration: 1,
+      observedAt: '2026-07-18T12:00:00.000Z', revision: 1784376000000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '100', liabilityBalance: '0', positions: [],
+    } as const
+    const currentState = currentStateToBridge(
+      { deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId, sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId },
+      state,
+      currentStateSemanticHash(state),
+      1,
+      CONNECTION.connectionId,
+    )
+    const activity = {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId, accessGeneration: 1,
+      kind: 'ActivityUpsert' as const, resourceId: 'later-activity', idempotencyKey: 'later-activity-key',
+      activity: {
+        accountId: 'wf-acc-1', activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE' as const,
+        amount: '5', currency: 'USD', sourceGroupId: 'provider-group',
+      },
+    }
+    const deadLetter = {
+      ...activity, resourceId: 'prime-saver-dead-letter', idempotencyKey: 'prime-saver-dead-letter-key',
+      activity: { ...activity.activity, sourceGroupId: 'conflicting-provider-group' },
+    }
+    expect(() => bridgeOperationToWire(currentState)).not.toThrow()
+    expect(() => validateBridgeReceipt(currentState, receipt(currentState))).not.toThrow()
+    const fixture = projectOutboxSql([
+      { id: 'dead-letter', payload: deadLetter, attempts: 3, state: 'dead_letter' },
+      { id: 'current-state', payload: currentState, attempts: 0, state: 'pending' },
+      { id: 'later-activity', payload: activity, attempts: 0, state: 'pending' },
+    ])
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      const wire = JSON.parse(String(init?.body)) as Record<string, unknown>
+      calls.push(String(wire.kind))
+      expect(wire.kind).toBe('CurrentStateUpsert')
+      return new Response(JSON.stringify(receipt(currentState)), { status: 200 })
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 1, failed: 2 })
+      expect(calls).toEqual(['CurrentStateUpsert'])
+      expect(fixture.rows.map(row => [row.id, row.state])).toEqual([
+        ['dead-letter', 'dead_letter'], ['current-state', 'delivered'], ['later-activity', 'pending'],
+      ])
+      expect(fixture.queries.some(query => /payload->>'kind'\s*=\s*'CurrentStateUpsert'/i.test(query))).toBe(true)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('keeps a dead-lettered current-state lane fully stopped', async () => {
+    const state = {
+      accountId: 'wf-acc-1', providerConnectionId: 'item-1',
+      providerIncarnationId: CONNECTION.sourceResourceIncarnationId, providerGeneration: 1,
+      observedAt: '2026-07-18T12:00:00.000Z', revision: 1784376000000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '100', liabilityBalance: '0', positions: [],
+    } as const
+    const currentState = currentStateToBridge(
+      { deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId, sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId },
+      state,
+      currentStateSemanticHash(state),
+      1,
+      CONNECTION.connectionId,
+    )
+    const fixture = projectOutboxSql([{ id: 'current-dead-letter', payload: currentState, attempts: 3, state: 'dead_letter' }])
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error('must not dispatch') }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.rows[0]?.state).toBe('dead_letter')
     } finally {
       globalThis.fetch = originalFetch
     }

@@ -6,13 +6,18 @@ import {
   createSnapTradeConnectTransport,
   FinanceSyncConnectControl,
   type ConnectControlDependencies,
+  type ConsumedPlaidConnectSession,
 } from './connect-control'
 import type { RuntimeConnection } from './runtime'
 
 const subjectA = 'wealthfolio#owner-a'
 const subjectB = 'wealthfolio#owner-b'
 
-function connection(provider: 'investec' | 'mercury' | 'snaptrade', localOwnerId = subjectA): RuntimeConnection {
+function session(secretReference = 'PLAID_SLOT_A', flow: 'new' | 'update' = 'new', providerConnectionId?: string, providerGeneration?: number): ConsumedPlaidConnectSession {
+  return { secretReference, flow, ...(providerConnectionId === undefined ? {} : { providerConnectionId }), ...(providerGeneration === undefined ? {} : { providerGeneration }) }
+}
+
+function connection(provider: 'investec' | 'mercury' | 'plaid' | 'snaptrade', localOwnerId = subjectA): RuntimeConnection {
   const common = {
     provider, connectionId: `${provider}-connection`, deploymentId: 'deployment-1', localOwnerId,
     sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001', accountIds: ['account-1'],
@@ -20,6 +25,7 @@ function connection(provider: 'investec' | 'mercury' | 'snaptrade', localOwnerId
   }
   if (provider === 'investec') return { ...common, provider, clientId: 'client', clientSecret: 'secret', apiKey: 'key', eligibleProductNames: ['Private Bank'], fromDate: '2026-01-01', toDate: '2026-07-18' }
   if (provider === 'mercury') return { ...common, provider, apiToken: 'token' }
+  if (provider === 'plaid') return { ...common, provider, providerConnectionId: 'item-1', clientId: 'client', clientSecret: 'secret', accessToken: 'access-token' }
   return { ...common, provider, clientId: 'client', consumerKey: 'consumer', authMode: 'commercial', userId: 'user', userSecret: 'secret', assetMappings: {} }
 }
 
@@ -29,6 +35,7 @@ function dependencies(overrides: Partial<ConnectControlDependencies> = {}): Conn
     connections: [],
     plaid: {
       createLinkToken: vi.fn(async () => ({ linkToken: 'link-token' })),
+      createUpdateLinkToken: vi.fn(async () => ({ linkToken: 'update-link-token' })),
       exchangePublicToken: vi.fn(async () => ({ clientId: 'client-id', clientSecret: 'client-secret', accessToken: 'access-secret', itemId: 'item-1' })),
       listAccounts: vi.fn(async () => [{ providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', assets: [] }]),
     },
@@ -39,7 +46,7 @@ function dependencies(overrides: Partial<ConnectControlDependencies> = {}): Conn
     },
     sessionStore: {
       create: vi.fn(async () => 'continuation-token'),
-      consume: vi.fn(async () => 'PLAID_SLOT_A'),
+      consume: vi.fn(async () => session()),
       release: vi.fn(async () => undefined),
     },
     onPlaidConnected: vi.fn(async () => undefined),
@@ -79,11 +86,70 @@ describe('Finance Sync Connect control plane', () => {
     expect(deps.snaptrade?.createRedirectUri).toHaveBeenCalledWith(expect.objectContaining({ localOwnerId: subjectA }))
   })
 
+  it('opens Plaid Link update mode for the existing Item without allocating a new slot', async () => {
+    const deps = dependencies({ connections: [connection('plaid')] })
+    const result = await new FinanceSyncConnectControl(deps).startPlaidUpdate(subjectA)
+    expect(result).toMatchObject({ provider: 'plaid', status: 'link_ready', linkToken: 'update-link-token', continuationToken: 'continuation-token' })
+    expect(deps.plaid?.createUpdateLinkToken).toHaveBeenCalledWith(subjectA, expect.objectContaining({
+      providerConnectionId: 'item-1', accessToken: 'access-token', clientId: 'client', clientSecret: 'secret',
+    }))
+    expect(deps.sessionStore.create).toHaveBeenCalledWith({
+      deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', secretReference: 'TEST_SLOT',
+      providerConnectionId: 'item-1', providerGeneration: 1, flow: 'update',
+    })
+    expect(deps.plaid?.exchangePublicToken).not.toHaveBeenCalled()
+  })
+
+  it('rediscovers accounts after Plaid update without rotating the Item', async () => {
+    const updated = vi.fn(async () => undefined)
+    const deps = dependencies({
+      connections: [connection('plaid')],
+      sessionStore: {
+        create: vi.fn(async () => 'continuation-token'),
+        consume: vi.fn(async () => session('TEST_SLOT', 'update', 'item-1', 1)),
+        release: vi.fn(async () => undefined),
+      },
+      onPlaidAccountsUpdated: updated,
+    })
+    await expect(new FinanceSyncConnectControl(deps).completePlaidUpdate(subjectA, 'continuation-token')).resolves.toMatchObject({ status: 'pending' })
+    expect(deps.sessionStore.consume).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', token: 'continuation-token', flow: 'update' })
+    expect(deps.plaid?.listAccounts).toHaveBeenCalledWith('access-token')
+    expect(updated).toHaveBeenCalledWith({
+      subject: subjectA, providerConnectionId: 'item-1', secretReference: 'TEST_SLOT', providerGeneration: 1,
+      accounts: [{ providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', assets: [] }],
+    })
+    expect(deps.plaid?.exchangePublicToken).not.toHaveBeenCalled()
+    expect(deps.secretStore.storePlaidAccessToken).not.toHaveBeenCalled()
+  })
+
+  it('rejects an update continuation when the provider generation changes', async () => {
+    const updated = vi.fn(async () => undefined)
+    const connectionWithNewGeneration = { ...connection('plaid'), providerGeneration: 2 }
+    const deps = dependencies({
+      connections: [connectionWithNewGeneration],
+      sessionStore: {
+        create: vi.fn(async () => 'continuation-token'),
+        consume: vi.fn(async () => session('TEST_SLOT', 'update', 'item-1', 1)),
+        release: vi.fn(async () => undefined),
+      },
+      onPlaidAccountsUpdated: updated,
+    })
+    await expect(new FinanceSyncConnectControl(deps).completePlaidUpdate(subjectA, 'continuation-token')).rejects.toMatchObject({ status: 409 })
+    expect(deps.plaid?.listAccounts).not.toHaveBeenCalled()
+    expect(updated).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when more than one Plaid Item needs a connection selection', async () => {
+    const first = connection('plaid') as Extract<RuntimeConnection, { provider: 'plaid' }>
+    const second = { ...first, connectionId: 'plaid-connection-2', providerConnectionId: 'item-2' }
+    await expect(new FinanceSyncConnectControl(dependencies({ connections: [first, second] })).startPlaidUpdate(subjectA)).rejects.toMatchObject({ status: 409 })
+  })
+
   it('releases the reserved slot when Plaid Link bootstrap fails', async () => {
     const release = vi.fn(async () => undefined)
     const deps = dependencies({
       plaid: { createLinkToken: vi.fn(async () => { throw new Error('Link failed') }), exchangePublicToken: vi.fn(), listAccounts: vi.fn() },
-      sessionStore: { create: vi.fn(async () => 'continuation-token'), consume: vi.fn(async () => 'PLAID_SLOT_A'), release },
+      sessionStore: { create: vi.fn(async () => 'continuation-token'), consume: vi.fn(async () => session()), release },
     })
     await expect(new FinanceSyncConnectControl(deps).start(subjectA, 'plaid')).rejects.toThrow('Link failed')
     expect(release).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', token: 'continuation-token' })
@@ -93,7 +159,7 @@ describe('Finance Sync Connect control plane', () => {
     const requests: Record<string, unknown>[] = []
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
-      return new Response(JSON.stringify(requests.length === 1
+      return new Response(JSON.stringify(requests.length <= 2
         ? { link_token: 'link-token' }
         : { accounts: [{ account_id: 'account-1', name: 'Checking', subtype: 'checking', mask: '1234', balances: { iso_currency_code: 'USD' } }] }), { status: 200 })
     }) as unknown as typeof fetch
@@ -107,6 +173,14 @@ describe('Finance Sync Connect control plane', () => {
     await transport!.createLinkToken(subjectA)
     expect(resolve).toHaveBeenCalledOnce()
     expect(resolve).toHaveBeenCalledWith('PLAID_CONNECT')
+    await expect(transport!.createUpdateLinkToken!(subjectA, { accessToken: 'existing-access', clientId: 'existing-client', clientSecret: 'existing-secret' })).resolves.toEqual({ linkToken: 'link-token' })
+    expect(requests[1]).toMatchObject({
+      access_token: 'existing-access',
+      update: { account_selection_enabled: true },
+      user: { client_user_id: subjectA },
+      client_id: 'existing-client',
+      secret: 'existing-secret',
+    })
     await expect(transport!.listAccounts('access-token')).resolves.toEqual([
       { providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', mask: '1234', assets: [] },
     ])
@@ -145,7 +219,7 @@ describe('Finance Sync Connect control plane', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
     const result = await new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token')
-    expect(deps.sessionStore.consume).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', token: 'continuation-token' })
+    expect(deps.sessionStore.consume).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', token: 'continuation-token', flow: 'new' })
     expect(deps.plaid?.exchangePublicToken).toHaveBeenCalledWith('public-token')
     expect(deps.secretStore.storePlaidAccessToken).toHaveBeenCalledWith({
       subject: subjectA, itemId: 'item-1', secretReference: 'PLAID_SLOT_A', clientId: 'client-id', clientSecret: 'client-secret', accessToken: 'access-secret',
@@ -165,7 +239,7 @@ describe('Finance Sync Connect control plane', () => {
       },
       sessionStore: {
         create: vi.fn(async () => 'continuation-token'),
-        consume: vi.fn(async () => { order.push('consume'); return 'PLAID_SLOT_A' }),
+        consume: vi.fn(async () => { order.push('consume'); return session() }),
         release: vi.fn(async () => undefined),
       },
       plaid: {
@@ -217,10 +291,10 @@ describe('Finance Sync Connect control plane', () => {
       secretReference: 'PLAID_SLOT_A', clientId: 'client', clientSecret: 'secret', accessToken: 'old',
     }
     const deps = dependencies({ connections: [old], sessionStore: {
-      create: vi.fn(async () => 'continuation-token'), consume: vi.fn(async () => 'PLAID_SLOT_B'), release: vi.fn(async () => undefined),
+      create: vi.fn(async () => 'continuation-token'), consume: vi.fn(async () => session('PLAID_SLOT_B')), release: vi.fn(async () => undefined),
     }, secretStore: { available: true, allowedSlots: ['PLAID_SLOT_A', 'PLAID_SLOT_B'], storePlaidAccessToken: vi.fn(async () => 'PLAID_SLOT_B') } })
     await new FinanceSyncConnectControl(deps).start(subjectA, 'plaid')
-    expect(deps.sessionStore.create).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', secretReference: 'PLAID_SLOT_B' })
+    expect(deps.sessionStore.create).toHaveBeenCalledWith({ deploymentId: 'deployment-1', subject: subjectA, provider: 'plaid', secretReference: 'PLAID_SLOT_B', flow: 'new' })
     await new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token')
     expect(deps.secretStore.storePlaidAccessToken).toHaveBeenCalledWith(expect.objectContaining({ secretReference: 'PLAID_SLOT_B' }))
   })
@@ -239,7 +313,7 @@ describe('Finance Sync Connect control plane', () => {
   })
 
   it('rejects a syntactically valid continuation slot outside the writer allowlist', async () => {
-    const deps = dependencies({ sessionStore: { create: vi.fn(async () => 'continuation-token'), consume: vi.fn(async () => 'PLAID_SLOT_C'), release: vi.fn(async () => undefined) } })
+    const deps = dependencies({ sessionStore: { create: vi.fn(async () => 'continuation-token'), consume: vi.fn(async () => session('PLAID_SLOT_C')), release: vi.fn(async () => undefined) } })
     await expect(new FinanceSyncConnectControl(deps).completePlaid(subjectA, 'public-token', 'continuation-token')).rejects.toMatchObject({ status: 409 })
     expect(deps.plaid?.exchangePublicToken).not.toHaveBeenCalled()
   })

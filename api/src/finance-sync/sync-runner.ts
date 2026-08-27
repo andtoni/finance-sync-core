@@ -156,6 +156,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
             subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
             secretReference: input.secretReference, accounts: input.accounts,
           }),
+          onPlaidAccountsUpdated: input => onboarding.updateConnectionAccounts(input),
         })
       }
     }

@@ -113,6 +113,43 @@ suite('provider generation durable fences with PostgreSQL', () => {
         ${sql.json({ idempotencyKey, subject })})`).resolves.toHaveLength(0)
   })
 
+  it('discovers new accounts on an existing Plaid Item without rotating admitted accounts', async () => {
+    const updateDeployment = `${deploymentId}-plaid-update`
+    const updateProviderConnectionId = `${providerConnectionId}-plaid-update`
+    const updateSecretReference = 'PLAID_UPDATE_SLOT'
+    const repository = new PostgresOnboardingRepository(sql!, updateDeployment)
+    await repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: updateProviderConnectionId,
+      secretReference: updateSecretReference, accounts: [account],
+    })
+    const [existing] = await repository.listPending(subject, 'plaid')
+    await repository.admit({
+      subject, provider: 'plaid', connectionId: existing.connectionId, providerAccountId,
+      wealthfolioAccountId, databaseStateDigest: digest, providerGeneration: 1,
+      receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+    })
+
+    const newProviderAccountId = 'provider-account-new'
+    await repository.updateConnectionAccounts({
+      subject, providerConnectionId: updateProviderConnectionId, secretReference: updateSecretReference,
+      providerGeneration: 1,
+      accounts: [account, { ...account, providerAccountId: newProviderAccountId, name: 'New account' }],
+    })
+
+    const pending = await repository.listPending(subject, 'plaid')
+    expect(pending).toEqual([expect.objectContaining({
+      providerAccountId: newProviderAccountId, providerGeneration: 1, name: 'New account',
+    })])
+    const [state] = await sql!`
+      SELECT pc.provider_generation, paa.revoked_at, count(dpa.provider_account_id)::int AS discovered
+      FROM provider_connections pc
+      JOIN provider_account_admissions paa ON paa.connection_id = pc.connection_id
+      JOIN discovered_provider_accounts dpa ON dpa.connection_id = pc.connection_id
+      WHERE pc.deployment_id = ${updateDeployment} AND pc.local_owner_id = ${subject}
+      GROUP BY pc.provider_generation, paa.revoked_at`
+    expect(state).toEqual({ provider_generation: 1, revoked_at: null, discovered: 2 })
+  })
+
   it('rebases earlier active admissions and rejected outbox work when a later account advances receiver access', async () => {
     const rebindDeployment = `${deploymentId}-receiver-rebind`
     const repository = new PostgresOnboardingRepository(sql!, rebindDeployment)

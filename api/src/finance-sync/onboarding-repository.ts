@@ -237,6 +237,105 @@ export class PostgresOnboardingRepository {
     return rows[0] ?? null
   }
 
+  private async upsertDiscoveredAccounts(tx: FinanceSyncSql, input: {
+    readonly subject: string
+    readonly connectionId: string
+    readonly providerGeneration: number
+    readonly accounts: readonly DiscoveredAccount[]
+  }): Promise<void> {
+    for (const account of input.accounts) {
+      const accountRows = await tx<{ account_incarnation_id: string }[]>`
+        INSERT INTO account_incarnations (
+          deployment_id, local_owner_id, account_incarnation_id, connection_incarnation_id,
+          provider_account_id, incarnation
+        ) VALUES (
+          ${this.deploymentId}, ${input.subject}, gen_random_uuid(), ${input.connectionId}::uuid,
+          ${account.providerAccountId}, 1
+        )
+        ON CONFLICT (deployment_id, local_owner_id, connection_incarnation_id, provider_account_id, incarnation)
+        DO UPDATE SET provider_account_id = EXCLUDED.provider_account_id
+        RETURNING account_incarnation_id::text
+      `
+      const accountIncarnationId = accountRows[0]?.account_incarnation_id
+      if (!accountIncarnationId) throw new Error('account incarnation persistence failed')
+      const resources = await tx<{ source_resource_incarnation_id: string }[]>`
+        INSERT INTO resource_incarnations (
+          deployment_id, local_owner_id, source_resource_incarnation_id, account_incarnation_id,
+          resource_kind, provider_resource_id, incarnation
+        ) VALUES (
+          ${this.deploymentId}, ${input.subject}, gen_random_uuid(), ${accountIncarnationId}::uuid,
+          'account_projection', ${account.providerAccountId}, 1
+        )
+        ON CONFLICT (deployment_id, local_owner_id, account_incarnation_id, resource_kind, provider_resource_id, incarnation)
+        DO UPDATE SET provider_resource_id = EXCLUDED.provider_resource_id
+        RETURNING source_resource_incarnation_id::text
+      `
+      const resourceId = resources[0]?.source_resource_incarnation_id
+      if (!resourceId) throw new Error('resource incarnation persistence failed')
+      await tx`
+        INSERT INTO discovered_provider_accounts (
+          deployment_id, local_owner_id, connection_id, provider_account_id,
+          account_incarnation_id, source_resource_incarnation_id, provider_name,
+          provider_type, currency, mask, assets, discovery_generation
+        ) VALUES (
+          ${this.deploymentId}, ${input.subject}, ${input.connectionId}::uuid, ${account.providerAccountId},
+          ${accountIncarnationId}::uuid, ${resourceId}::uuid, ${account.name},
+          ${account.type}, ${account.currency}, ${account.mask ?? null}, ${tx.json(account.assets as never)},
+          ${input.providerGeneration}
+        )
+        ON CONFLICT (deployment_id, local_owner_id, connection_id, provider_account_id)
+        DO UPDATE SET provider_name = EXCLUDED.provider_name, provider_type = EXCLUDED.provider_type,
+          currency = EXCLUDED.currency, mask = EXCLUDED.mask, assets = EXCLUDED.assets,
+          discovery_generation = EXCLUDED.discovery_generation, discovered_at = now()
+      `
+    }
+  }
+
+  async updateConnectionAccounts(input: {
+    readonly subject: string
+    readonly providerConnectionId: string
+    readonly secretReference: string
+    readonly providerGeneration: number
+    readonly accounts: readonly DiscoveredAccount[]
+  }): Promise<void> {
+    if (input.accounts.length === 0) throw new Error('provider discovery returned no accounts')
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(input.secretReference)) throw new Error('invalid provider secret reference')
+    await this.sql.begin(async transaction => {
+      const tx = transaction as unknown as FinanceSyncSql
+      await tx`SELECT pg_advisory_xact_lock(hashtext(${this.deploymentId}), hashtext(${input.secretReference}))`
+      const connections = await tx<{ connectionId: string; principalId: string; providerGeneration: number }[]>`
+        SELECT connection_id::text AS "connectionId", provider_principal_id::text AS "principalId",
+          provider_generation AS "providerGeneration"
+        FROM provider_connections
+        WHERE deployment_id = ${this.deploymentId}
+          AND local_owner_id = ${input.subject}
+          AND provider = 'plaid'
+          AND provider_connection_id = ${input.providerConnectionId}
+          AND secret_reference = ${input.secretReference}
+          AND provider_generation = ${input.providerGeneration}
+          AND state = 'active' AND disabled_at IS NULL
+        FOR UPDATE
+      `
+      const connection = connections[0]
+      if (!connection || connections.length !== 1) throw new Error('active Plaid connection was not found')
+      await tx`
+        INSERT INTO connection_incarnations (
+          deployment_id, local_owner_id, connection_incarnation_id, provider_principal_id,
+          provider_connection_id, incarnation
+        ) VALUES (
+          ${this.deploymentId}, ${input.subject}, ${connection.connectionId}::uuid, ${connection.principalId}::uuid,
+          ${input.providerConnectionId}, 1
+        ) ON CONFLICT DO NOTHING
+      `
+      await this.upsertDiscoveredAccounts(tx, {
+        subject: input.subject,
+        connectionId: connection.connectionId,
+        providerGeneration: connection.providerGeneration,
+        accounts: input.accounts,
+      })
+    })
+  }
+
   async recordConnection(input: {
     readonly subject: string
     readonly provider: 'investec' | 'mercury' | 'plaid' | 'snaptrade'
@@ -265,7 +364,7 @@ export class PostgresOnboardingRepository {
       `
       const principalId = principal[0]?.provider_principal_id
       if (!principalId) throw new Error('provider principal persistence failed')
-      const connection = await tx<{ connection_id: string }[]>`
+      const connection = await tx<{ connection_id: string; provider_generation: number }[]>`
         INSERT INTO provider_connections (
           deployment_id, local_owner_id, provider_principal_id, provider,
           provider_connection_id, secret_reference, configuration, state
@@ -279,10 +378,11 @@ export class PostgresOnboardingRepository {
           configuration = EXCLUDED.configuration,
           provider_generation = provider_connections.provider_generation + 1,
           state = 'discovered', disabled_at = NULL
-        RETURNING connection_id::text
+        RETURNING connection_id::text, provider_generation
       `
       const connectionId = connection[0]?.connection_id
-      if (!connectionId) throw new Error('provider connection persistence failed')
+      const providerGeneration = connection[0]?.provider_generation
+      if (!connectionId || providerGeneration === undefined) throw new Error('provider connection persistence failed')
 
       // Relink rotates the connection generation. Prior admissions must be
       // explicitly re-established against accounts discovered in that generation.
@@ -302,54 +402,12 @@ export class PostgresOnboardingRepository {
           ${input.providerConnectionId}, 1
         ) ON CONFLICT DO NOTHING
       `
-      for (const account of input.accounts) {
-        const accountRows = await tx<{ account_incarnation_id: string }[]>`
-          INSERT INTO account_incarnations (
-            deployment_id, local_owner_id, account_incarnation_id, connection_incarnation_id,
-            provider_account_id, incarnation
-          ) VALUES (
-            ${this.deploymentId}, ${input.subject}, gen_random_uuid(), ${connectionId}::uuid,
-            ${account.providerAccountId}, 1
-          )
-          ON CONFLICT (deployment_id, local_owner_id, connection_incarnation_id, provider_account_id, incarnation)
-          DO UPDATE SET provider_account_id = EXCLUDED.provider_account_id
-          RETURNING account_incarnation_id::text
-        `
-        const accountIncarnationId = accountRows[0]?.account_incarnation_id
-        if (!accountIncarnationId) throw new Error('account incarnation persistence failed')
-        const resources = await tx<{ source_resource_incarnation_id: string }[]>`
-          INSERT INTO resource_incarnations (
-            deployment_id, local_owner_id, source_resource_incarnation_id, account_incarnation_id,
-            resource_kind, provider_resource_id, incarnation
-          ) VALUES (
-            ${this.deploymentId}, ${input.subject}, gen_random_uuid(), ${accountIncarnationId}::uuid,
-            'account_projection', ${account.providerAccountId}, 1
-          )
-          ON CONFLICT (deployment_id, local_owner_id, account_incarnation_id, resource_kind, provider_resource_id, incarnation)
-          DO UPDATE SET provider_resource_id = EXCLUDED.provider_resource_id
-          RETURNING source_resource_incarnation_id::text
-        `
-        const resourceId = resources[0]?.source_resource_incarnation_id
-        if (!resourceId) throw new Error('resource incarnation persistence failed')
-        await tx`
-          INSERT INTO discovered_provider_accounts (
-            deployment_id, local_owner_id, connection_id, provider_account_id,
-            account_incarnation_id, source_resource_incarnation_id, provider_name,
-            provider_type, currency, mask, assets, discovery_generation
-          ) VALUES (
-            ${this.deploymentId}, ${input.subject}, ${connectionId}::uuid, ${account.providerAccountId},
-            ${accountIncarnationId}::uuid, ${resourceId}::uuid, ${account.name},
-            ${account.type}, ${account.currency}, ${account.mask ?? null}, ${tx.json(account.assets as never)},
-            (SELECT provider_generation FROM provider_connections
-              WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
-                AND connection_id = ${connectionId}::uuid)
-          )
-          ON CONFLICT (deployment_id, local_owner_id, connection_id, provider_account_id)
-          DO UPDATE SET provider_name = EXCLUDED.provider_name, provider_type = EXCLUDED.provider_type,
-            currency = EXCLUDED.currency, mask = EXCLUDED.mask, assets = EXCLUDED.assets,
-            discovery_generation = EXCLUDED.discovery_generation, discovered_at = now()
-        `
-      }
+      await this.upsertDiscoveredAccounts(tx, {
+        subject: input.subject,
+        connectionId,
+        providerGeneration,
+        accounts: input.accounts,
+      })
     })
   }
 }

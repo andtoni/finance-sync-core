@@ -157,9 +157,19 @@ export function createFinanceSyncHttpHandler(input: {
       if (request.method === 'DELETE' && disconnect) {
         return send(response, 200, await connect.disconnect(rawSubject, decodeURIComponent(disconnect[1]), decodeURIComponent(disconnect[2])))
       }
+      if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/update') {
+        return send(response, 200, await connect.startPlaidUpdate(rawSubject))
+      }
       const start = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/start$/)
       if (request.method === 'POST' && start) {
         return send(response, 200, await connect.start(rawSubject, decodeURIComponent(start[1])))
+      }
+      if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/update/complete') {
+        const body = await jsonBody(request)
+        if (typeof body.continuationToken !== 'string' || !body.continuationToken) {
+          throw new ConnectControlError(400, 'continuation token is required')
+        }
+        return send(response, 200, await connect.completePlaidUpdate(rawSubject, body.continuationToken))
       }
       if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/complete') {
         const body = await jsonBody(request)

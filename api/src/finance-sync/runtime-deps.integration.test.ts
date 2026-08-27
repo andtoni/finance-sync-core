@@ -3,6 +3,8 @@ import postgres from 'postgres'
 import { resolve } from 'node:path'
 import { createRuntimeDependencies } from './runtime-deps'
 import { migrate } from './storage/migrate'
+import { currentStateToBridge } from './projection/bridge-client'
+import { currentStateSemanticHash } from './projection/current-state'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import type { RuntimeConnection } from './runtime'
 
@@ -136,6 +138,77 @@ suite('runtime dependencies with PostgreSQL', () => {
       expect(counts).toEqual({ delivered: 30, max_attempts: 1 })
     } finally {
       globalThis.fetch = originalFetch
+    }
+  })
+
+  it('delivers a current-state row past an unrelated activity dead letter while keeping activity work fenced', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    const state = {
+      accountId: 'wealthfolio-account', providerConnectionId: connection.connectionId,
+      providerIncarnationId: sourceId, providerGeneration: 1,
+      observedAt: '2026-07-18T12:00:00.000Z', revision: 1784376000000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '100', liabilityBalance: '0', positions: [],
+    } as const
+    const currentState = currentStateToBridge(
+      { deploymentId, localOwnerId: owner, sourceResourceIncarnationId: sourceId },
+      state,
+      currentStateSemanticHash(state),
+      1,
+      connection.connectionId,
+    )
+    const activity = {
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1,
+      kind: 'ActivityUpsert' as const, resourceId: 'later-activity', idempotencyKey: 'later-activity-key',
+      activity: {
+        accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE' as const,
+        amount: '5', currency: 'USD', sourceGroupId: 'provider-group',
+      },
+    }
+    const deadLetter = {
+      ...activity, resourceId: 'prime-saver-dead-letter', idempotencyKey: 'prime-saver-dead-letter-key',
+      activity: { ...activity.activity, sourceGroupId: 'conflicting-provider-group' },
+    }
+    await sql`INSERT INTO projection_outbox
+      (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state,attempts,last_error,dead_lettered_at,dead_letter_reason)
+      VALUES (${deploymentId},${owner},${connection.connectionId},1,${deadLetter.idempotencyKey},${sql.json(deadLetter)},'dead_letter',3,'BRIDGE_HTTP_REJECTED',now(),'BRIDGE_HTTP_REJECTED')`
+    await sql`INSERT INTO projection_outbox
+      (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload)
+      VALUES (${deploymentId},${owner},${connection.connectionId},1,${currentState.idempotencyKey},${sql.json(currentState as never)})`
+    await sql`INSERT INTO projection_outbox
+      (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload)
+      VALUES (${deploymentId},${owner},${connection.connectionId},1,${activity.idempotencyKey},${sql.json(activity)})`
+
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      const wire = JSON.parse(String(init?.body)) as Record<string, unknown>
+      calls.push(String(wire.kind))
+      expect(wire.kind).toBe('CurrentStateUpsert')
+      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', 'current_state_upsert', String(wire.resource_id), 'wealthfolio-account', '0', '', 'accepted', '1', currentState.semanticHash!]
+      return new Response(JSON.stringify({
+        deploymentId, accountId: 'wealthfolio-account', subject: owner,
+        idempotencyKey: wire.idempotency_key, accessGeneration: 1,
+        operation: 'current_state_upsert', resourceId: wire.resource_id,
+        lifecycleSuccessorId: null, outcome: 'Accepted', bindingVersion: 3,
+        receiptBinding: binding(fields), semanticHash: currentState.semanticHash,
+      }), { status: 200 })
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 1, failed: 2 })
+      expect(calls).toEqual(['CurrentStateUpsert'])
+      const rows = await sql`
+        SELECT idempotency_key, state, dead_letter_reason
+        FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      expect(rows).toEqual(expect.arrayContaining([
+        { idempotency_key: deadLetter.idempotencyKey, state: 'dead_letter', dead_letter_reason: 'BRIDGE_HTTP_REJECTED' },
+        { idempotency_key: currentState.idempotencyKey, state: 'delivered', dead_letter_reason: null },
+        { idempotency_key: activity.idempotencyKey, state: 'pending', dead_letter_reason: null },
+      ]))
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
     }
   })
 })
