@@ -1271,7 +1271,7 @@ export function createRuntimeDependencies(
               AND provider_generation = ${connection.providerGeneration}
               AND state IN ('pending', 'uncertain')
               AND payload->>'kind' = 'CurrentStateUpsert'
-            ORDER BY created_at, (payload ? 'lifecycleSuccessorId'), id
+            ORDER BY (payload->>'kind' = 'CurrentStateUpsert') DESC, created_at, (payload ? 'lifecycleSuccessorId'), id
             LIMIT ${MAX_PROJECTION_BATCH}
             FOR UPDATE SKIP LOCKED
           `
@@ -1282,7 +1282,7 @@ export function createRuntimeDependencies(
               AND connection_id = ${connection.connectionId}
               AND provider_generation = ${connection.providerGeneration}
               AND state IN ('pending', 'uncertain')
-            ORDER BY created_at, (payload ? 'lifecycleSuccessorId'), id
+            ORDER BY (payload->>'kind' = 'CurrentStateUpsert') DESC, created_at, (payload ? 'lifecycleSuccessorId'), id
             LIMIT ${MAX_PROJECTION_BATCH}
             FOR UPDATE SKIP LOCKED
           `
