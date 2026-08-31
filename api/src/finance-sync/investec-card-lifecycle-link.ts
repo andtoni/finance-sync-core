@@ -183,7 +183,7 @@ export function createInvestecCardLifecycleLinkControl(
         || typeof request.reason !== 'string'
         || request.reason.trim().length < 1
         || request.reason.trim().length > 2048
-        || /[\u0000-\u001f\u007f]/.test(request.reason)) {
+        || /[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f]/.test(request.reason)) {
         throw new InvestecCardLifecycleLinkError(400, 'invalid Investec card lifecycle link request')
       }
 

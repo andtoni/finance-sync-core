@@ -99,7 +99,7 @@ describe('owner-authorized Investec card lifecycle links', () => {
       sourceResourceIncarnationId,
       pendingTransactionId,
       postedTransactionId,
-      reason: 'same synthetic online order with adjusted final amount',
+      reason: 'same synthetic online order\nwith adjusted final amount',
     })
 
     expect(result).toMatchObject({
@@ -154,7 +154,7 @@ describe('owner-authorized Investec card lifecycle links', () => {
       sourceResourceIncarnationId,
       pendingTransactionId,
       postedTransactionId,
-      reason: 'same order\nforged audit line',
+      reason: 'same order\tforged audit field',
     })).rejects.toMatchObject({ status: 400 })
   })
 
