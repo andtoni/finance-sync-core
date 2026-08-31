@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { ConnectControlError, FinanceSyncConnectControl } from './connect-control'
 import { ObservationQuarantineError, type ObservationQuarantineRequest } from './observation-quarantine'
 import { InvestecCardCurrencyCorrectionError, type InvestecCardCurrencyCorrectionRequest } from './investec-card-correction'
+import { InvestecCardLifecycleLinkError, type InvestecCardLifecycleLinkRequest } from './investec-card-lifecycle-link'
 
 const MAX_JSON_BODY_BYTES = 16 * 1024
 
@@ -10,6 +11,10 @@ function tokenMatches(provided: string, expected: string): boolean {
   const left = createHash('sha256').update(provided).digest()
   const right = createHash('sha256').update(expected).digest()
   return timingSafeEqual(left, right)
+}
+
+function hasControlCharacters(value: string): boolean {
+  return /[\u0000-\u001f\u007f]/.test(value)
 }
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -44,6 +49,7 @@ export function createFinanceSyncHttpHandler(input: {
   readonly connect?: FinanceSyncConnectControl
   readonly quarantine?: { create(rawSubject: string, request: ObservationQuarantineRequest): Promise<unknown> }
   readonly investecCardCorrection?: { create(rawSubject: string, request: InvestecCardCurrencyCorrectionRequest): Promise<unknown> }
+  readonly investecCardLifecycleLink?: { create(rawSubject: string, request: InvestecCardLifecycleLinkRequest): Promise<unknown> }
   readonly health: () => { readonly status: number; readonly body: unknown }
 }) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -60,7 +66,6 @@ export function createFinanceSyncHttpHandler(input: {
       return send(response, 401, { error: 'unauthorized' })
     }
     if (!input.providersEnabled) return send(response, 503, { error: 'provider_control_disabled' })
-    if (!input.connect) return send(response, 503, { error: 'provider_control_disabled' })
     const rawSubject = request.headers['x-authenticated-subject']
     if (typeof rawSubject !== 'string' || !rawSubject) return send(response, 400, { error: 'request_failed' })
     const connect = input.connect
@@ -96,6 +101,30 @@ export function createFinanceSyncHttpHandler(input: {
           reason: reason.trim(),
         }))
       }
+      if (request.method === 'POST' && path === '/control/v1/investec/card-lifecycle-links') {
+        if (!input.investecCardLifecycleLink) return send(response, 404, { error: 'not_found' })
+        const body = await jsonBody(request)
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        const sourceResourceIncarnationId = body.sourceResourceIncarnationId
+        const pendingTransactionId = body.pendingTransactionId
+        const postedTransactionId = body.postedTransactionId
+        const reason = body.reason
+        const validId = (value: unknown): value is string => typeof value === 'string'
+          && value.length > 0 && value.length <= 512 && !/[\u0000-\u001f\u007f]/.test(value)
+        if (typeof sourceResourceIncarnationId !== 'string' || !uuid.test(sourceResourceIncarnationId)
+          || !validId(pendingTransactionId) || !validId(postedTransactionId)
+          || pendingTransactionId === postedTransactionId
+          || typeof reason !== 'string' || reason.trim().length < 1 || reason.trim().length > 2048
+          || hasControlCharacters(reason)) {
+          throw new ConnectControlError(400, 'invalid Investec card lifecycle link request')
+        }
+        return send(response, 200, await input.investecCardLifecycleLink.create(rawSubject, {
+          sourceResourceIncarnationId,
+          pendingTransactionId,
+          postedTransactionId,
+          reason: reason.trim(),
+        }))
+      }
       if (request.method === 'POST' && path === '/control/v1/observation-quarantines') {
         if (!input.quarantine) return send(response, 503, { error: 'projection_control_disabled' })
         const body = await jsonBody(request)
@@ -120,6 +149,7 @@ export function createFinanceSyncHttpHandler(input: {
           reason: reason.trim(),
         }))
       }
+      if (!connect) return send(response, 503, { error: 'provider_control_disabled' })
       if (request.method === 'GET' && path === '/control/v1/provider-connections') {
         return send(response, 200, await connect.list(rawSubject))
       }
@@ -182,7 +212,8 @@ export function createFinanceSyncHttpHandler(input: {
     } catch (error) {
       const status = error instanceof ConnectControlError
         || error instanceof ObservationQuarantineError
-        || error instanceof InvestecCardCurrencyCorrectionError ? error.status : 500
+        || error instanceof InvestecCardCurrencyCorrectionError
+        || error instanceof InvestecCardLifecycleLinkError ? error.status : 500
       return send(response, status, { error: 'request_failed' })
     }
   }

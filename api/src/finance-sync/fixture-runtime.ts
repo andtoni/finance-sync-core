@@ -5,7 +5,10 @@
  *
  * No provider credential or live endpoint is used by this path.
  */
+import { FinanceSyncConnectControl } from './connect-control'
 import type { RuntimeConnection } from './runtime'
+import type { FinanceSyncSql } from './storage/pg'
+import { PostgresOnboardingRepository } from './onboarding-repository'
 import type {
   PlaidAccount,
   PlaidSyncPage,
@@ -16,6 +19,7 @@ import type {
   SnapTradeRawActivity,
   SnapTradeTransport,
 } from './probes/snaptrade/snaptrade-adapter'
+import type { InvestecTransport } from './probes/investec/investec-adapter'
 import type { ProviderTransportFactories } from './provider-runtime'
 
 export const FIXTURE_OWNER_SUBJECT = 'urn:wealthfolio:password#local'
@@ -24,6 +28,10 @@ const PLAID_SOURCE = '00000000-0000-0000-0000-000000000101'
 const SAVINGS_SOURCE = '00000000-0000-0000-0000-000000000102'
 const CARD_SOURCE = '00000000-0000-0000-0000-000000000103'
 const SNAPTRADE_SOURCE = '00000000-0000-0000-0000-000000000104'
+const INVESTEC_SOURCE = '00000000-0000-4000-8000-000000000105'
+const INVESTEC_CONNECTION_ID = '00000000-0000-0000-0000-000000000305'
+const INVESTEC_ACCOUNT_ID = 'fixture-investec-card'
+const INVESTEC_ACCOUNT_NUMBER = '1000000000014'
 
 interface FixturePlaidAccount {
   readonly id: string
@@ -60,6 +68,89 @@ const PLAID_TRANSACTIONS = [
   { transaction_id: 'fixture-prime-saver-in', account_id: 'fixture-savings', amount: -51_300, date: '2026-08-02', name: 'Prime Saver transfer' },
 ] as const
 
+const INVESTEC_TRANSACTIONS = [
+  {
+    uuid: 'fixture-posted-order-equal', status: 'POSTED', postedOrder: 1,
+    type: 'DEBIT', transactionType: 'CARDPURCHASES', amount: '123.45',
+    transactionDate: '2026-08-20', postingDate: '2026-08-21',
+    description: 'SAMPLEMART ONLINE EQUAL', reference: 'posted-equal', cardNumber: INVESTEC_ACCOUNT_NUMBER,
+  },
+  {
+    uuid: 'fixture-posted-order-1', status: 'POSTED', postedOrder: 1,
+    type: 'DEBIT', transactionType: 'CARDPURCHASES', amount: '1345.13',
+    transactionDate: '2026-08-18', postingDate: '2026-08-19',
+    description: 'SAMPLEMART ONLINE STORE', reference: 'posted-order-1', cardNumber: INVESTEC_ACCOUNT_NUMBER,
+  },
+  {
+    uuid: 'fixture-posted-order-2', status: 'POSTED', postedOrder: 1,
+    type: 'DEBIT', transactionType: 'CARDPURCHASES', amount: '1430.40',
+    transactionDate: '2026-08-27', postingDate: '2026-08-28',
+    description: 'SAMPLEMART ONLINE MARKET', reference: 'posted-order-2', cardNumber: INVESTEC_ACCOUNT_NUMBER,
+  },
+  {
+    uuid: 'fixture-posted-wrong-merchant', status: 'POSTED', postedOrder: 1,
+    type: 'DEBIT', transactionType: 'CARDPURCHASES', amount: '50.00',
+    transactionDate: '2026-08-18', postingDate: '2026-08-19',
+    description: 'FIXTURE OTHER MERCHANT', reference: 'posted-other', cardNumber: INVESTEC_ACCOUNT_NUMBER,
+  },
+] as const
+
+const INVESTEC_CARD_EXECUTIONS = [
+  {
+    executionId: 'fixture-auth-equal', sandbox: false, type: 'after_transaction', authorizationApproved: null,
+    completedAt: '2026-08-20T12:00:01.000Z', logs: [{ content: JSON.stringify({
+      schemaVersion: 1, eventType: 'after_transaction', providerEventTime: '2026-08-20T12:00:00.000Z',
+      transaction: {
+        accountNumber: INVESTEC_ACCOUNT_NUMBER, centsAmount: 12345, currencyCode: 'ZAR',
+        dateTime: '2026-08-20T12:00:00.000Z', reference: 'card-equal',
+        merchant: { name: 'SAMPLEMART ONLINE EQUAL' }, card: { display: '••••0014' }, type: 'card',
+      },
+    }) }],
+  },
+  {
+    executionId: 'fixture-auth-order-1', sandbox: false, type: 'after_transaction', authorizationApproved: null,
+    completedAt: '2026-08-17T12:00:01.000Z', logs: [{ content: JSON.stringify({
+      schemaVersion: 1, eventType: 'after_transaction', providerEventTime: '2026-08-17T12:00:00.000Z',
+      transaction: {
+        accountNumber: INVESTEC_ACCOUNT_NUMBER, centsAmount: 135738, currencyCode: 'ZAR',
+        dateTime: '2026-08-17T12:00:00.000Z', reference: 'card-order-1',
+        merchant: { name: 'SAMPLEMART ONLINE' }, card: { display: '••••0014' }, type: 'card',
+      },
+    }) }],
+  },
+  {
+    executionId: 'fixture-auth-order-2', sandbox: false, type: 'after_transaction', authorizationApproved: null,
+    completedAt: '2026-08-26T12:00:01.000Z', logs: [{ content: JSON.stringify({
+      schemaVersion: 1, eventType: 'after_transaction', providerEventTime: '2026-08-26T12:00:00.000Z',
+      transaction: {
+        accountNumber: INVESTEC_ACCOUNT_NUMBER, centsAmount: 143386, currencyCode: 'ZAR',
+        dateTime: '2026-08-26T12:00:00.000Z', reference: 'card-order-2',
+        merchant: { name: 'SAMPLEMART ONLINE' }, card: { display: '••••0014' }, type: 'card',
+      },
+    }) }],
+  },
+] as const
+
+function fixtureInvestecTransport(): InvestecTransport {
+  return {
+    async listAccounts() {
+      return [{ accountId: INVESTEC_ACCOUNT_ID, productName: 'Private Bank Account', accountName: 'Fixture Investec Card', accountNumber: INVESTEC_ACCOUNT_NUMBER }]
+    },
+    async getBalance() {
+      return { currency: 'ZAR', currentBalance: '10000.00', availableBalance: '10000.00' }
+    },
+    async getTransactionPage() {
+      return { transactions: INVESTEC_TRANSACTIONS }
+    },
+    async listCards() {
+      return [{ cardKey: 'fixture-card-0014', accountId: INVESTEC_ACCOUNT_ID, accountNumber: INVESTEC_ACCOUNT_NUMBER }]
+    },
+    async listCardExecutions() {
+      return INVESTEC_CARD_EXECUTIONS
+    },
+  }
+}
+
 const SNAPTRADE_ACTIVITIES: readonly SnapTradeRawActivity[] = [
   {
     id: 'fixture-alpaca-contribution', account: { id: 'fixture-alpaca' }, type: 'CONTRIBUTION',
@@ -76,13 +167,15 @@ const SNAPTRADE_ACCOUNTS: readonly SnapTradeRawAccount[] = [
 
 function fixtureAccountMap(env: NodeJS.ProcessEnv): Readonly<Record<string, string>> {
   const raw = env.FINANCE_SYNC_FIXTURE_ACCOUNT_MAP_JSON
-  if (!raw) return Object.freeze(Object.fromEntries(PLAID_ACCOUNTS.map(account => [account.id, account.id]).concat([['fixture-alpaca', 'fixture-alpaca']])))
+  if (!raw) return Object.freeze(Object.fromEntries(PLAID_ACCOUNTS.map(account => [account.id, account.id]).concat([
+    ['fixture-alpaca', 'fixture-alpaca'], [INVESTEC_ACCOUNT_ID, INVESTEC_ACCOUNT_ID],
+  ])))
   try {
     const parsed = JSON.parse(raw) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('fixture account map must be an object')
     const map = parsed as Record<string, unknown>
     const result: Record<string, string> = {}
-    for (const providerId of [...PLAID_ACCOUNTS.map(account => account.id), 'fixture-alpaca']) {
+    for (const providerId of [...PLAID_ACCOUNTS.map(account => account.id), 'fixture-alpaca', INVESTEC_ACCOUNT_ID]) {
       if (typeof map[providerId] !== 'string' || map[providerId].length === 0) throw new Error(`missing fixture account mapping for ${providerId}`)
       result[providerId] = map[providerId]
     }
@@ -201,6 +294,16 @@ export function createFixtureRuntime(deploymentId: string, env: NodeJS.ProcessEn
     activitiesStartDate: '2026-08-01',
     activitiesEndDate: '2026-08-04',
   }
+  const investecConnection: RuntimeConnection = {
+    ...commonConnection(`${INVESTEC_CONNECTION_ID}:${INVESTEC_ACCOUNT_ID}`, INVESTEC_SOURCE, INVESTEC_ACCOUNT_ID, wealthfolioAccountIds[INVESTEC_ACCOUNT_ID], deploymentId, accessGeneration),
+    provider: 'investec',
+    clientId: 'fixture-only',
+    clientSecret: 'fixture-only',
+    apiKey: 'fixture-only',
+    eligibleProductNames: ['Private Bank Account'],
+    fromDate: '2026-08-01',
+    toDate: '2026-08-31',
+  }
 
   const factories: ProviderTransportFactories = {
     plaid: connection => {
@@ -209,15 +312,41 @@ export function createFixtureRuntime(deploymentId: string, env: NodeJS.ProcessEn
       return fixturePlaidTransport(account)
     },
     snaptrade: () => fixtureSnapTradeTransport(),
-    investec: () => { throw new Error('Investec is unavailable in fixture mode') },
+    investec: () => fixtureInvestecTransport(),
     mercury: () => { throw new Error('Mercury is unavailable in fixture mode') },
   }
 
+  const connections = env.FINANCE_SYNC_FIXTURE_INVESTEC_ONLY === 'true'
+    ? [investecConnection]
+    : [...plaidConnections, snaptradeConnection, investecConnection]
   return {
-    connections: [...plaidConnections, snaptradeConnection],
+    connections,
     factories,
-    fixtureAccountIds: [...PLAID_ACCOUNTS.map(account => wealthfolioAccountIds[account.id]), wealthfolioAccountIds['fixture-alpaca']],
+    fixtureAccountIds: connections.flatMap(connection => connection.accountIds.map(accountId => connection.wealthfolioAccountIds[accountId])),
   }
+}
+
+export function createFixtureConnectControl(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connections: () => Promise<readonly RuntimeConnection[]>,
+): FinanceSyncConnectControl {
+  const onboarding = new PostgresOnboardingRepository(sql, deploymentId)
+  return new FinanceSyncConnectControl({
+    deploymentId,
+    connections,
+    secretStore: {
+      available: false,
+      allowedSlots: [],
+      storePlaidAccessToken: async () => { throw new Error('fixture Plaid credentials are unavailable') },
+    },
+    sessionStore: {
+      create: async () => undefined,
+      consume: async () => undefined,
+      release: async () => undefined,
+    },
+    onboarding,
+  })
 }
 
 export const fixtureAuthorityRows = Object.freeze([
@@ -225,4 +354,5 @@ export const fixtureAuthorityRows = Object.freeze([
   { connectionId: 'fixture-plaid:fixture-savings', provider: 'plaid', providerConnectionId: 'fixture-plaid-savings', providerPrincipalId: '00000000-0000-0000-0000-000000000202', connectionIncarnationId: '00000000-0000-0000-0000-000000000302', accountId: 'fixture-savings', accountIncarnationId: '00000000-0000-0000-0000-000000000402', sourceResourceIncarnationId: SAVINGS_SOURCE },
   { connectionId: 'fixture-plaid:fixture-card', provider: 'plaid', providerConnectionId: 'fixture-plaid-card', providerPrincipalId: '00000000-0000-0000-0000-000000000203', connectionIncarnationId: '00000000-0000-0000-0000-000000000303', accountId: 'fixture-card', accountIncarnationId: '00000000-0000-0000-0000-000000000403', sourceResourceIncarnationId: CARD_SOURCE },
   { connectionId: 'fixture-snaptrade:fixture-alpaca', provider: 'snaptrade', providerConnectionId: 'fixture-snaptrade', providerPrincipalId: '00000000-0000-0000-0000-000000000204', connectionIncarnationId: '00000000-0000-0000-0000-000000000304', accountId: 'fixture-alpaca', accountIncarnationId: '00000000-0000-0000-0000-000000000404', sourceResourceIncarnationId: SNAPTRADE_SOURCE },
+  { connectionId: INVESTEC_CONNECTION_ID, provider: 'investec', providerConnectionId: 'fixture-investec', providerPrincipalId: '00000000-0000-0000-0000-000000000205', connectionIncarnationId: INVESTEC_CONNECTION_ID, accountId: INVESTEC_ACCOUNT_ID, accountIncarnationId: '00000000-0000-0000-0000-000000000405', sourceResourceIncarnationId: INVESTEC_SOURCE },
 ])

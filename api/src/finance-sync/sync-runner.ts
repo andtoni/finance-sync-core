@@ -18,10 +18,11 @@ import { createInfisicalPlaidTokenWriter, createInfisicalProviderSecretReader } 
 import { PostgresOnboardingRepository } from './onboarding-repository'
 import { createNativeProviderOnboarding } from './server-onboarding'
 import { createProviderTransportFactories } from './provider-runtime'
-import { fixtureModeEnabled } from './fixture-runtime'
+import { createFixtureConnectControl, fixtureModeEnabled } from './fixture-runtime'
 import { replayQuarantinedInvestecCards, reprojectRetainedInvestecCards, startInvestecCardDrainer } from './investec-card-drainer'
 import { createObservationQuarantineControl } from './observation-quarantine'
 import { createInvestecCardCurrencyCorrectionControl } from './investec-card-correction'
+import { createInvestecCardLifecycleLinkControl } from './investec-card-lifecycle-link'
 import type { DrainerHandle } from '../drain/drainer'
 
 interface CliArgs { help?: boolean; once?: boolean }
@@ -131,6 +132,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
         // Fixture mode uses the synthetic adapters only. Do not initialize the
         // production onboarding/Infisical control plane or attempt provider calls.
         deps = createRuntimeDependencies(sql, config.deploymentId, process.env)
+        connect = createFixtureConnectControl(sql, config.deploymentId, () => deps!.loadConnections(config.deploymentId))
       } else {
         const secretReader = createInfisicalProviderSecretReader(process.env)
         const tokenWriter = createInfisicalPlaidTokenWriter(process.env)
@@ -165,12 +167,16 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     await replayQuarantinedCards()
     await sweepInvestecCardLifecycles()
     if (args.once) { if (!databaseReady || cycleFailed || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
+    const lifecycleLinkEnabled = process.env.FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_LINK_ENABLED === 'true'
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
       providersEnabled: config.providersEnabled,
       connect,
       quarantine: createObservationQuarantineControl(sql, config.deploymentId),
       investecCardCorrection: deps ? createInvestecCardCurrencyCorrectionControl(sql, config.deploymentId, deps) : undefined,
+      investecCardLifecycleLink: deps && lifecycleLinkEnabled
+        ? createInvestecCardLifecycleLinkControl(sql, config.deploymentId, deps)
+        : undefined,
       health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount, cycleFailed); return { status: body.ok ? 200 : 503, body } },
     })
     const server = createServer((request, response) => { void handler(request, response) })

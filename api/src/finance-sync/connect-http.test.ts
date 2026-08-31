@@ -10,11 +10,13 @@ let base: string
 let admitted: Record<string, unknown>[]
 let quarantined: Record<string, unknown>[]
 let corrected: Record<string, unknown>[]
+let linked: Record<string, unknown>[]
 
 beforeEach(async () => {
   admitted = []
   quarantined = []
   corrected = []
+  linked = []
   const connect = new FinanceSyncConnectControl({
     deploymentId: 'deployment-1',
     connections: [{
@@ -69,6 +71,13 @@ beforeEach(async () => {
       create: async (rawSubject, request) => {
         const result = { rawSubject, ...request, correctionId: 'correction-1' }
         corrected.push(result)
+        return result
+      },
+    },
+    investecCardLifecycleLink: {
+      create: async (rawSubject, request) => {
+        const result = { rawSubject, ...request, overrideId: 'override-1' }
+        linked.push(result)
         return result
       },
     },
@@ -190,6 +199,61 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(invalid.status).toBe(400)
   })
 
+  it('creates an owner-authorized Investec card lifecycle link request', async () => {
+    const request = {
+      sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
+      pendingTransactionId: 'investec-card:account-1:reference-pending-1',
+      postedTransactionId: 'posted-1',
+      reason: 'same synthetic online order with adjusted final amount',
+    }
+    const response = await fetch(`${base}/control/v1/investec/card-lifecycle-links`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify(request),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ ...request, rawSubject: subject, overrideId: 'override-1' })
+    expect(linked).toEqual([{ ...request, rawSubject: subject, overrideId: 'override-1' }])
+
+    const invalid = await fetch(`${base}/control/v1/investec/card-lifecycle-links`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ ...request, pendingTransactionId: 'x'.repeat(513) }),
+    })
+    expect(invalid.status).toBe(400)
+
+    const forgedReason = await fetch(`${base}/control/v1/investec/card-lifecycle-links`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ ...request, reason: 'same order\nforged audit line' }),
+    })
+    expect(forgedReason.status).toBe(400)
+  })
+
+  it('does not expose lifecycle linking when the runtime feature is disabled', async () => {
+    const disabledHandler = createFinanceSyncHttpHandler({
+      controlToken,
+      providersEnabled: true,
+      health: () => ({ status: 200, body: { ok: true } }),
+    })
+    const disabledServer = createServer((request, response) => { void disabledHandler(request, response) })
+    await new Promise<void>((resolve, reject) => {
+      disabledServer.once('error', reject)
+      disabledServer.listen(0, '127.0.0.1', resolve)
+    })
+    try {
+      const address = disabledServer.address()
+      if (!address || typeof address === 'string') throw new Error('disabled test server did not bind')
+      const response = await fetch(
+        `http://127.0.0.1:${address.port}/control/v1/investec/card-lifecycle-links`,
+        {
+          method: 'POST',
+          headers: headers({ 'content-type': 'application/json' }),
+          body: JSON.stringify({}),
+        },
+      )
+      expect(response.status).toBe(404)
+    } finally {
+      await new Promise<void>(resolve => disabledServer.close(() => resolve()))
+    }
+  })
+
   it('creates an exact authenticated observation quarantine request', async () => {
     const request = {
       sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
@@ -246,6 +310,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
         ['/control/v1/provider-connections/snaptrade/start', { method: 'POST' }],
         ['/control/v1/observation-quarantines', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
         ['/control/v1/investec/card-currency-corrections', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
+        ['/control/v1/investec/card-lifecycle-links', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
       ] as const
       for (const [path, init] of requests) {
         const response = await fetch(`${disabledBase}${path}`, { ...init, headers: headers('headers' in init ? init.headers : {}) })

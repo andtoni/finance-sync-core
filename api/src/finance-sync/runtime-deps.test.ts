@@ -66,7 +66,11 @@ function receipt(op: BridgeDisclosureOperation) {
   }
 }
 
-function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attempts: number }, priorPayloads: unknown[] = []) {
+function outboxSql(
+  row: { id: string; payload: BridgeDisclosureOperation; attempts: number },
+  priorPayloads: unknown[] = [],
+  manualOverrides: unknown[] = [],
+) {
   let state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' = 'pending'
   let attempts = row.attempts
   const queries: string[] = []
@@ -84,6 +88,7 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
   }
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const text = strings.join('?')
+    if (/FROM\s+investec_card_lifecycle_overrides/i.test(text)) return manualOverrides
     if (/INSERT\s+INTO\s+raw_observations/i.test(text)) {
       const payloadIndex = values.findIndex(value => value !== null && typeof value === 'object'
         && ('transactionId' in value || 'accountId' in value))
@@ -106,6 +111,25 @@ function outboxSql(row: { id: string; payload: BridgeDisclosureOperation; attemp
     }
     queries.push(text)
     if (/FROM\s+raw_observations/i.test(text) && /provider_version/i.test(text) && /semantic_hash/i.test(text)) {
+      if (/provider_version\s*=\s*\?/i.test(text)) {
+        const counterpartId = values.at(-1)
+        const counterpart = allRows().find(payload => {
+          const value = unwrap(payload).payload
+          return value && typeof value === 'object'
+            && (value as Record<string, unknown>).transactionId === counterpartId
+        })
+        if (!counterpart) return []
+        const unwrapped = unwrap(counterpart)
+        const value = unwrapped.payload && typeof unwrapped.payload === 'object'
+          ? unwrapped.payload as Record<string, unknown> : {}
+        return [{
+          payload: unwrapped.payload,
+          raw_payload: unwrapped.rawPayload,
+          provider_version: typeof value.providerVersion === 'string' ? value.providerVersion : `investec:txn:${counterpartId}`,
+          semantic_hash: typeof value.semanticHash === 'string' ? value.semanticHash : `prior-hash-${counterpartId}`,
+          observed_at: typeof value.observedAt === 'string' ? value.observedAt : '2026-08-06T00:00:00.000Z',
+        }]
+      }
       const lifecyclePayloads = /providerLifecycleTransactionId/.test(text)
         ? allRows().filter(payload => {
           const value = unwrap(payload).payload && typeof unwrap(payload).payload === 'object'
@@ -251,6 +275,13 @@ describe('createRuntimeDependencies startup validation', () => {
       FINANCE_SYNC_BRIDGE_URL: 'http://127.0.0.1:8088/bridge',
       FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'http://127.0.0.1:8088/receipts',
       FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: '127.0.0.1',
+    }, true)).not.toThrow()
+    expect(() => assertBridgeConfiguration({
+      FINANCE_SYNC_BRIDGE_URL: 'http://wealthfolio:8088/bridge',
+      FINANCE_SYNC_BRIDGE_RECEIPT_URL: 'http://wealthfolio:8088/receipts',
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: 'wealthfolio',
+      FINANCE_SYNC_FIXTURE_BRIDGE_HOSTS: 'wealthfolio',
+      FINANCE_SYNC_BRIDGE_TOKEN: 'fixture-token',
     }, true)).not.toThrow()
   })
 
@@ -953,6 +984,27 @@ describe('Investec card and poll lifecycle correlation', () => {
     const [operation] = fixture.enqueued.filter(item => item.kind === 'ActivityUpsert')
     expect(operation.lifecycleSuccessorId).toBeUndefined()
     expect(operation.activity?.needsReview).toBeUndefined()
+  })
+
+  it('uses an operator-authorized override without weakening automatic matching', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'manual-card', providerVersion: 'investec:card:manual-card', semanticHash: 'manual-card-hash', currency: 'ZAR', originalCurrency: 'ZAR', originalAmount: '10.00', amount: '-10.00', cardNumber: '400000xxxxxx0011' }
+    const settled = { ...inferredSettledPayload, transactionId: 'manual-settled', providerVersion: 'investec:txn:manual-settled', semanticHash: 'manual-settled-hash', description: 'DMI* ACME SALES & SERV ACME.COM ZA', amount: '-12.00', settlementAmount: '-12.00', cardNumber: '400000xxxxxx0011' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000112', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled], [{ pending_transaction_id: card.transactionId, posted_transaction_id: settled.transactionId }])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger',
+      payload: card,
+    }], { skipCurrentState: true })
+    const lifecycle = fixture.enqueued.find(item => item.lifecycleSuccessorId?.endsWith(':manual-settled'))
+    expect(lifecycle?.activity?.metadata).toMatchObject({
+      providerOwned: { investecCorrelation: { confidence: 'operator-authorized' } },
+    })
   })
 
   it('does not infer a lifecycle from malformed currency evidence', async () => {

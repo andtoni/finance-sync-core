@@ -35,6 +35,13 @@ const INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS = 3
 const DAY_MS = 86_400_000
 const PLAID_HOSTS = new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com'])
 
+interface FixtureAdmissionRow {
+  readonly provider_account_id: string
+  readonly source_resource_incarnation_id: string
+  readonly wealthfolio_account_id: string
+  readonly receiver_access_generation: number
+}
+
 async function ensureFixtureAuthority(sql: FinanceSyncSql, deploymentId: string): Promise<void> {
   for (const row of fixtureAuthorityRows) {
     await sql`
@@ -71,7 +78,78 @@ async function ensureFixtureAuthority(sql: FinanceSyncSql, deploymentId: string)
         ${row.accountIncarnationId}::uuid, 'fixture', ${row.accountId}, 1
       ) ON CONFLICT DO NOTHING
     `
+    if (row.provider === 'investec') {
+      await sql`
+        INSERT INTO provider_connections (
+          deployment_id, local_owner_id, connection_id, provider_principal_id,
+          provider, provider_connection_id, secret_reference, provider_generation,
+          configuration, state
+        ) VALUES (
+          ${deploymentId}, ${FIXTURE_OWNER_SUBJECT}, ${row.connectionId}::uuid,
+          ${row.providerPrincipalId}::uuid, 'investec', ${row.providerConnectionId},
+          'FIXTURE_ONLY', 1, '{}'::jsonb, 'discovered'
+        ) ON CONFLICT DO NOTHING
+      `
+      await sql`
+        INSERT INTO discovered_provider_accounts (
+          deployment_id, local_owner_id, connection_id, provider_account_id,
+          account_incarnation_id, source_resource_incarnation_id, provider_name,
+          provider_type, currency, mask, assets, discovery_generation
+        ) VALUES (
+          ${deploymentId}, ${FIXTURE_OWNER_SUBJECT}, ${row.connectionId}::uuid,
+          ${row.accountId}, ${row.accountIncarnationId}::uuid,
+          ${row.sourceResourceIncarnationId}::uuid, 'Fixture Investec Card',
+          'Private Bank Account', 'ZAR', '0014', '[]'::jsonb, 1
+        ) ON CONFLICT DO NOTHING
+      `
+    }
   }
+}
+
+async function admittedFixtureConnections(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connections: readonly RuntimeConnection[],
+): Promise<readonly RuntimeConnection[]> {
+  const admissions = await sql<FixtureAdmissionRow[]>`
+    SELECT dpa.provider_account_id, dpa.source_resource_incarnation_id,
+      paa.wealthfolio_account_id, paa.receiver_access_generation
+    FROM discovered_provider_accounts dpa
+    JOIN provider_account_admissions paa
+      ON paa.deployment_id = dpa.deployment_id
+      AND paa.local_owner_id = dpa.local_owner_id
+      AND paa.connection_id = dpa.connection_id
+      AND paa.provider_account_id = dpa.provider_account_id
+    JOIN provider_connections pc
+      ON pc.deployment_id = dpa.deployment_id
+      AND pc.local_owner_id = dpa.local_owner_id
+      AND pc.connection_id = dpa.connection_id
+    WHERE dpa.deployment_id = ${deploymentId}
+      AND dpa.local_owner_id = ${FIXTURE_OWNER_SUBJECT}
+      AND pc.state = 'active'
+      AND pc.disabled_at IS NULL
+      AND dpa.discovery_generation = pc.provider_generation
+      AND paa.provider_generation = pc.provider_generation
+      AND paa.revoked_at IS NULL
+      AND paa.baseline_state = 'verified'
+  `
+  return connections.flatMap(connection => {
+    const rows = connection.accountIds.map(providerAccountId => admissions.find(row =>
+      row.provider_account_id === providerAccountId
+      && row.source_resource_incarnation_id === connection.sourceResourceIncarnationId))
+    if (rows.some(row => row === undefined)) return []
+    const admitted = rows as FixtureAdmissionRow[]
+    const generations = new Set(admitted.map(row => row.receiver_access_generation))
+    if (generations.size !== 1) throw new Error('fixture receiver access generation is ambiguous')
+    return [{
+      ...connection,
+      receiverAccessGeneration: admitted[0].receiver_access_generation,
+      wealthfolioAccountIds: Object.freeze(Object.fromEntries(admitted.map(row => [
+        row.provider_account_id,
+        row.wealthfolio_account_id,
+      ]))),
+    }]
+  })
 }
 
 export interface SyncCycleAuditEntry {
@@ -87,9 +165,20 @@ interface RuntimeEnv extends ProviderRuntimeEnv {
   readonly FINANCE_SYNC_BRIDGE_RECEIPT_URL?: string
   readonly FINANCE_SYNC_BRIDGE_TOKEN?: string
   readonly FINANCE_SYNC_BRIDGE_TOKEN_FILE?: string
+  readonly FINANCE_SYNC_FIXTURE_BRIDGE_HOSTS?: string
 }
 
-function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: ReadonlySet<string>, allowFixtureHttp = false): URL {
+function fixtureBridgeHosts(env: RuntimeEnv): ReadonlySet<string> {
+  return new Set(env.FINANCE_SYNC_FIXTURE_BRIDGE_HOSTS?.split(',').map(value => value.trim().toLowerCase()).filter(Boolean) ?? [])
+}
+
+function requiredEndpoint(
+  raw: string | undefined,
+  name: string,
+  allowedHosts: ReadonlySet<string>,
+  allowFixtureHttp = false,
+  allowedFixtureHosts: ReadonlySet<string> = new Set(),
+): URL {
   if (!raw) throw new Error(`${name} is required for configured connections`)
   let url: URL
   try {
@@ -97,9 +186,11 @@ function requiredEndpoint(raw: string | undefined, name: string, allowedHosts: R
   } catch {
     throw new Error(`${name} must be a valid URL`)
   }
-  const fixtureLoopback = allowFixtureHttp && ['127.0.0.1', 'localhost'].includes(url.hostname.toLowerCase())
-  const fixtureHttp = fixtureLoopback && url.protocol === 'http:'
-  if (allowFixtureHttp && !fixtureLoopback) throw new Error(`${name} must target a loopback host in fixture mode`)
+  const hostname = url.hostname.toLowerCase()
+  const fixtureLoopback = allowFixtureHttp && ['127.0.0.1', 'localhost'].includes(hostname)
+  const fixtureHost = allowFixtureHttp && allowedFixtureHosts.has(hostname)
+  const fixtureHttp = (fixtureLoopback || fixtureHost) && url.protocol === 'http:'
+  if (allowFixtureHttp && !fixtureLoopback && !fixtureHost) throw new Error(`${name} must target a loopback or explicitly allowed fixture host`)
   if ((!fixtureHttp && url.protocol !== 'https:') || url.username || url.password) throw new Error(`${name} must be an HTTPS URL without credentials`)
   if (!allowedHosts.has(url.hostname.toLowerCase())) throw new Error(`${name} host is not allowed`)
   return url
@@ -359,7 +450,7 @@ interface InvestecCounterpart {
   readonly providerVersion: string
   readonly semanticHash: string
   readonly observedAt: string
-  readonly provenance: 'provider-explicit' | 'provider-facts-exact'
+  readonly provenance: 'provider-explicit' | 'provider-facts-exact' | 'operator-authorized'
 }
 
 interface InvestecAmbiguousCounterpart {
@@ -467,7 +558,16 @@ function cardSettlementDateMatches(cardDate: string, settledDate: string): boole
   return Number.isInteger(days) && days >= 0 && days <= INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS
 }
 
-function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+/**
+ * Match every non-economic provider fact used by automatic card settlement
+ * correlation. This deliberately excludes only the amount equality check so a
+ * user-authorized override can reuse the same safety fence without widening the
+ * automatic matcher.
+ */
+export function investecProviderFactPairShapeMatches(
+  card: Readonly<Record<string, unknown>>,
+  settled: Readonly<Record<string, unknown>>,
+): boolean {
   if (hasConflictingLifecycleIds(card) || hasConflictingLifecycleIds(settled)
     || providerLifecycleTransactionId(card) || providerLifecycleTransactionId(settled)
     || normalizedText(card.status) !== 'PENDING' || normalizedText(settled.status) !== 'POSTED'
@@ -496,10 +596,18 @@ function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled:
   const accountCurrency = providerCardAccountCurrency(card)
   const originalMagnitude = cashDecimalMagnitude(originalAmount)
   const settlementMagnitude = cashDecimalMagnitude(settlementAmount)
-  if (!originalAmount || !originalCurrency || !cardCurrency || cardCurrency !== originalCurrency
-    || !settlementAmount || !settlementCurrency || !accountCurrency || settlementCurrency !== accountCurrency
-    || originalMagnitude === undefined || originalMagnitude.units <= 0n
-    || settlementMagnitude === undefined || settlementMagnitude.units <= 0n) return false
+  return Boolean(originalAmount && originalCurrency && cardCurrency && cardCurrency === originalCurrency
+    && settlementAmount && settlementCurrency && accountCurrency && settlementCurrency === accountCurrency
+    && originalMagnitude !== undefined && originalMagnitude.units > 0n
+    && settlementMagnitude !== undefined && settlementMagnitude.units > 0n)
+}
+
+function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+  if (!investecProviderFactPairShapeMatches(card, settled)) return false
+  const originalAmount = card.originalAmount as string
+  const originalCurrency = currencyCode(card.originalCurrency)!
+  const settlementAmount = settled.settlementAmount ?? settled.amount
+  const settlementCurrency = currencyCode(settled.settlementCurrency ?? settled.currency)!
   // Foreign authorization and account settlement magnitudes are intentionally
   // incomparable; only equal currencies receive the strict tolerance check.
   return originalCurrency !== settlementCurrency || sameCurrencyAmountWithinTolerance(
@@ -535,6 +643,73 @@ function hasConflictingLifecycleIds(payload: Readonly<Record<string, unknown>>):
   return payload.providerLifecycleIdConflict === true || providerLifecycleTransactionIds(payload).length > 1
 }
 
+interface InvestecLifecycleOverrideRow {
+  readonly pending_transaction_id: string
+  readonly posted_transaction_id: string
+}
+
+async function findManualInvestecLifecycleCounterpart(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  payload: Readonly<Record<string, unknown>>,
+  isCard: boolean,
+  currentTransactionId: string,
+): Promise<InvestecCounterpartMatch | undefined> {
+  const overrides = await sql<InvestecLifecycleOverrideRow[]>`
+    SELECT pending_transaction_id, posted_transaction_id
+    FROM investec_card_lifecycle_overrides
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${connection.localOwnerId}
+      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+      AND (pending_transaction_id = ${currentTransactionId} OR posted_transaction_id = ${currentTransactionId})
+  `
+  if (overrides.length === 0) return undefined
+  if (overrides.length !== 1) return { ambiguous: true }
+  const override = overrides[0]
+  const counterpartTransactionId = isCard ? override.posted_transaction_id : override.pending_transaction_id
+  const counterpartProviderVersion = `${isCard ? 'investec:txn:' : 'investec:card:'}${counterpartTransactionId}`
+  const rows = await sql<InvestecCounterpartRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (provider_version)
+        payload, provider_version, semantic_hash, hash_specification_version, observed_at,
+        deployment_id, local_owner_id, source_resource_incarnation_id
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND local_owner_id = ${connection.localOwnerId}
+        AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+        AND provider_version = ${counterpartProviderVersion}
+      ORDER BY provider_version, recorded_at DESC, observed_at DESC, observation_id DESC
+    )
+    SELECT payload, provider_version, semantic_hash, observed_at
+    FROM latest
+    WHERE payload->>'transactionId' = ${counterpartTransactionId}
+      AND payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = latest.deployment_id AND q.local_owner_id = latest.local_owner_id
+          AND q.source_resource_incarnation_id = latest.source_resource_incarnation_id
+          AND q.provider_version = latest.provider_version AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  const parsed = rows.map(counterpartFromRow).filter((row): row is InvestecCounterpart => row !== undefined)
+  if (parsed.length !== 1) return { ambiguous: true }
+  const counterpart = parsed[0]
+  const card = isCard ? payload : counterpart.payload
+  const settled = isCard ? counterpart.payload : payload
+  const cardAccountId = typeof card.accountId === 'string' ? card.accountId : undefined
+  const settledAccountId = typeof settled.accountId === 'string' ? settled.accountId : undefined
+  const validCounterpart = isCard
+    ? normalizedText(counterpart.payload.status) === 'POSTED' && providerTransactionType(counterpart.payload) === 'CARDPURCHASES'
+    : normalizedText(counterpart.payload.status) === 'PENDING'
+  if (!cardAccountId || cardAccountId !== settledAccountId
+    || !connection.accountIds.includes(cardAccountId)
+    || !validCounterpart
+    || !investecProviderFactPairShapeMatches(card, settled)) return { ambiguous: true }
+  return { ...counterpart, provenance: 'operator-authorized' }
+}
+
 async function findInvestecCounterpart(
   sql: FinanceSyncSql,
   deploymentId: string,
@@ -552,6 +727,15 @@ async function findInvestecCounterpart(
   const currentPrefix = isCard ? 'investec:card:%' : 'investec:txn:%'
   const counterpartPrefix = isCard ? 'investec:txn:%' : 'investec:card:%'
   if (!isCard && (normalizedText(payload.status) !== 'POSTED' || providerTransactionType(payload) !== 'CARDPURCHASES')) return undefined
+  // An explicit operator link is durable control-plane evidence. It bypasses
+  // only the amount equality fence and is evaluated before provider-fact
+  // inference, while conflicting provider lifecycle IDs remain authoritative.
+  if (currentTransactionId) {
+    const manual = await findManualInvestecLifecycleCounterpart(
+      sql, deploymentId, connection, payload, isCard, currentTransactionId,
+    )
+    if (manual) return manual
+  }
   // Explicit lifecycle IDs remain authoritative and are resolved before the
   // deliberately narrower provider-fact matcher below.
   if (linkedTransactionId || currentTransactionId) {
@@ -677,7 +861,7 @@ function markInvestecReconciliationReview(
 function correlatedInvestecPayload(
   card: Readonly<Record<string, unknown>>,
   settled: Readonly<Record<string, unknown>>,
-  provenance: 'provider-explicit' | 'provider-facts-exact',
+  provenance: 'provider-explicit' | 'provider-facts-exact' | 'operator-authorized',
 ): Readonly<Record<string, unknown>> {
   const cardId = transactionId(card)
   const settledId = transactionId(settled)
@@ -900,8 +1084,9 @@ export async function reconcileInvestecCardLifecycles(
 
 export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {
   const allowedBridgeHosts = bridgeHosts(env)
-  requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture)
-  requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts, fixture)
+  const allowedFixtureHosts = fixtureBridgeHosts(env)
+  requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture, allowedFixtureHosts)
+  requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts, fixture, allowedFixtureHosts)
   readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
 }
 
@@ -994,10 +1179,11 @@ export function createRuntimeDependencies(
   let bridgeToken: string | undefined
   const bridgeInputs = [env.FINANCE_SYNC_BRIDGE_URL, env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, env.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS,
     env.FINANCE_SYNC_BRIDGE_TOKEN, env.FINANCE_SYNC_BRIDGE_TOKEN_FILE]
+  const allowedFixtureHosts = fixtureBridgeHosts(env)
   if (bridgeInputs.some(Boolean)) {
     const allowedBridgeHosts = bridgeHosts(env)
-    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture)
-    bridgeReceiptUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts, fixture)
+    bridgeUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_URL, 'FINANCE_SYNC_BRIDGE_URL', allowedBridgeHosts, fixture, allowedFixtureHosts)
+    bridgeReceiptUrl = requiredEndpoint(env.FINANCE_SYNC_BRIDGE_RECEIPT_URL, 'FINANCE_SYNC_BRIDGE_RECEIPT_URL', allowedBridgeHosts, fixture, allowedFixtureHosts)
     bridgeToken = readExclusiveInput(env as Readonly<Record<string, string | undefined>>, 'FINANCE_SYNC_BRIDGE_TOKEN', true)
   }
 
@@ -1163,7 +1349,7 @@ export function createRuntimeDependencies(
       if (fixtureRuntime) {
         await ensureFixtureAuthority(sql, deploymentId)
         if (!bridgeUrl || !bridgeReceiptUrl || !bridgeToken) throw new Error('bridge configuration is required for fixture connections')
-        return fixtureRuntime.connections
+        return admittedFixtureConnections(sql, deploymentId, fixtureRuntime.connections)
       }
       const connections = await loadDurableRuntimeConnections(sql, deploymentId, secretResolver)
       if (connections.length > 0 && (!bridgeUrl || !bridgeReceiptUrl || !bridgeToken)) throw new Error('bridge configuration is required for admitted connections')

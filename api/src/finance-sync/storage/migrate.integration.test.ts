@@ -136,7 +136,7 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql!, directory);
     await migrate(sql!, directory);
     const rows = await sql!`select version from finance_sync_schema_migrations order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
     const rawColumns = await sql!`
       select column_name from information_schema.columns
       where table_name = 'raw_observations' and column_name = 'raw_payload'
@@ -156,6 +156,104 @@ suite("PostgreSQL migrations (integration)", () => {
     await sql!`insert into finance_sync_migrations (deployment_id, version, name, checksum) values ('conflicting-legacy', 1, 'identity', ${'0'.repeat(64)})`;
     await expect(migrate(sql!, directory)).rejects.toThrow(/checksum conflict/i);
     await sql!`delete from finance_sync_migrations where deployment_id = 'conflicting-legacy'`;
+  });
+
+  it("enforces lifecycle override one-to-one and append-only constraints in PostgreSQL", async () => {
+    const schemaName = `finance_sync_lifecycle_${process.pid}_${Date.now()}`;
+    const schema = quoteIdentifier(schemaName);
+    await sql!.unsafe(`CREATE SCHEMA ${schema}`);
+    const first = postgres(url!, {
+      connect_timeout: 3,
+      prepare: false,
+      max: 1,
+      connection: { search_path: schemaName },
+    });
+    const second = postgres(url!, {
+      connect_timeout: 3,
+      prepare: false,
+      max: 1,
+      connection: { search_path: schemaName },
+    });
+    try {
+      await first.begin(async transaction => {
+        const tx = transaction as unknown as ReturnType<typeof postgres>;
+        const migrations = await applyThroughEight(tx, schemaName);
+        for (const migration of migrations.filter(candidate => candidate.version > 8)) {
+          await tx.unsafe(migration.sql);
+        }
+      });
+      const deploymentId = "lifecycle-test";
+      const owner = "urn:wealthfolio:test#lifecycle-owner";
+      const principalId = "10000000-0000-4000-8000-000000000101";
+      const connectionId = "20000000-0000-4000-8000-000000000102";
+      const accountIncarnationId = "30000000-0000-4000-8000-000000000103";
+      const sourceId = "40000000-0000-4000-8000-000000000104";
+      await first.begin(async transaction => {
+        const tx = transaction as unknown as ReturnType<typeof postgres>;
+        await tx.unsafe(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+        await tx`INSERT INTO provider_principals
+          (deployment_id, local_owner_id, provider, provider_principal_id, provider_subject_id)
+          VALUES (${deploymentId}, ${owner}, 'investec', ${principalId}::uuid, 'lifecycle-subject')`;
+        await tx`INSERT INTO connection_incarnations
+          (deployment_id, local_owner_id, connection_incarnation_id, provider_principal_id,
+           provider_connection_id, incarnation)
+          VALUES (${deploymentId}, ${owner}, ${connectionId}::uuid, ${principalId}::uuid,
+            'lifecycle-connection', 1)`;
+        await tx`INSERT INTO account_incarnations
+          (deployment_id, local_owner_id, account_incarnation_id, connection_incarnation_id,
+           provider_account_id, incarnation)
+          VALUES (${deploymentId}, ${owner}, ${accountIncarnationId}::uuid, ${connectionId}::uuid,
+            'lifecycle-account', 1)`;
+        await tx`INSERT INTO resource_incarnations
+          (deployment_id, local_owner_id, source_resource_incarnation_id, account_incarnation_id,
+           resource_kind, provider_resource_id, incarnation)
+          VALUES (${deploymentId}, ${owner}, ${sourceId}::uuid, ${accountIncarnationId}::uuid,
+            'card', 'lifecycle-card', 1)`;
+      });
+
+      const insertPair = (
+        client: ReturnType<typeof postgres>,
+        pendingTransactionId: string,
+        postedTransactionId: string,
+      ) => client.begin(async transaction => {
+        const tx = transaction as unknown as ReturnType<typeof postgres>;
+        await tx.unsafe(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+        return tx<{ override_id: string }[]>`INSERT INTO investec_card_lifecycle_overrides (
+            deployment_id, local_owner_id, source_resource_incarnation_id,
+            pending_transaction_id, posted_transaction_id, actor_subject, reason
+          ) VALUES (
+            ${deploymentId}, ${owner}, ${sourceId}::uuid,
+            ${pendingTransactionId}, ${postedTransactionId}, ${owner}, 'integration test'
+          ) RETURNING override_id`;
+      });
+      const [left, right] = await Promise.all([
+        insertPair(first, "shared-fact", "posted-a"),
+        insertPair(second, "pending-b", "shared-fact"),
+      ]);
+      expect(left.length + right.length).toBe(1);
+
+      const [stored] = await first.begin(async transaction => {
+        const tx = transaction as unknown as ReturnType<typeof postgres>;
+        await tx.unsafe(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+        return tx<{ override_id: string }[]>`
+          SELECT override_id FROM investec_card_lifecycle_overrides`;
+      });
+      await expect(first.begin(async transaction => {
+        const tx = transaction as unknown as ReturnType<typeof postgres>;
+        await tx.unsafe(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+        await tx`UPDATE investec_card_lifecycle_overrides
+          SET reason = 'mutated' WHERE override_id = ${stored.override_id}::uuid`;
+      })).rejects.toThrow(/append-only/i);
+      await expect(first.begin(async transaction => {
+        const tx = transaction as unknown as ReturnType<typeof postgres>;
+        await tx.unsafe(`SET LOCAL search_path TO ${schema}, pg_catalog`);
+        await tx`DELETE FROM investec_card_lifecycle_overrides
+          WHERE override_id = ${stored.override_id}::uuid`;
+      })).rejects.toThrow(/append-only/i);
+    } finally {
+      await Promise.all([first.end(), second.end()]);
+      await sql!.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    }
   });
 });
 afterAll(async () => { await sql?.end(); });

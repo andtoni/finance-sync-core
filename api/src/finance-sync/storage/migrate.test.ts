@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -82,6 +82,19 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/envelope jsonb NOT NULL/i);
     expect(sql).toMatch(/REVOKE UPDATE, DELETE ON card_ingress_quarantines FROM finance_sync_runtime/i);
     expect(sql).toMatch(/card ingress quarantines are append-only/i);
+  });
+
+  it("defines append-only Investec card lifecycle overrides", () => {
+    const sql = readFileSync(resolve(root, "0018_investec_card_lifecycle_overrides.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS investec_card_lifecycle_overrides/i);
+    expect(sql).toMatch(/UNIQUE \(deployment_id, local_owner_id, source_resource_incarnation_id, pending_transaction_id\)/i);
+    expect(sql).toMatch(/UNIQUE \(deployment_id, local_owner_id, source_resource_incarnation_id, posted_transaction_id\)/i);
+    expect(sql).toMatch(/CREATE TRIGGER investec_card_lifecycle_overrides_one_to_one/i);
+    expect(sql).toMatch(/existing\.pending_transaction_id = ANY/i);
+    expect(sql).toMatch(/existing\.posted_transaction_id = ANY/i);
+    expect(sql).toMatch(/pg_advisory_xact_lock/i);
+    expect(sql).toMatch(/REVOKE UPDATE, DELETE ON investec_card_lifecycle_overrides FROM finance_sync_runtime/i);
+    expect(sql).toMatch(/Investec card lifecycle overrides are append-only/i);
   });
 
   it("rejects checksum drift", () => {
