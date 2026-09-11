@@ -13,9 +13,15 @@ export type ConnectProvider = (typeof CONNECT_PROVIDERS)[number]
 export interface PlaidTokenWriter {
   readonly available: boolean
   /** Exact non-secret pre-provisioned destination slots; writer never derives one. */
+  /** Legacy exact references remain readable and writable for existing Items. */
   readonly allowedSlots: readonly string[]
-  /** Authenticate and prove the durable sink is reachable before consuming a public token. */
-  prepare?(): Promise<void>
+  /** Server-generated destination for a new Item; never caller supplied. */
+  readonly allocatePlaidSecretReference?: (subject: string) => string
+  readonly acceptsPlaidSecretReference?: (reference: string) => boolean
+  /** Authenticate and reserve a generated destination before consuming a public token. */
+  prepare?(reservation?: { readonly secretReference: string; readonly reservationBinding: string }): Promise<void>
+  /** Read a previously persisted bundle to resume after a completion crash. */
+  recoverPlaidAccessToken?: (reference: string) => Promise<Readonly<Record<string, unknown>>>
   storePlaidAccessToken(input: {
     readonly subject: string
     readonly itemId: string
@@ -23,6 +29,8 @@ export interface PlaidTokenWriter {
     readonly clientId: string
     readonly clientSecret: string
     readonly accessToken: string
+    /** SHA-256 binding of the subject and DB continuation token; never the raw token. */
+    readonly reservationBinding?: string
   }): Promise<string>
 }
 
@@ -55,6 +63,8 @@ export type PlaidConnectFlow = 'new' | 'update'
 
 export interface ConsumedPlaidConnectSession {
   readonly secretReference: string
+  readonly recovery?: boolean
+  readonly claimVersion?: number
   readonly flow: PlaidConnectFlow
   readonly providerConnectionId?: string
   readonly providerGeneration?: number
@@ -78,8 +88,12 @@ export interface ConnectSessionStore {
     readonly token: string
     readonly flow: PlaidConnectFlow
   }): Promise<ConsumedPlaidConnectSession | undefined>
-  /** Releases the slot lease after Link bootstrap or completion success/failure. */
-  release(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string }): Promise<void>
+  /** Releases a bootstrap lease, or a specific completion claim; completion claims are never released by token alone. */
+  release(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string; readonly claimVersion?: number }): Promise<void>
+  markCredentialPersisted?(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string; readonly claimVersion: number }): Promise<void>
+  markUncertain?(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string; readonly claimVersion: number }): Promise<void>
+  replayCompleted?(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string; readonly flow: PlaidConnectFlow }): Promise<{ readonly itemId: string } | undefined>
+  finalize?(input: { readonly deploymentId: string; readonly subject: string; readonly provider: 'plaid'; readonly token: string; readonly claimVersion: number; readonly itemId: string }, operation: (tx: unknown) => Promise<void>): Promise<void>
 }
 
 export interface ConnectControlDependencies {
@@ -107,7 +121,12 @@ export interface ConnectControlDependencies {
   readonly onPlaidConnected?: (input: {
     readonly subject: string; readonly itemId: string; readonly secretReference: string
     readonly accounts: Awaited<ReturnType<PlaidConnectTransport['listAccounts']>>
+    readonly recovery?: boolean
   }) => Promise<void>
+  readonly onPlaidConnectedTransactional?: (input: {
+    readonly subject: string; readonly itemId: string; readonly secretReference: string
+    readonly accounts: Awaited<ReturnType<PlaidConnectTransport['listAccounts']>>; readonly recovery?: boolean
+  }, tx: unknown) => Promise<void>
   readonly onPlaidAccountsUpdated?: (input: {
     readonly subject: string; readonly providerConnectionId: string; readonly secretReference: string; readonly providerGeneration: number
     readonly accounts: Awaited<ReturnType<PlaidConnectTransport['listAccounts']>>
@@ -176,6 +195,10 @@ export function wealthfolioProviderRelinkAttestation(input: {
 function exactDigest(actual: string, expected: string): boolean {
   const left = Buffer.from(actual); const right = Buffer.from(expected)
   return left.length === right.length && timingSafeEqual(left, right)
+}
+
+function reservationBinding(subjectValue: string, continuationToken: string): string {
+  return createHash('sha256').update(`${subjectValue}\u0000${continuationToken}`, 'utf8').digest('hex')
 }
 
 export class FinanceSyncConnectControl {
@@ -258,17 +281,30 @@ export class FinanceSyncConnectControl {
     }
     if (selected === 'plaid') {
       if (!this.deps.plaid || !this.deps.secretStore.available || !this.deps.onPlaidConnected) throw new ConnectControlError(503, 'provider is unavailable')
-      // Writer slots are deployment-global. Exclude every active Plaid slot,
-      // not only the authenticated subject's, to prevent cross-subject overwrite.
-      const activeSlots = new Set(allConnections.filter((connection): connection is Extract<RuntimeConnection, { provider: 'plaid' }> => connection.provider === 'plaid')
-        .map(connection => connection.secretReference).filter((reference): reference is string => !!reference))
-      const candidates = this.deps.secretStore.allowedSlots.filter(slot => !activeSlots.has(slot))
       let continuationToken: string | undefined
-      for (const secretReference of candidates) {
+      if (this.deps.secretStore.allocatePlaidSecretReference) {
+        // The writer generates a collision-resistant reference inside its scoped
+        // namespace. PostgreSQL still binds it to this subject/session.
+        const secretReference = this.deps.secretStore.allocatePlaidSecretReference(boundSubject)
         continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', secretReference, flow: 'new' })
-        if (continuationToken) break
+        if (continuationToken) {
+          try {
+            await this.deps.secretStore.prepare?.({ secretReference, reservationBinding: reservationBinding(boundSubject, continuationToken) })
+          } catch (error) {
+            try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken }) } catch { /* expiry is the fallback lease recovery */ }
+            throw error
+          }
+        }
+      } else {
+        // Compatibility for injected legacy stores and tests only.
+        const activeSlots = new Set(allConnections.filter((connection): connection is Extract<RuntimeConnection, { provider: 'plaid' }> => connection.provider === 'plaid')
+          .map(connection => connection.secretReference).filter((reference): reference is string => !!reference))
+        for (const secretReference of this.deps.secretStore.allowedSlots.filter(slot => !activeSlots.has(slot))) {
+          continuationToken = await this.deps.sessionStore.create({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', secretReference, flow: 'new' })
+          if (continuationToken) break
+        }
       }
-      if (!continuationToken) throw new ConnectControlError(409, 'no unallocated Plaid credential slot is available')
+      if (!continuationToken) throw new ConnectControlError(409, 'a Plaid connection is already being linked; retry after it completes')
       try {
         const result = await this.deps.plaid.createLinkToken(boundSubject)
         if (!result.linkToken) throw new ConnectControlError(502, 'provider returned an invalid response')
@@ -288,28 +324,61 @@ export class FinanceSyncConnectControl {
   async completePlaid(rawSubject: string, publicToken: string, continuationToken: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
     if (!publicToken || !continuationToken) throw new ConnectControlError(400, 'completion tokens are required')
+    const replay = await this.deps.sessionStore.replayCompleted?.({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, flow: 'new' })
+    if (replay) return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
     if (!this.deps.plaid || !this.deps.secretStore.available || !this.deps.onPlaidConnected) throw new ConnectControlError(503, 'provider is unavailable')
-    await this.deps.secretStore.prepare?.()
+    if (!this.deps.secretStore.allocatePlaidSecretReference) await this.deps.secretStore.prepare?.()
     const session = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, flow: 'new' })
     if (!session || session.flow !== 'new' || session.providerConnectionId !== undefined || session.providerGeneration !== undefined
-      || !this.deps.secretStore.allowedSlots.includes(session.secretReference)) throw new ConnectControlError(409, 'link session is invalid or already used')
+      || (!this.deps.secretStore.allowedSlots.includes(session.secretReference)
+        && !this.deps.secretStore.acceptsPlaidSecretReference?.(session.secretReference))) throw new ConnectControlError(409, 'link session is invalid or already used')
     const secretReference = session.secretReference
-    const release = async () => { try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken }) } catch { /* expiry recovers a lease if PostgreSQL is temporarily unavailable */ } }
+    const claimVersion = session.claimVersion
+    let credentialPersisted = false
+    const release = async () => { try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion }) } catch { /* expiry recovers a lease if PostgreSQL is temporarily unavailable */ } }
+    const uncertain = async () => { try { if (claimVersion !== undefined) await this.deps.sessionStore.markUncertain?.({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion }) } catch { /* the lease remains recoverable when PostgreSQL is unavailable */ } }
+    const persisted = async () => { if (claimVersion !== undefined) await this.deps.sessionStore.markCredentialPersisted?.({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion }) }
+    if (session.recovery) {
+      if (!this.deps.secretStore.recoverPlaidAccessToken) { await uncertain(); throw new ConnectControlError(409, 'Plaid completion is uncertain; reconnect is required') }
+      try {
+        const bundle = await this.deps.secretStore.recoverPlaidAccessToken(secretReference)
+        const itemId = typeof bundle.itemId === 'string' ? bundle.itemId : ''
+        const accessToken = typeof bundle.accessToken === 'string' ? bundle.accessToken : ''
+        if (!itemId || !accessToken) throw new Error('incomplete persisted Plaid bundle')
+        const accounts = await this.deps.plaid.listAccounts(accessToken)
+        if (accounts.length === 0) throw new Error('provider returned no accounts')
+        const complete = this.deps.onPlaidConnectedTransactional && this.deps.sessionStore.finalize
+        if (complete) await this.deps.sessionStore.finalize!({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion: claimVersion!, itemId }, tx => this.deps.onPlaidConnectedTransactional!({ subject: boundSubject, itemId, secretReference, accounts, recovery: true }, tx))
+        else { await this.deps.onPlaidConnected({ subject: boundSubject, itemId, secretReference, accounts, recovery: true }); await release() }
+        return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
+      } catch { await uncertain(); throw new ConnectControlError(409, 'Plaid completion is uncertain; reconnect is required') }
+    }
     try {
       const exchanged = await this.deps.plaid.exchangePublicToken(publicToken)
       if (!exchanged.accessToken || !exchanged.itemId) throw new ConnectControlError(502, 'provider returned an invalid response')
-      const storedReference = await this.deps.secretStore.storePlaidAccessToken({
-        subject: boundSubject, itemId: exchanged.itemId, secretReference, clientId: exchanged.clientId,
-        clientSecret: exchanged.clientSecret, accessToken: exchanged.accessToken,
-      })
-      if (storedReference !== secretReference) throw new ConnectControlError(502, 'provider secret store returned an invalid slot')
+      let storedReference: string
+      try {
+        storedReference = await this.deps.secretStore.storePlaidAccessToken({
+          subject: boundSubject, itemId: exchanged.itemId, secretReference, clientId: exchanged.clientId,
+          clientSecret: exchanged.clientSecret, accessToken: exchanged.accessToken,
+          reservationBinding: reservationBinding(boundSubject, continuationToken),
+        })
+      } catch {
+        await uncertain()
+        throw new ConnectControlError(409, 'Plaid credential persistence is uncertain; reconnect is required')
+      }
+      if (storedReference !== secretReference) { await uncertain(); throw new ConnectControlError(502, 'provider secret store returned an invalid slot') }
+      try { await persisted(); credentialPersisted = true } catch { await uncertain(); throw new ConnectControlError(409, 'Plaid credential persistence is uncertain; reconnect is required') }
       const accounts = await this.deps.plaid.listAccounts(exchanged.accessToken)
       if (accounts.length === 0) throw new ConnectControlError(502, 'provider returned no accounts')
-      await this.deps.onPlaidConnected({ subject: boundSubject, itemId: exchanged.itemId, secretReference, accounts })
-      await release()
+      const complete = this.deps.onPlaidConnectedTransactional && this.deps.sessionStore.finalize
+      if (complete) await this.deps.sessionStore.finalize!({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion: claimVersion!, itemId: exchanged.itemId }, tx => this.deps.onPlaidConnectedTransactional!({ subject: boundSubject, itemId: exchanged.itemId, secretReference, accounts }, tx))
+      else { await this.deps.onPlaidConnected({ subject: boundSubject, itemId: exchanged.itemId, secretReference, accounts }); await release() }
       return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
     } catch (error) {
-      await release()
+      if (credentialPersisted || (claimVersion !== undefined && session.recovery)
+        || (error instanceof ConnectControlError && error.status === 409 && error.message.includes('persistence'))) await uncertain()
+      else await release()
       throw error
     }
   }
@@ -346,11 +415,10 @@ export class FinanceSyncConnectControl {
     const boundSubject = subject(rawSubject)
     if (!continuationToken || !this.deps.plaid || !this.deps.onPlaidAccountsUpdated) throw new ConnectControlError(503, 'provider update is unavailable')
     const session = await this.deps.sessionStore.consume({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, flow: 'update' })
-    const release = async () => { try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken }) } catch { /* expiry recovers the lease if PostgreSQL is temporarily unavailable */ } }
     if (!session || session.flow !== 'update' || !session.providerConnectionId || session.providerGeneration === undefined) {
-      await release()
       throw new ConnectControlError(409, 'link session is invalid or already used')
     }
+    const release = async () => { try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion: session.claimVersion }) } catch { /* expiry recovers the lease if PostgreSQL is temporarily unavailable */ } }
     try {
       const connection = await this.plaidItemConnection(boundSubject)
       if (connection.providerConnectionId !== session.providerConnectionId || connection.secretReference !== session.secretReference

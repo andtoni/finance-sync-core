@@ -12,6 +12,7 @@ function scopedEnv(scope: 'READER' | 'PLAID_WRITER', slots = scope === 'READER' 
     [`${prefix}CLIENT_ID`]: 'machine-client',
     [`${prefix}CLIENT_SECRET`]: 'machine-secret',
     [`${prefix}ALLOWED_SLOTS`]: slots,
+    [`${prefix}SECRET_PREFIX`]: 'FINANCE_SYNC_PLAID_ITEM_',
   }
 }
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -24,6 +25,16 @@ function loginThen(...responses: Response[]) {
 }
 
 describe('Infisical provider slots', () => {
+  it('allocates dynamic references without an artificial connection count', () => {
+    const writer = createInfisicalPlaidTokenWriter(scopedEnv('PLAID_WRITER'))
+    const first = writer.allocatePlaidSecretReference!('wealthfolio#owner-a')
+    const second = writer.allocatePlaidSecretReference!('wealthfolio#owner-a')
+    expect(first).toMatch(/^FINANCE_SYNC_PLAID_ITEM_[0-9A-F]{32}$/)
+    expect(second).toMatch(/^FINANCE_SYNC_PLAID_ITEM_[0-9A-F]{32}$/)
+    expect(second).not.toBe(first)
+    expect(writer.acceptsPlaidSecretReference!(first)).toBe(true)
+    expect(writer.acceptsPlaidSecretReference!('FINANCE_SYNC_PLAID_ITEM_EVIL')).toBe(false)
+  })
   it('is unavailable by default and rejects partial or broad configuration', () => {
     expect(createInfisicalProviderSecretReader({}).available).toBe(false)
     expect(() => createInfisicalProviderSecretReader({ FINANCE_SYNC_INFISICAL_READER_URL: 'https://secrets.example.test' })).toThrow('incomplete')
@@ -60,7 +71,56 @@ describe('Infisical provider slots', () => {
     const patch = fetchImpl.mock.calls[2]!
     expect(patch[1]).toEqual(expect.objectContaining({ method: 'PATCH', redirect: 'error' }))
     const body = JSON.parse(patch[1]!.body as string)
-    expect(JSON.parse(body.secretValue)).toEqual({ clientId: 'client', clientSecret: 'secret', accessToken: 'access' })
+    expect(JSON.parse(body.secretValue)).toEqual({ clientId: 'client', clientSecret: 'secret', accessToken: 'access', itemId: 'item-1' })
+  })
+
+  it('treats the pinned HTTP 400 duplicate reservation create as idempotent', async () => {
+    const reference = 'FINANCE_SYNC_PLAID_ITEM_0123456789ABCDEF0123456789ABCDEF'
+    const binding = 'a'.repeat(64)
+    const placeholder = JSON.stringify({ schema: 'finance-sync-plaid-reservation-v1', binding })
+    const fetchImpl = loginThen(json({}, 400), json({ secret: { secretValue: placeholder } }))
+    const writer = createInfisicalPlaidTokenWriter(scopedEnv('PLAID_WRITER'), fetchImpl)
+    await expect(writer.prepare!({ secretReference: reference, reservationBinding: binding })).resolves.toBeUndefined()
+    expect(fetchImpl.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ method: 'POST' }))
+    expect(fetchImpl.mock.calls[2]?.[1]).toEqual(expect.objectContaining({ headers: expect.any(Object) }))
+  })
+
+  it('proves generated create capability with a non-secret reservation before completion', async () => {
+    const reference = 'FINANCE_SYNC_PLAID_ITEM_0123456789ABCDEF0123456789ABCDEF'
+    const binding = 'a'.repeat(64)
+    const placeholder = JSON.stringify({ schema: 'finance-sync-plaid-reservation-v1', binding })
+    const fetchImpl = loginThen(json({}, 200), json({ accessToken: 'short-lived-token' }), json({ secret: { secretValue: placeholder } }), json({}, 200))
+    const writer = createInfisicalPlaidTokenWriter(scopedEnv('PLAID_WRITER'), fetchImpl)
+    await expect(writer.prepare!({ secretReference: reference, reservationBinding: binding })).resolves.toBeUndefined()
+    await expect(writer.storePlaidAccessToken({ subject: 'issuer:user', itemId: 'item-1', secretReference: reference, reservationBinding: binding, clientId: 'client', clientSecret: 'secret', accessToken: 'access' })).resolves.toBe(reference)
+    expect(fetchImpl.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ method: 'POST' }))
+    expect(fetchImpl.mock.calls[4]?.[1]).toEqual(expect.objectContaining({ method: 'PATCH' }))
+  })
+
+  it('rejects populated or foreign generated destinations without PATCH', async () => {
+    const reference = 'FINANCE_SYNC_PLAID_ITEM_0123456789ABCDEF0123456789ABCDEF'
+    const binding = 'a'.repeat(64)
+    const populated = JSON.stringify({ clientId: 'other', clientSecret: 'secret', accessToken: 'access', itemId: 'item-1' })
+    const fetchImpl = loginThen(json({ secret: { secretValue: populated } }))
+    const writer = createInfisicalPlaidTokenWriter(scopedEnv('PLAID_WRITER'), fetchImpl)
+    await expect(writer.storePlaidAccessToken({ subject: 'issuer:user', itemId: 'item-1', secretReference: reference, reservationBinding: binding, clientId: 'client', clientSecret: 'secret', accessToken: 'access' })).rejects.toThrow('conflict')
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+
+    const foreign = JSON.stringify({ schema: 'finance-sync-plaid-reservation-v1', binding: 'b'.repeat(64) })
+    const foreignFetch = loginThen(json({ secret: { secretValue: foreign } }))
+    const foreignWriter = createInfisicalPlaidTokenWriter(scopedEnv('PLAID_WRITER'), foreignFetch)
+    await expect(foreignWriter.storePlaidAccessToken({ subject: 'issuer:user', itemId: 'item-1', secretReference: reference, reservationBinding: binding, clientId: 'client', clientSecret: 'secret', accessToken: 'access' })).rejects.toThrow('conflict')
+    expect(foreignFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns an identical populated generated bundle without PATCH', async () => {
+    const reference = 'FINANCE_SYNC_PLAID_ITEM_0123456789ABCDEF0123456789ABCDEF'
+    const binding = 'a'.repeat(64)
+    const value = JSON.stringify({ itemId: 'item-1', accessToken: 'access', clientSecret: 'secret', clientId: 'client' })
+    const fetchImpl = loginThen(json({ secret: { secretValue: value } }))
+    const writer = createInfisicalPlaidTokenWriter(scopedEnv('PLAID_WRITER'), fetchImpl)
+    await expect(writer.storePlaidAccessToken({ subject: 'issuer:user', itemId: 'item-1', secretReference: reference, reservationBinding: binding, clientId: 'client', clientSecret: 'secret', accessToken: 'access' })).resolves.toBe(reference)
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
   })
 
   it('does not create an absent runtime slot', async () => {

@@ -156,7 +156,11 @@ Provider credentials are resolved through scoped server-side Infisical machine i
           onboarding,
           onPlaidConnected: input => onboarding.recordConnection({
             subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
-            secretReference: input.secretReference, accounts: input.accounts,
+            secretReference: input.secretReference, recovery: input.recovery, accounts: input.accounts,
+          }),
+          onPlaidConnectedTransactional: (input, tx) => onboarding.recordConnectionTransaction(tx as import('./storage/pg').FinanceSyncSql, {
+            subject: input.subject, provider: 'plaid', providerConnectionId: input.itemId,
+            secretReference: input.secretReference, recovery: input.recovery, accounts: input.accounts,
           }),
           onPlaidAccountsUpdated: input => onboarding.updateConnectionAccounts(input),
         })

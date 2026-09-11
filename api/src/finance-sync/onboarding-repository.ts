@@ -341,12 +341,23 @@ export class PostgresOnboardingRepository {
     readonly provider: 'investec' | 'mercury' | 'plaid' | 'snaptrade'
     readonly providerConnectionId: string
     readonly secretReference: string
+    readonly recovery?: boolean
     readonly configuration?: Readonly<Record<string, unknown>>
     readonly accounts: readonly DiscoveredAccount[]
   }): Promise<void> {
     if (input.accounts.length === 0) throw new Error('provider discovery returned no accounts')
-    await this.sql.begin(async transaction => {
-      const tx = transaction as unknown as FinanceSyncSql
+    await this.sql.begin(async transaction => this.recordConnectionTransaction(transaction as unknown as FinanceSyncSql, input))
+  }
+
+  async recordConnectionTransaction(tx: FinanceSyncSql, input: {
+    readonly subject: string
+    readonly provider: 'investec' | 'mercury' | 'plaid' | 'snaptrade'
+    readonly providerConnectionId: string
+    readonly secretReference: string
+    readonly recovery?: boolean
+    readonly configuration?: Readonly<Record<string, unknown>>
+    readonly accounts: readonly DiscoveredAccount[]
+  }): Promise<void> {
       if (input.provider === 'plaid') {
         // Match Connect slot-allocation locking so an exact slot cannot be
         // concurrently assigned across subjects while connection state advances.
@@ -364,6 +375,18 @@ export class PostgresOnboardingRepository {
       `
       const principalId = principal[0]?.provider_principal_id
       if (!principalId) throw new Error('provider principal persistence failed')
+      const prior = await tx<{ provider_connection_id: string; secret_reference: string; provider_generation: number; state: string }[]>`
+        SELECT provider_connection_id, secret_reference, provider_generation, state
+        FROM provider_connections
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND provider = ${input.provider} AND provider_connection_id = ${input.providerConnectionId}
+        FOR UPDATE
+      `
+      if (input.recovery === true && prior[0] && prior[0].secret_reference !== input.secretReference) {
+        throw new Error('recovery secret reference does not match the persisted Plaid Item')
+      }
+      const sameRecovery = input.recovery === true && prior[0]?.provider_connection_id === input.providerConnectionId
+        && prior[0]?.secret_reference === input.secretReference && prior[0]?.state === 'active'
       const connection = await tx<{ connection_id: string; provider_generation: number }[]>`
         INSERT INTO provider_connections (
           deployment_id, local_owner_id, provider_principal_id, provider,
@@ -376,17 +399,18 @@ export class PostgresOnboardingRepository {
         ON CONFLICT (deployment_id, local_owner_id, provider, provider_connection_id)
         DO UPDATE SET secret_reference = EXCLUDED.secret_reference,
           configuration = EXCLUDED.configuration,
-          provider_generation = provider_connections.provider_generation + 1,
-          state = 'discovered', disabled_at = NULL
+          provider_generation = CASE WHEN ${input.recovery ?? false} THEN provider_connections.provider_generation ELSE provider_connections.provider_generation + 1 END,
+          state = CASE WHEN ${sameRecovery} THEN provider_connections.state ELSE 'discovered' END,
+          disabled_at = CASE WHEN ${sameRecovery} THEN provider_connections.disabled_at ELSE NULL END
         RETURNING connection_id::text, provider_generation
       `
       const connectionId = connection[0]?.connection_id
       const providerGeneration = connection[0]?.provider_generation
       if (!connectionId || providerGeneration === undefined) throw new Error('provider connection persistence failed')
 
-      // Relink rotates the connection generation. Prior admissions must be
-      // explicitly re-established against accounts discovered in that generation.
-      await tx`
+      // Relink rotates the connection generation. Recovery of the same Item,
+      // reference, and generation keeps its already-admitted accounts live.
+      if (!sameRecovery) await tx`
         UPDATE provider_account_admissions
         SET revoked_at = now(), baseline_state = 'pending', baseline_verified_at = NULL,
           baseline_fingerprint = NULL
@@ -408,6 +432,5 @@ export class PostgresOnboardingRepository {
         providerGeneration,
         accounts: input.accounts,
       })
-    })
   }
 }

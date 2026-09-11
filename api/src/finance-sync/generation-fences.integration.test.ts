@@ -150,6 +150,28 @@ suite('provider generation durable fences with PostgreSQL', () => {
     expect(state).toEqual({ provider_generation: 1, revoked_at: null, discovered: 2 })
   })
 
+  it('recovers the same Plaid Item without revoking its active admissions', async () => {
+    const recoveryDeployment = `${deploymentId}-recovery`
+    const recoveryProviderConnection = `${providerConnectionId}-recovery`
+    const repository = new PostgresOnboardingRepository(sql!, recoveryDeployment)
+    await repository.recordConnection({ subject, provider: 'plaid', providerConnectionId: recoveryProviderConnection, secretReference: 'PLAID_RECOVERY_SLOT', accounts: [account] })
+    const [pending] = await repository.listPending(subject, 'plaid')
+    await repository.admit({ subject, provider: 'plaid', connectionId: pending.connectionId, providerAccountId,
+      wealthfolioAccountId, databaseStateDigest: digest, providerGeneration: 1, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [] })
+    await repository.recordConnection({ subject, provider: 'plaid', providerConnectionId: recoveryProviderConnection, secretReference: 'PLAID_RECOVERY_SLOT', recovery: true, accounts: [account] })
+    const [state] = await sql!`
+      SELECT pc.provider_connection_id, pc.secret_reference, pc.provider_generation, pc.state, paa.revoked_at
+      FROM provider_connections pc JOIN provider_account_admissions paa ON paa.connection_id = pc.connection_id
+      WHERE pc.deployment_id = ${recoveryDeployment} AND pc.local_owner_id = ${subject}`
+    expect(state).toEqual({ provider_connection_id: recoveryProviderConnection, secret_reference: 'PLAID_RECOVERY_SLOT', provider_generation: 1, state: 'active', revoked_at: null })
+    await expect(repository.recordConnection({ subject, provider: 'plaid', providerConnectionId: recoveryProviderConnection, secretReference: 'PLAID_OTHER_SLOT', recovery: true, accounts: [account] })).rejects.toThrow(/recovery secret reference/)
+    const [unchanged] = await sql!`
+      SELECT provider_generation, secret_reference, state
+      FROM provider_connections
+      WHERE deployment_id = ${recoveryDeployment} AND local_owner_id = ${subject}`
+    expect(unchanged).toEqual({ provider_generation: 1, secret_reference: 'PLAID_RECOVERY_SLOT', state: 'active' })
+  })
+
   it('rebases earlier active admissions and rejected outbox work when a later account advances receiver access', async () => {
     const rebindDeployment = `${deploymentId}-receiver-rebind`
     const repository = new PostgresOnboardingRepository(sql!, rebindDeployment)
