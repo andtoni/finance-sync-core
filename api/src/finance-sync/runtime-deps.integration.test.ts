@@ -6,6 +6,7 @@ import { migrate } from './storage/migrate'
 import { currentStateToBridge } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
+import type { BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection } from './runtime'
 
 const url = process.env.FINANCE_SYNC_TEST_DATABASE_URL
@@ -138,6 +139,251 @@ suite('runtime dependencies with PostgreSQL', () => {
       expect(counts).toEqual({ delivered: 30, max_attempts: 1 })
     } finally {
       globalThis.fetch = originalFetch
+    }
+  })
+
+  it('blocks a queued Investec predecessor after terminal lifecycle acceptance in real PostgreSQL', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const posted = {
+      ...observation('terminal-posted', {
+        transactionId: 'terminal-posted', accountId: 'provider-account', amount: '-10', currency: 'ZAR',
+        transactionDate: '2026-07-17', date: '2026-07-17', postingDate: '2026-07-17', settlementDate: '2026-07-17',
+      description: 'SYNTHETIC TERMINAL MERCHANT', reference: 'terminal-ref', type: 'DEBIT',
+        transactionType: 'CARDPURCHASES', direction: 'DEBIT', status: 'posted',
+      }), providerVersion: 'investec:txn:terminal-posted',
+    }
+    const card = {
+      ...observation('terminal-card', {
+        transactionId: 'terminal-card', accountId: 'provider-account', amount: '-10', currency: 'ZAR',
+        transactionDate: '2026-07-17', originalAmount: '10', originalCurrency: 'ZAR', date: '2026-07-17',
+      authorizationDateTime: '2026-07-17T10:00:00.000Z', description: 'SYNTHETIC TERMINAL MERCHANT',
+      reference: 'terminal-ref', type: 'DEBIT', transactionType: 'CARD', cardNumber: 'TEST-CARD-0011',
+        metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } },
+        direction: 'DEBIT', status: 'pending',
+      }), providerVersion: 'investec:card:terminal-card',
+    }
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    await deps.persistAndEnqueue(investecConnection, [posted], { skipCurrentState: true })
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    await deps.persistAndEnqueue(investecConnection, [card], { skipCurrentState: true })
+    const sourceResource = (id: string) => `${deploymentId}:${sourceId}:${id}`
+    const [pending, lifecycle] = await sql<{ payload: BridgeDisclosureOperation; state: string }[]>`
+      SELECT payload, state FROM projection_outbox
+      WHERE deployment_id=${deploymentId} ORDER BY (payload ? 'lifecycleSuccessorId')
+    `
+    expect(pending.payload?.activity?.status).toBe('PENDING')
+    expect(lifecycle.payload?.activity?.status).toBe('POSTED')
+    expect(lifecycle.payload?.lifecycleSuccessorId).toBe(sourceResource('terminal-posted'))
+
+    await sql`UPDATE projection_outbox SET state='suppressed', last_error='TEST_HOLD_PENDING'
+      WHERE deployment_id=${deploymentId} AND idempotency_key=${pending.payload.idempotencyKey}`
+    const [heldLifecycle] = await sql<{ state: string }[]>`
+      SELECT state FROM projection_outbox
+      WHERE deployment_id=${deploymentId} AND idempotency_key=${lifecycle.payload.idempotencyKey}`
+    expect(heldLifecycle).toEqual({ state: 'pending' })
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      const wire = JSON.parse(String(init?.body)) as Record<string, unknown>
+      calls.push(String(wire.resource_id))
+      const successor = lifecycle.payload.lifecycleSuccessorId ?? null
+      const operation = 'activity_upsert'
+      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', operation, String(wire.resource_id), 'wealthfolio-account', successor === null ? '0' : '1', successor ?? '', 'accepted', '0', '']
+      return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner, idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation, resourceId: wire.resource_id, lifecycleSuccessorId: successor, outcome: 'Accepted', bindingVersion: 3, receiptBinding: binding(fields), semanticHash: null }), { status: 200 })
+    }) as typeof fetch
+    try {
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 1, failed: 0 })
+      await sql`UPDATE projection_outbox SET state='pending', last_error=NULL
+        WHERE deployment_id=${deploymentId} AND idempotency_key=${pending.payload.idempotencyKey}`
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 0 })
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 0 })
+      expect(calls).toEqual([lifecycle.payload.resourceId])
+      const [suppressed] = await sql`
+        SELECT state, last_error FROM projection_outbox
+        WHERE deployment_id=${deploymentId} AND idempotency_key=${pending.payload.idempotencyKey}`
+      expect(suppressed).toEqual({ state: 'suppressed', last_error: 'INVESTEC_LIFECYCLE_ALREADY_TERMINAL' })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('keeps first-life and invalid/uncertain Investec deliveries distinct from terminal suppression', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const resource = (suffix: string) => `${deploymentId}:${sourceId}:${suffix}`
+    const activity = (suffix: string, subject = owner): BridgeDisclosureOperation => ({
+      deploymentId, accountId: 'wealthfolio-account', subject, accessGeneration: 1,
+      idempotencyKey: `integration-${runId}-${suffix}`, kind: 'ActivityUpsert', resourceId: resource(suffix),
+      activity: {
+        accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'PENDING',
+        activityDate: '2026-07-18T12:00:00.000Z', activityDatePrecision: 'INSTANT', amount: '1', currency: 'USD',
+      },
+    })
+    const insert = async (payload: BridgeDisclosureOperation, state?: string) => {
+      await sql`INSERT INTO projection_outbox
+        (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state)
+        VALUES (${deploymentId},${owner},${investecConnection.connectionId},1,${payload.idempotencyKey},${sql.json(payload as never)},${state ?? 'pending'})`
+    }
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    let mode: 'accepted' | 'invalid' | 'transport' = 'accepted'
+    globalThis.fetch = (async (_input, init) => {
+      const wire = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      calls.push(String(wire.resource_id ?? 'receipt-lookup'))
+      if (init?.method === 'GET') return new Response(null, { status: 404 })
+      if (mode === 'transport') {
+        mode = 'accepted'
+        throw new Error('synthetic transport uncertainty')
+      }
+      if (mode === 'invalid') return new Response(JSON.stringify({ outcome: 'Accepted' }), { status: 200 })
+      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', 'activity_upsert', String(wire.resource_id), 'wealthfolio-account', '0', '', 'accepted', '0', '']
+      return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner, idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation: 'activity_upsert', resourceId: wire.resource_id, lifecycleSuccessorId: null, outcome: 'Accepted', bindingVersion: 3, receiptBinding: binding(fields), semanticHash: null }), { status: 200 })
+    }) as typeof fetch
+    try {
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      const firstLife = activity('first-life')
+      await insert(firstLife)
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(calls).toEqual([firstLife.resourceId])
+
+      const invalid = activity('invalid-receipt')
+      await insert(invalid)
+      mode = 'invalid'
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 1 })
+      const [uncertain] = await sql`SELECT state FROM projection_outbox WHERE deployment_id=${deploymentId} AND idempotency_key=${invalid.idempotencyKey}`
+      expect(uncertain).toEqual({ state: 'uncertain' })
+
+      mode = 'transport'
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 1 })
+      const [stillUncertain] = await sql`SELECT state FROM projection_outbox WHERE deployment_id=${deploymentId} AND idempotency_key=${invalid.idempotencyKey}`
+      expect(stillUncertain).toEqual({ state: 'uncertain' })
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 1, failed: 0 })
+
+      const negative = activity('negative-identity')
+      const wrongOwnerLifecycle: BridgeDisclosureOperation = {
+        ...negative, subject: 'urn:other.test#owner', idempotencyKey: `integration-${runId}-wrong-owner`,
+        lifecycleSuccessorId: resource('negative-posted'), activity: { ...negative.activity!, status: 'POSTED' },
+      }
+      await insert(wrongOwnerLifecycle, 'delivered')
+      await insert(negative)
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(calls).toContain(negative.resourceId)
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('fences a pending predecessor when the terminal lifecycle receipt is unresolved', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const resource = (suffix: string) => `${deploymentId}:${sourceId}:${suffix}`
+    const pending: BridgeDisclosureOperation = {
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1,
+      kind: 'ActivityUpsert', resourceId: resource('uncertain-pending'), idempotencyKey: `integration-${runId}-uncertain-pending`,
+      activity: { accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'PENDING',
+        activityDate: '2026-07-18T12:00:00.000Z', activityDatePrecision: 'INSTANT', amount: '1', currency: 'USD' },
+    }
+    const lifecycle: BridgeDisclosureOperation = {
+      ...pending, idempotencyKey: `integration-${runId}-uncertain-lifecycle`, lifecycleSuccessorId: resource('uncertain-posted'),
+      activity: { ...pending.activity!, status: 'POSTED', activityDate: '2026-07-18', activityDatePrecision: 'DATE' },
+    }
+    const insert = async (payload: BridgeDisclosureOperation, state?: string) => {
+      await sql`INSERT INTO projection_outbox
+        (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state)
+        VALUES (${deploymentId},${owner},${investecConnection.connectionId},1,${payload.idempotencyKey},${sql.json(payload as never)},${state ?? 'pending'})`
+    }
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(String(init?.method))
+      if (init?.method === 'GET') return new Response(null, { status: 404 })
+      throw new Error('synthetic lifecycle response loss')
+    }) as typeof fetch
+    try {
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      await insert(lifecycle)
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 1 })
+      const [uncertainLifecycle] = await sql`SELECT state FROM projection_outbox WHERE deployment_id=${deploymentId} AND idempotency_key=${lifecycle.idempotencyKey}`
+      expect(uncertainLifecycle).toEqual({ state: 'uncertain' })
+
+      calls.length = 0
+      await insert(pending)
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 2 })
+      expect(calls).toEqual(['GET'])
+      const [fencedPending] = await sql`
+        SELECT state, last_error FROM projection_outbox
+        WHERE deployment_id=${deploymentId} AND idempotency_key=${pending.idempotencyKey}`
+      expect(fencedPending).toEqual({ state: 'uncertain', last_error: 'INVESTEC_LIFECYCLE_RECOVERY_REQUIRED' })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('keeps an uncertain pending receipt unresolved after a delivered lifecycle', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const resource = (suffix: string) => `${deploymentId}:${sourceId}:${suffix}`
+    const pending: BridgeDisclosureOperation = {
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1,
+      kind: 'ActivityUpsert', resourceId: resource('accepted-pending'), idempotencyKey: `integration-${runId}-accepted-pending`,
+      activity: { accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'PENDING',
+        activityDate: '2026-07-18T12:00:00.000Z', activityDatePrecision: 'INSTANT', amount: '1', currency: 'USD' },
+    }
+    const lifecycle: BridgeDisclosureOperation = {
+      ...pending, idempotencyKey: `integration-${runId}-delivered-lifecycle`, lifecycleSuccessorId: resource('accepted-posted'),
+      activity: { ...pending.activity!, status: 'POSTED', activityDate: '2026-07-18', activityDatePrecision: 'DATE' },
+    }
+    const fields = [deploymentId, owner, pending.idempotencyKey, '1', 'activity_upsert', pending.resourceId, 'wealthfolio-account', '0', '', 'accepted', '0', '']
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(String(init?.method))
+      if (init?.method === 'POST') throw new Error('uncertain pending must not dispatch')
+      return new Response(JSON.stringify({
+        deploymentId, accountId: 'wealthfolio-account', subject: owner,
+        idempotencyKey: pending.idempotencyKey, accessGeneration: 1,
+        operation: 'activity_upsert', resourceId: pending.resourceId, lifecycleSuccessorId: null,
+        outcome: 'Accepted', bindingVersion: 3, receiptBinding: binding(fields), semanticHash: null,
+      }), { status: 200 })
+    }) as typeof fetch
+    try {
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      await sql`INSERT INTO sync_checkpoints (deployment_id,connection_id,provider_generation,provider,cursor)
+        VALUES (${deploymentId},${connection.connectionId},1,'investec','held-cursor')`
+      await sql`INSERT INTO projection_outbox
+        (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state)
+        VALUES (${deploymentId},${owner},${investecConnection.connectionId},1,${lifecycle.idempotencyKey},${sql.json(lifecycle as never)},'delivered')`
+      await sql`INSERT INTO projection_outbox
+        (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state)
+        VALUES (${deploymentId},${owner},${investecConnection.connectionId},1,${pending.idempotencyKey},${sql.json(pending as never)},'uncertain')`
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(calls).toEqual(['GET'])
+      const [fencedPending] = await sql`
+        SELECT state, last_error FROM projection_outbox
+        WHERE deployment_id=${deploymentId} AND idempotency_key=${pending.idempotencyKey}`
+      expect(fencedPending).toEqual({ state: 'uncertain', last_error: 'INVESTEC_LIFECYCLE_RECOVERY_REQUIRED' })
+      const [checkpoint] = await sql`SELECT cursor FROM sync_checkpoints WHERE deployment_id=${deploymentId} AND connection_id=${connection.connectionId} AND provider_generation=1`
+      expect(checkpoint).toEqual({ cursor: 'held-cursor' })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      await sql`DELETE FROM sync_checkpoints WHERE deployment_id=${deploymentId} AND connection_id=${connection.connectionId}`
     }
   })
 

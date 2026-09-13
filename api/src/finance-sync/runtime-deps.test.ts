@@ -42,6 +42,29 @@ function binding(fields: readonly string[]): string {
   return `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
 }
 
+function mockAbortSignalTimeout() {
+  return vi.spyOn(AbortSignal, 'timeout').mockImplementation((milliseconds: number) => {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(new Error('test timeout')), milliseconds)
+    return controller.signal
+  })
+}
+
+function rejectOnAbort(init: RequestInit | undefined): Promise<Response> {
+  return new Promise((_, reject) => {
+    const signal = init?.signal
+    if (!signal) {
+      reject(new Error('test fetch signal missing'))
+      return
+    }
+    if (signal.aborted) {
+      reject(signal.reason)
+      return
+    }
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+  })
+}
+
 function receipt(op: BridgeDisclosureOperation) {
   const operation = op.kind === 'ActivityUpsert' ? 'activity_upsert' : op.kind === 'ActivityDelete' ? 'activity_delete' : op.kind === 'CurrentStateUpsert' ? 'current_state_upsert' : 'projection_fence'
   const successor = op.lifecycleSuccessorId ?? null
@@ -70,6 +93,7 @@ function outboxSql(
   row: { id: string; payload: BridgeDisclosureOperation; attempts: number },
   priorPayloads: unknown[] = [],
   manualOverrides: unknown[] = [],
+  acceptedLifecycles: BridgeDisclosureOperation[] = [],
 ) {
   let state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' = 'pending'
   let attempts = row.attempts
@@ -108,6 +132,16 @@ function outboxSql(
     if (/INSERT\s+INTO\s+projection_outbox/i.test(text)) {
       const payload = values.find(value => value !== null && typeof value === 'object' && 'kind' in value) as BridgeDisclosureOperation | undefined
       if (payload) enqueued.push(payload)
+    }
+    if (/FROM\s+projection_outbox/i.test(text)
+      && (/state\s*=\s*'delivered'/i.test(text) || /state\s+IN\s*\(\s*'delivered'/i.test(text))
+      && /lifecycleSuccessorId/i.test(text)) {
+      const match = acceptedLifecycles.find(operation => values.includes(operation.resourceId)
+        && values.includes(operation.accountId)
+        && values.includes(operation.subject)
+        && (!values.some(value => value === operation.lifecycleSuccessorId)
+          || values.includes(operation.lifecycleSuccessorId)))
+      return match ? [{ state: 'delivered' }] : []
     }
     queries.push(text)
     if (/FROM\s+raw_observations/i.test(text) && /provider_version/i.test(text) && /semantic_hash/i.test(text)) {
@@ -192,7 +226,7 @@ function outboxSql(
         : Number(state === 'pending' || state === 'dead_letter')
       return [{ count }]
     }
-    if (/SELECT\s+id,\s*payload,\s*attempts/i.test(text)) {
+    if (/SELECT\s+id,\s*payload,\s*attempts(?:,\s*state)?/i.test(text)) {
       return state === 'pending' || state === 'uncertain' ? [{ ...row, attempts, state }] : []
     }
     if (/UPDATE\s+projection_outbox/i.test(text)) {
@@ -208,12 +242,25 @@ function outboxSql(
   return { sql, state: () => state, attempts: () => attempts, queries, enqueued, rawPayloads }
 }
 
-function projectOutboxSql(input: readonly { id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' }[]) {
+function projectOutboxSql(
+  input: readonly { id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' | 'delivered' | 'dead_letter' | 'suppressed' }[],
+  acceptedLifecycles: readonly BridgeDisclosureOperation[] = [],
+) {
   const rows = input.map(row => ({ ...row }))
   const queries: string[] = []
   const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
     const text = strings.join('?')
     queries.push(text)
+    if (/FROM\s+projection_outbox/i.test(text)
+      && (/state\s*=\s*'delivered'/i.test(text) || /state\s+IN\s*\(\s*'delivered'/i.test(text))
+      && /lifecycleSuccessorId/i.test(text)) {
+      const match = acceptedLifecycles.find(operation => values.includes(operation.resourceId)
+        && values.includes(operation.accountId)
+        && values.includes(operation.subject)
+        && (!values.some(value => value === operation.lifecycleSuccessorId)
+          || values.includes(operation.lifecycleSuccessorId)))
+      return match ? [{ state: 'delivered' }] : []
+    }
     if (/GROUP BY payload->>'kind'/i.test(text)) {
       const counts = new Map<string | null, number>()
       for (const row of rows.filter(row => row.state === 'dead_letter')) {
@@ -222,8 +269,8 @@ function projectOutboxSql(input: readonly { id: string; payload: BridgeDisclosur
       }
       return [...counts.entries()].map(([kind, count]) => ({ kind, count }))
     }
-    if (/SELECT\s+id,\s*payload,\s*attempts/i.test(text)) {
-      const currentOnly = /payload->>'kind'\s*=\s*'CurrentStateUpsert'/i.test(text)
+    if (/SELECT\s+id,\s*payload,\s*attempts(?:,\s*state)?/i.test(text)) {
+      const currentOnly = /AND\s+payload->>'kind'\s*=\s*'CurrentStateUpsert'/i.test(text)
       return rows.filter(row => (row.state === 'pending' || row.state === 'uncertain')
         && (!currentOnly || row.payload.kind === 'CurrentStateUpsert'))
     }
@@ -235,6 +282,7 @@ function projectOutboxSql(input: readonly { id: string; payload: BridgeDisclosur
         if (/state = 'delivered'/i.test(text)) row.state = 'delivered'
         if (/state = 'uncertain'/i.test(text)) row.state = 'uncertain'
         if (/state = 'dead_letter'/i.test(text)) row.state = 'dead_letter'
+        if (/state = 'suppressed'/i.test(text)) row.state = 'suppressed'
       }
       return []
     }
@@ -781,6 +829,91 @@ describe('Investec card and poll lifecycle correlation', () => {
     metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } },
   }
 
+  it('does not re-enqueue a pending predecessor after an exact lifecycle was delivered', async () => {
+    const oldLifecycle = providerObservationToBridge('investec', {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      semanticHash: 'old-lifecycle-hash',
+      domain: 'cash_ledger', observedAt: inferredSettledPayload.observedAt,
+      payload: { ...inferredSettledPayload, pendingTransactionId: inferredCardPayload.transactionId },
+    }, 1, 'wf-acc-1', INVESTEC_CONNECTION.connectionId)
+    if (!oldLifecycle?.lifecycleSuccessorId) throw new Error('synthetic lifecycle fixture failed')
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000117', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [inferredSettledPayload], [], [oldLifecycle])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const observation = {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: inferredCardPayload.providerVersion, semanticHash: 'new-v5-card-hash',
+      hashSpecificationVersion: 5, observedAt: inferredCardPayload.observedAt,
+      domain: 'cash_ledger' as const, payload: inferredCardPayload,
+    }
+
+    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [observation], { skipCurrentState: true })).resolves.toBe(0)
+    const firstActivities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
+    expect(firstActivities).toHaveLength(1)
+    expect(firstActivities[0].lifecycleSuccessorId).toBe(oldLifecycle.lifecycleSuccessorId)
+    expect(firstActivities.every(operation => operation.lifecycleSuccessorId !== undefined)).toBe(true)
+
+    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [observation], { skipCurrentState: true })).resolves.toBe(0)
+    const allActivities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
+    expect(allActivities.every(operation => operation.lifecycleSuccessorId !== undefined)).toBe(true)
+  })
+
+  it('does not use a terminal lifecycle from another owner or account', async () => {
+    const oldLifecycle = providerObservationToBridge('investec', {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      semanticHash: 'wrong-owner-lifecycle', domain: 'cash_ledger',
+      observedAt: inferredSettledPayload.observedAt,
+      payload: { ...inferredSettledPayload, pendingTransactionId: inferredCardPayload.transactionId },
+    }, 1, 'wf-acc-1', INVESTEC_CONNECTION.connectionId)
+    if (!oldLifecycle?.lifecycleSuccessorId) throw new Error('synthetic lifecycle fixture failed')
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000119', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [inferredSettledPayload], [], [{
+      ...oldLifecycle, accountId: 'wf-other-account', subject: 'urn:other.test#owner',
+    }])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: inferredCardPayload.providerVersion, semanticHash: 'wrong-owner-v5-hash',
+      hashSpecificationVersion: 5, observedAt: inferredCardPayload.observedAt,
+      domain: 'cash_ledger', payload: inferredCardPayload,
+    }], { skipCurrentState: true })
+    const activities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
+    expect(activities).toHaveLength(2)
+    expect(activities.some(operation => operation.lifecycleSuccessorId === undefined)).toBe(true)
+  })
+
+  it('suppresses a later ordinary pending observation when the exact predecessor is terminal', async () => {
+    const oldLifecycle = providerObservationToBridge('investec', {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      semanticHash: 'terminal-unmatch-lifecycle', domain: 'cash_ledger',
+      observedAt: inferredSettledPayload.observedAt,
+      payload: { ...inferredSettledPayload, pendingTransactionId: inferredCardPayload.transactionId },
+    }, 1, 'wf-acc-1', INVESTEC_CONNECTION.connectionId)
+    if (!oldLifecycle?.lifecycleSuccessorId) throw new Error('synthetic lifecycle fixture failed')
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000118', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [], [], [oldLifecycle])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: inferredCardPayload.providerVersion, semanticHash: 'changed-merchant-v5-hash',
+      hashSpecificationVersion: 5, observedAt: inferredCardPayload.observedAt,
+      domain: 'cash_ledger', payload: { ...inferredCardPayload, description: 'CHANGED EVIDENCE' },
+    }], { skipCurrentState: true })).resolves.toBe(0)
+    expect(fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')).toEqual([])
+  })
+
   it.each([
     ['card-first', inferredCardPayload, [inferredSettledPayload]],
     ['poll-first', inferredSettledPayload, [inferredCardPayload]],
@@ -1288,6 +1421,61 @@ describe('projectPending transaction and receipt contract', () => {
     }
   })
 
+  it('delivers a lifecycle while preserving exact terminal identity', async () => {
+    const lifecycle: BridgeDisclosureOperation = {
+      ...operation,
+      kind: 'ActivityUpsert',
+      resourceId: `dep-1:${CONNECTION.sourceResourceIncarnationId}:pending-terminal`,
+      lifecycleSuccessorId: `dep-1:${CONNECTION.sourceResourceIncarnationId}:posted-terminal`,
+      activity: {
+        accountId: operation.accountId, activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE', amount: '1', currency: 'USD',
+      },
+    }
+    const fixture = projectOutboxSql([{ id: 'lifecycle-row', payload: lifecycle, attempts: 0, state: 'pending' }])
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify(receipt(lifecycle)), { status: 200 })) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(fixture.rows[0].state).toBe('delivered')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('suppresses a queued Investec pending row after lifecycle acceptance without dispatch', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-18', toDate: '2026-07-19',
+    }
+    const pending: BridgeDisclosureOperation = {
+      ...operation,
+      kind: 'ActivityUpsert',
+      resourceId: `dep-1:${CONNECTION.sourceResourceIncarnationId}:queued-pending`,
+      activity: {
+        accountId: operation.accountId, activityType: 'WITHDRAWAL', status: 'PENDING',
+        activityDate: '2026-07-18T12:00:00.000Z', activityDatePrecision: 'INSTANT', amount: '1', currency: 'USD',
+      },
+    }
+    const lifecycle: BridgeDisclosureOperation = {
+      ...pending,
+      idempotencyKey: 'accepted-lifecycle-key',
+      lifecycleSuccessorId: `dep-1:${CONNECTION.sourceResourceIncarnationId}:posted-terminal`,
+      activity: { ...pending.activity!, status: 'POSTED' },
+    }
+    const fixture = projectOutboxSql([{ id: 'queued-pending-row', payload: pending, attempts: 0, state: 'pending' }], [lifecycle])
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error('ordinary pending must not dispatch') }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 0 })
+      expect(fixture.rows[0].state).toBe('suppressed')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('fences a successful commit with an invalid receipt as uncertain', async () => {
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000011', payload: operation, attempts: 2 })
     const originalFetch = globalThis.fetch
@@ -1301,6 +1489,128 @@ describe('projectPending transaction and receipt contract', () => {
       expect(fixture.state()).toBe('uncertain')
     } finally {
       globalThis.fetch = originalFetch
+    }
+  })
+
+  it('recovers an uncertain Investec lifecycle once without replaying after delivery', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const lifecycle: BridgeDisclosureOperation = {
+      ...operation,
+      kind: 'ActivityUpsert', resourceId: 'dep-1:00000000-0000-0000-0000-000000000001:uncertain-pending',
+      idempotencyKey: 'uncertain-lifecycle-key', lifecycleSuccessorId: 'dep-1:00000000-0000-0000-0000-000000000001:uncertain-posted',
+      activity: { accountId: operation.accountId, activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE', amount: '1', currency: 'USD' },
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000014', payload: lifecycle, attempts: 0 })
+    const originalFetch = globalThis.fetch
+    let phase: 'initial' | 'recovery' = 'initial'
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(String(init?.method))
+      if (phase === 'initial') return new Response(JSON.stringify({ outcome: 'Accepted' }), { status: 200 })
+      if (init?.method === 'GET') return new Response(JSON.stringify(receipt(lifecycle)), { status: 200 })
+      throw new Error('delivered lifecycle must not POST')
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('uncertain')
+      phase = 'recovery'
+      calls.length = 0
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(calls).toEqual(['GET'])
+      expect(fixture.state()).toBe('delivered')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('retries a non-Investec uncertain lifecycle after failed receipt recovery', async () => {
+    const lifecycle: BridgeDisclosureOperation = {
+      ...operation,
+      kind: 'ActivityUpsert', resourceId: 'plaid-lifecycle-pending', idempotencyKey: 'plaid-lifecycle-key',
+      lifecycleSuccessorId: 'plaid-lifecycle-posted',
+      activity: { accountId: operation.accountId, activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE', amount: '1', currency: 'USD' },
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000015', payload: lifecycle, attempts: 0 })
+    const originalFetch = globalThis.fetch
+    let phase: 'initial' | 'retry' = 'initial'
+    const calls: string[] = []
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(String(init?.method))
+      if (phase === 'initial') return init?.method === 'GET'
+        ? new Response(null, { status: 404 })
+        : new Response(JSON.stringify({ outcome: 'Accepted' }), { status: 200 })
+      if (init?.method === 'GET') return new Response(null, { status: 404 })
+      return new Response(JSON.stringify(receipt(lifecycle)), { status: 200 })
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('uncertain')
+      phase = 'retry'
+      calls.length = 0
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(calls).toEqual(['GET', 'POST'])
+      expect(fixture.state()).toBe('delivered')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('bounds a hanging bridge POST and keeps the operation uncertain', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000012', payload: operation, attempts: 0 })
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    vi.useFakeTimers()
+    const timeout = mockAbortSignalTimeout()
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(String(init?.method))
+      return rejectOnAbort(init)
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env(), undefined, async () => null)
+      const result = deps.projectPending(CONNECTION)
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(30_000)
+      await expect(result).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(calls).toEqual(['POST'])
+      expect(fixture.state()).toBe('uncertain')
+    } finally {
+      globalThis.fetch = originalFetch
+      timeout.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds receipt recovery GET after an invalid bridge response and stays uncertain', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000013', payload: operation, attempts: 0 })
+    const originalFetch = globalThis.fetch
+    const calls: string[] = []
+    vi.useFakeTimers()
+    const timeout = mockAbortSignalTimeout()
+    globalThis.fetch = (async (_input, init) => {
+      calls.push(String(init?.method))
+      return init?.method === 'POST'
+        ? new Response('{}', { status: 200 })
+        : rejectOnAbort(init)
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      const result = deps.projectPending(CONNECTION)
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(30_000)
+      await expect(result).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(calls).toEqual(['POST', 'GET'])
+      expect(fixture.state()).toBe('uncertain')
+    } finally {
+      globalThis.fetch = originalFetch
+      timeout.mockRestore()
+      vi.useRealTimers()
     }
   })
 

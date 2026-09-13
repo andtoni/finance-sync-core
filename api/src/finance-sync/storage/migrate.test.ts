@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -95,6 +95,21 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/pg_advisory_xact_lock/i);
     expect(sql).toMatch(/REVOKE UPDATE, DELETE ON investec_card_lifecycle_overrides FROM finance_sync_runtime/i);
     expect(sql).toMatch(/Investec card lifecycle overrides are append-only/i);
+  });
+
+  it("indexes exact delivered and uncertain Investec lifecycle identities", () => {
+    const sql = readFileSync(resolve(root, "0020_investec_lifecycle_lookup.sql"), "utf8");
+    expect(sql).toMatch(/CREATE INDEX IF NOT EXISTS projection_outbox_investec_lifecycle_identity_idx/i);
+    expect(sql).toMatch(/deployment_id/i);
+    expect(sql).toMatch(/local_owner_id/i);
+    expect(sql).toMatch(/connection_id/i);
+    expect(sql).toMatch(/payload->>'accountId'/i);
+    expect(sql).toMatch(/payload->>'subject'/i);
+    expect(sql).toMatch(/payload->>'resourceId'/i);
+    expect(sql).toMatch(/payload->>'lifecycleSuccessorId'/i);
+    expect(sql).toMatch(/WHERE state IN \('delivered', 'uncertain'\)/i);
+    expect(sql).toMatch(/payload->>'kind' = 'ActivityUpsert'/i);
+    expect(sql).toMatch(/payload->>'lifecycleSuccessorId' IS NOT NULL/i);
   });
 
   it("rejects checksum drift", () => {

@@ -136,7 +136,7 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql!, directory);
     await migrate(sql!, directory);
     const rows = await sql!`select version from finance_sync_schema_migrations order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
     const rawColumns = await sql!`
       select column_name from information_schema.columns
       where table_name = 'raw_observations' and column_name = 'raw_payload'
@@ -153,9 +153,27 @@ suite("PostgreSQL migrations (integration)", () => {
     `;
     expect(plaidSessionColumns.map((row) => row.column_name).sort()).toEqual(['flow_kind', 'provider_connection_id', 'provider_generation']);
 
-    await sql!`insert into finance_sync_migrations (deployment_id, version, name, checksum) values ('conflicting-legacy', 1, 'identity', ${'0'.repeat(64)})`;
-    await expect(migrate(sql!, directory)).rejects.toThrow(/checksum conflict/i);
-    await sql!`delete from finance_sync_migrations where deployment_id = 'conflicting-legacy'`;
+  });
+
+  it("rejects an intentional legacy checksum conflict in an isolated schema", async () => {
+    const schemaName = `finance_sync_checksum_${process.pid}_${Date.now()}`;
+    const schema = quoteIdentifier(schemaName);
+    await sql!.unsafe(`CREATE SCHEMA ${schema}`);
+    const isolated = postgres(url!, {
+      connect_timeout: 3,
+      prepare: false,
+      max: 1,
+      connection: { search_path: `${schemaName},public` },
+    });
+    try {
+      await migrate(isolated, directory);
+      await isolated`insert into finance_sync_migrations (deployment_id, version, name, checksum)
+        values ('conflicting-legacy', 1, 'identity', ${'0'.repeat(64)})`;
+      await expect(migrate(isolated, directory)).rejects.toThrow(/checksum conflict/i);
+    } finally {
+      await isolated.end();
+      await sql!.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    }
   });
 
   it("enforces lifecycle override one-to-one and append-only constraints in PostgreSQL", async () => {

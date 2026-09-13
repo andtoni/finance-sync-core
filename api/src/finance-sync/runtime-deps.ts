@@ -31,6 +31,7 @@ import {
 
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
 const MAX_PROJECTION_BATCH = 25
+const BRIDGE_REQUEST_TIMEOUT_MS = 30_000
 const INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS = 3
 const DAY_MS = 86_400_000
 const PLAID_HOSTS = new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com'])
@@ -1035,6 +1036,38 @@ function correlatedInvestecPayload(
   })
 }
 
+type InvestecLifecycleDisposition = 'none' | 'delivered' | 'uncertain'
+
+async function investecLifecycleDisposition(
+  sql: FinanceSyncSql,
+  connection: RuntimeConnection,
+  operation: BridgeDisclosureOperation,
+  expectedSuccessor?: string,
+): Promise<InvestecLifecycleDisposition> {
+  const sourcePrefix = `${operation.deploymentId}:${connection.sourceResourceIncarnationId}:`
+  if (!operation.resourceId.startsWith(sourcePrefix)
+    || (expectedSuccessor !== undefined && !expectedSuccessor.startsWith(sourcePrefix))) return 'none'
+  const rows = await sql<{ state: 'delivered' | 'uncertain' }[]>`
+    SELECT state
+    FROM projection_outbox
+    WHERE deployment_id = ${operation.deploymentId}
+      AND local_owner_id = ${operation.subject}
+      AND connection_id = ${connection.connectionId}
+      AND state IN ('delivered', 'uncertain')
+      AND payload->>'kind' = 'ActivityUpsert'
+      AND payload->>'resourceId' = ${operation.resourceId}
+      AND payload->>'lifecycleSuccessorId' IS NOT NULL
+      AND (${expectedSuccessor ?? null}::text IS NULL OR payload->>'lifecycleSuccessorId' = ${expectedSuccessor ?? null})
+      AND payload->>'accountId' = ${operation.accountId}
+      AND payload->>'subject' = ${operation.subject}
+      AND payload->>'resourceId' LIKE ${`${sourcePrefix}%`}
+      AND payload->>'lifecycleSuccessorId' LIKE ${`${sourcePrefix}%`}
+    ORDER BY state = 'delivered' DESC
+    LIMIT 1
+  `
+  return rows[0]?.state ?? 'none'
+}
+
 async function investecProjectionOperations(
   sql: FinanceSyncSql,
   deploymentId: string,
@@ -1049,7 +1082,11 @@ async function investecProjectionOperations(
   const current = recordPayload(observation.payload)
   if (!current || !transactionId(current) || !counterpart) {
     const operation = providerObservationToBridge(connection.provider, observation, accessGeneration, accountId, connectionId)
-    return operation ? [operation] : []
+    if (!operation || operation.kind !== 'ActivityUpsert' || operation.activity?.status !== 'PENDING') {
+      return operation ? [operation] : []
+    }
+    const lifecycle = await investecLifecycleDisposition(sql, connection, operation)
+    return lifecycle === 'none' ? [operation] : []
   }
   if ('ambiguous' in counterpart) {
     const reviewSemanticHash = createHash('sha256').update([
@@ -1105,7 +1142,10 @@ async function investecProjectionOperations(
       payload: counterpart.payload,
       observedAt: counterpart.observedAt,
     }
-  const pending = providerObservationToBridge(connection.provider, pendingObservation, accessGeneration, accountId, connectionId)
+  const lifecycleDisposition = await investecLifecycleDisposition(sql, connection, lifecycle, lifecycle.lifecycleSuccessorId)
+  const pending = lifecycleDisposition === 'none'
+    ? providerObservationToBridge(connection.provider, pendingObservation, accessGeneration, accountId, connectionId)
+    : undefined
   return pending ? [pending, lifecycle] : [lifecycle]
 }
 
@@ -1594,13 +1634,14 @@ export function createRuntimeDependencies(
             `
             delivered++
           }
-          const recoverReceipt = async (): Promise<boolean> => {
+          const recoverReceipt = async (markRecovered = true): Promise<boolean> => {
             try {
               const lookup = receiptLookup ?? (async (operation: BridgeDisclosureOperation): Promise<unknown | null> => {
                 if (!bridgeReceiptUrl || !bridgeToken) return null
                 const base = bridgeReceiptUrl.toString().replace(/\/+$/, '')
                 const response = await fetch(`${base}/${encodeURIComponent(operation.subject)}/${encodeURIComponent(operation.idempotencyKey)}`, {
                   method: 'GET', redirect: 'error', headers: { authorization: `Bearer ${bridgeToken}` },
+                  signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
                 })
                 if (response.status === 404) return null
                 if (!response.ok) throw new Error('bridge receipt lookup failed')
@@ -1609,14 +1650,62 @@ export function createRuntimeDependencies(
               const recovered = await lookup(row.payload)
               if (recovered === null) return false
               validateBridgeReceipt(row.payload, recovered)
-              await markDelivered()
+              if (markRecovered) await markDelivered()
               return true
             } catch {
               return false
             }
           }
 
+          const requireInvestecRecovery = async () => {
+            await tx`
+              UPDATE projection_outbox
+              SET state = 'uncertain', last_error = 'INVESTEC_LIFECYCLE_RECOVERY_REQUIRED'
+              WHERE id = ${row.id}::uuid
+                AND provider_generation = ${connection.providerGeneration}
+                AND state IN ('pending', 'uncertain')
+            `
+            deliveryFailures++
+          }
+
+          if (connection.provider === 'investec'
+            && row.payload.kind === 'ActivityUpsert'
+            && row.payload.activity?.status === 'PENDING'
+            && row.payload.lifecycleSuccessorId === undefined) {
+            const lifecycleDisposition = await investecLifecycleDisposition(tx, connection, row.payload)
+            if (lifecycleDisposition === 'delivered') {
+              if (row.state === 'uncertain') {
+                // An uncertain pending POST may already have committed after the
+                // terminal lifecycle. Never hide that possibility as suppressed.
+                await recoverReceipt(false)
+                await requireInvestecRecovery()
+              } else {
+                await tx`
+                  UPDATE projection_outbox
+                  SET state = 'suppressed', last_error = 'INVESTEC_LIFECYCLE_ALREADY_TERMINAL'
+                  WHERE id = ${row.id}::uuid
+                    AND provider_generation = ${connection.providerGeneration}
+                    AND state = 'pending'
+                `
+              }
+              continue
+            }
+            if (lifecycleDisposition === 'uncertain') {
+              await requireInvestecRecovery()
+              continue
+            }
+          }
+
           // Never replay an uncertain commit before attempting receipt recovery.
+          // An unresolved lifecycle is a fence: retrying its pending predecessor
+          // could resurrect the activity while the terminal receipt is unknown.
+          if (connection.provider === 'investec'
+            && row.state === 'uncertain' && row.payload.lifecycleSuccessorId !== undefined) {
+            // A lifecycle recovery attempt is authoritative for this pass. Do
+            // not issue a second lookup or replay the lifecycle after it.
+            await recoverReceipt()
+            continue
+          }
           if (row.state === 'uncertain' && await recoverReceipt()) continue
 
           let response: Response
@@ -1624,6 +1713,7 @@ export function createRuntimeDependencies(
             response = await fetch(bridgeUrl, {
               method: 'POST',
               redirect: 'error',
+              signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
               headers: {
                 'content-type': 'application/json',
                 authorization: `Bearer ${bridgeToken}`,
