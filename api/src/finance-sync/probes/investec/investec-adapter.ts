@@ -40,6 +40,10 @@ interface InvestecTransaction {
   readonly settlementCurrency?: string
   readonly description?: string
   readonly reference?: string
+  readonly merchantId?: string
+  readonly merchantCode?: string
+  readonly merchantReference?: string
+  readonly merchant?: unknown
   readonly cardNumber?: string
   readonly runningBalance?: string | number
   readonly pendingTransactionId?: string
@@ -132,7 +136,9 @@ export interface InvestecAdapterResult {
   readonly nextCursor: string | null
 }
 
-const HASH_SPEC_VERSION = 4
+const BALANCE_HASH_SPEC_VERSION = 4
+const AUDIT_HASH_SPEC_VERSION = 4
+const TRANSACTION_HASH_SPEC_VERSION = 5
 const PRIME_SAVER_IDENTITY_VERSION = 2
 
 function sha256(input: string): string {
@@ -321,6 +327,18 @@ function providerField(transaction: InvestecTransaction, names: readonly string[
   return undefined
 }
 
+function providerMerchantIdentity(transaction: InvestecTransaction): string | undefined {
+  const direct = providerField(transaction, ['merchantId', 'merchantCode', 'merchantReference'])
+  if (direct) return direct
+  if (!transaction.merchant || typeof transaction.merchant !== 'object' || Array.isArray(transaction.merchant)) return undefined
+  const merchant = transaction.merchant as Record<string, unknown>
+  for (const name of ['merchantId', 'merchantCode', 'merchantReference', 'id']) {
+    const value = merchant[name]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return undefined
+}
+
 function providerDecimalField(transaction: InvestecTransaction, names: readonly string[]): string | undefined {
   const record = transaction as unknown as Record<string, unknown>
   for (const name of names) {
@@ -400,12 +418,37 @@ function sanitizeAuditEvidence(value: unknown, key = '', parentKey = ''): unknow
   return value
 }
 
+type CardRecoveryDiagnostic = {
+  readonly stage: 'card_list' | 'account_mapping' | 'execution_list'
+  readonly status: 'failed' | 'invalid'
+  readonly errorClass: string
+  readonly mappingStage?: 'account_id' | 'account_number' | 'card_identity'
+}
+
+function safeErrorClass(error: unknown): string {
+  const standardErrorClasses = new Set([
+    'Error', 'AggregateError', 'EvalError', 'RangeError', 'ReferenceError',
+    'SyntaxError', 'TypeError', 'URIError',
+  ])
+  if (error instanceof Error && standardErrorClasses.has(error.name)) return error.name
+  if (error === null) return 'NULL_ERROR'
+  if (typeof error === 'object') return 'OBJECT_ERROR'
+  return `${typeof error}_error`.toUpperCase()
+}
+
+function logCardRecoveryDiagnostic(diagnostic: CardRecoveryDiagnostic): void {
+  // Deliberately log only fixed stage/status/error-class fields. Provider
+  // messages, response bodies, identifiers, and card/financial values are not
+  // part of recovery diagnostics.
+  console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED', JSON.stringify(diagnostic))
+}
+
 function cardAuditObservation(config: InvestecAdapterConfig, execution: InvestecCardExecution, accountId: string | null, cardKey: string | null, outcome: string, reason: string): ObservationOutput | null {
   const executionId = typeof execution.executionId === 'string' ? execution.executionId.trim() : ''
   if (!executionId) return null
   const payload = Object.freeze({ auditType: 'INVESTEC_CARD_EXECUTION', executionId, cardKey, accountId, outcome, reason })
   const rawPayload = sanitizeAuditEvidence(execution)
-  return Object.freeze({ deploymentId: config.deploymentId, localOwnerId: config.localOwnerId, sourceResourceIncarnationId: config.sourceResourceIncarnationId, providerVersion: `investec:card-execution:${executionId}`, semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'investec_card_audit', executionId, canonicalJson(rawPayload), outcome, reason].join('\x00')), hashSpecificationVersion: HASH_SPEC_VERSION, domain: 'provider_audit', payload, rawPayload, observedAt: typeof execution.completedAt === 'string' && Number.isFinite(Date.parse(execution.completedAt)) ? new Date(execution.completedAt).toISOString() : new Date().toISOString() })
+  return Object.freeze({ deploymentId: config.deploymentId, localOwnerId: config.localOwnerId, sourceResourceIncarnationId: config.sourceResourceIncarnationId, providerVersion: `investec:card-execution:${executionId}`, semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'investec_card_audit', executionId, canonicalJson(rawPayload), outcome, reason].join('\x00')), hashSpecificationVersion: AUDIT_HASH_SPEC_VERSION, domain: 'provider_audit', payload, rawPayload, observedAt: typeof execution.completedAt === 'string' && Number.isFinite(Date.parse(execution.completedAt)) ? new Date(execution.completedAt).toISOString() : new Date().toISOString() })
 }
 
 async function collectInvestecCardExecutions(
@@ -419,10 +462,10 @@ async function collectInvestecCardExecutions(
   let cards: readonly { cardKey?: string; accountId?: string; accountNumber?: string }[]
   try {
     cards = await transport.listCards()
-  } catch {
+  } catch (error) {
     // Card execution recovery is additive evidence. A provider-side outage or
     // unsupported Card API must not block the ordinary PB ledger cycle.
-    console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED')
+    logCardRecoveryDiagnostic({ stage: 'card_list', status: 'failed', errorClass: safeErrorClass(error) })
     return
   }
   const uniqueAccounts = (rows: readonly { accountId: string; accountNumber?: string }[]) =>
@@ -431,7 +474,7 @@ async function collectInvestecCardExecutions(
   for (const card of cards) {
     const cardKey = typeof card.cardKey === 'string' && card.cardKey.trim() ? card.cardKey.trim() : undefined
     if (!cardKey) {
-      console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED')
+      logCardRecoveryDiagnostic({ stage: 'account_mapping', status: 'invalid', errorClass: 'MISSING_CARD_KEY', mappingStage: 'card_identity' })
       continue
     }
     const explicitAccountId = typeof card.accountId === 'string' && card.accountId.trim()
@@ -458,11 +501,18 @@ async function collectInvestecCardExecutions(
       if (candidates.length === 1) mapped = candidates[0]
     }
 
+    if (!mapped) {
+      logCardRecoveryDiagnostic({
+        stage: 'account_mapping', status: 'invalid', errorClass: mappingReason,
+        mappingStage: explicitAccountId ? 'account_id' : 'account_number',
+      })
+    }
+
     let executions: readonly InvestecCardExecution[]
     try {
       executions = await transport.listCardExecutions(cardKey)
-    } catch {
-      console.error('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED')
+    } catch (error) {
+      logCardRecoveryDiagnostic({ stage: 'execution_list', status: 'failed', errorClass: safeErrorClass(error) })
       continue
     }
     for (const execution of executions) {
@@ -568,7 +618,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
       sourceResourceIncarnationId: config.sourceResourceIncarnationId,
       providerVersion: `investec:balance:${account.accountId}`,
       semanticHash: sha256([config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, 'balance', JSON.stringify(balancePayload)].join('\x00')),
-      hashSpecificationVersion: HASH_SPEC_VERSION,
+      hashSpecificationVersion: BALANCE_HASH_SPEC_VERSION,
       domain: 'balance',
       payload: balancePayload,
       rawPayload: balance,
@@ -639,6 +689,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
           const lifecycleIdConflict = hasConflictingLifecycleIds(txn)
           const providerLifecycleId = providerLifecycleTransactionId(txn)
           const description = txn.description ?? null
+          const merchantIdentity = providerMerchantIdentity(txn)
           const namedUsdPocket = providerTransactionType === 'MCPBAPOCKETTRANSFERS'
             && typeof description === 'string'
             && /USD\s+POCKET/i.test(description)
@@ -699,6 +750,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
                   ...(lifecycleIdConflict ? { providerLifecycleIdConflict: true } : {}),
                   ...(sourceGroupId === undefined ? {} : { pocketSourceGroupId: sourceGroupId }),
                   ...(currencyEvidence === undefined ? {} : { currencyEvidence }),
+                  ...(merchantIdentity === undefined ? {} : { merchantIdentity }),
                 },
               },
             },
@@ -721,7 +773,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
             sourceResourceIncarnationId: config.sourceResourceIncarnationId,
             providerVersion: 'investec:txn:' + transactionId,
             semanticHash: sha256(semanticStr),
-            hashSpecificationVersion: HASH_SPEC_VERSION,
+            hashSpecificationVersion: TRANSACTION_HASH_SPEC_VERSION,
             domain: 'cash_ledger',
             payload: payload as Readonly<Record<string, unknown>>,
             rawPayload: txn,

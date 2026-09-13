@@ -1,7 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles } from './runtime-deps'
 import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
-import { bridgeOperationToWire, currentStateToBridge, validateBridgeReceipt } from './projection/bridge-client'
+import { bridgeOperationToWire, currentStateToBridge, providerObservationToBridge, validateBridgeReceipt } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
@@ -810,6 +810,120 @@ describe('Investec card and poll lifecycle correlation', () => {
     })
   })
 
+  it('matches provider merchant identity when card and booked feeds carry different descriptions', async () => {
+    const card = {
+      ...inferredCardPayload,
+      transactionId: 'merchant-identity-card',
+      providerVersion: 'investec:card:merchant-identity-card',
+      semanticHash: 'merchant-identity-card-hash',
+      description: 'Card feed label',
+      metadata: { providerOwned: { investec: { accountCurrency: 'ZAR', merchantIdentity: 'INVESTEC-MERCHANT-42' } } },
+    }
+    const settled = {
+      ...inferredSettledPayload,
+      transactionId: 'merchant-identity-settled',
+      providerVersion: 'investec:txn:merchant-identity-settled',
+      semanticHash: 'merchant-identity-settled-hash',
+      description: 'Booked feed label',
+      metadata: { providerOwned: { investec: { merchantIdentity: 'INVESTEC-MERCHANT-42' } } },
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000113', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued.some(operation => operation.lifecycleSuccessorId?.endsWith(':merchant-identity-settled'))).toBe(true)
+  })
+
+  it('uses the exact merchant boundary when only one feed has provider identity', async () => {
+    const card = {
+      ...inferredCardPayload,
+      transactionId: 'single-identity-card',
+      providerVersion: 'investec:card:single-identity-card',
+      semanticHash: 'single-identity-card-hash',
+      description: 'SYNTHETIC CARD MERCHANT',
+      metadata: { providerOwned: { investec: { accountCurrency: 'ZAR', merchantIdentity: 'INVESTEC-MERCHANT-42' } } },
+    }
+    const settled = {
+      ...inferredSettledPayload,
+      transactionId: 'single-identity-settled',
+      providerVersion: 'investec:txn:single-identity-settled',
+      semanticHash: 'single-identity-settled-hash',
+      description: 'SYNTHETIC CARD MERCHANT',
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000114', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued.some(operation => operation.lifecycleSuccessorId?.endsWith(':single-identity-settled'))).toBe(true)
+  })
+
+  it('does not match an unverified three-word merchant prefix across location suffixes', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'coffee-card', providerVersion: 'investec:card:coffee-card', semanticHash: 'coffee-card-hash', description: 'Sample Coffee - Central' }
+    const settled = { ...inferredSettledPayload, transactionId: 'coffee-settled', providerVersion: 'investec:txn:coffee-settled', semanticHash: 'coffee-settled-hash', description: 'SAMPLE COFFEE SAMPLEVILLE ZA' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000114', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    expect(fixture.enqueued.some(operation => operation.lifecycleSuccessorId?.endsWith(':coffee-settled'))).toBe(false)
+  })
+
+  it('rejects a similar merchant with fewer than three shared leading words', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'merchant-near-card', providerVersion: 'investec:card:merchant-near-card', semanticHash: 'merchant-near-card-hash', description: 'Sample Coffee - Central' }
+    const settled = { ...inferredSettledPayload, transactionId: 'merchant-near-settled', providerVersion: 'investec:txn:merchant-near-settled', semanticHash: 'merchant-near-settled-hash', description: 'Sample Coffe Sampleville ZA' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000115', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    const operation = fixture.enqueued.find(item => item.kind === 'ActivityUpsert')
+    expect(operation?.lifecycleSuccessorId).toBeUndefined()
+  })
+
+  it('rejects an opposite-direction refund or reversal candidate', async () => {
+    const card = { ...inferredCardPayload, transactionId: 'direction-card', providerVersion: 'investec:card:direction-card', semanticHash: 'direction-card-hash' }
+    const settled = { ...inferredSettledPayload, transactionId: 'direction-settled', providerVersion: 'investec:txn:direction-settled', semanticHash: 'direction-settled-hash', type: 'CREDIT', direction: 'CREDIT', amount: '191.13', settlementAmount: '191.13' }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000116', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [settled])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    await deps.persistAndEnqueue(INVESTEC_CONNECTION, [{
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: card.providerVersion, semanticHash: card.semanticHash,
+      hashSpecificationVersion: 4, observedAt: card.observedAt, domain: 'cash_ledger', payload: card,
+    }], { skipCurrentState: true })
+    const operation = fixture.enqueued.find(item => item.kind === 'ActivityUpsert')
+    expect(operation?.lifecycleSuccessorId).toBeUndefined()
+  })
+
   it('correlates a same-currency settlement posted within the provider window', async () => {
     const settled = {
       ...inferredSettledPayload,
@@ -914,6 +1028,32 @@ describe('Investec card and poll lifecycle correlation', () => {
     expect(settledActivity?.metadata).toMatchObject({
       providerOwned: { investecCorrelation: expect.anything() },
     })
+  })
+
+  it('keeps one logical posted successor across v4 and v5 retries', () => {
+    const postedPayload = {
+      ...inferredSettledPayload,
+      transactionId: 'versioned-posted-successor',
+      providerVersion: undefined,
+      pendingTransactionId: 'versioned-pending-card',
+    }
+    type VersionedObservation = Parameters<typeof providerObservationToBridge>[1] & { readonly hashSpecificationVersion: number }
+    const oldObservation: VersionedObservation = {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      semanticHash: 'old-v4-hash', hashSpecificationVersion: 4,
+      domain: 'cash_ledger', observedAt: '2026-08-14T22:00:00.000Z', payload: postedPayload,
+    }
+    const newObservation: VersionedObservation = {
+      ...oldObservation, semanticHash: 'new-v5-hash', hashSpecificationVersion: 5,
+    }
+    const oldOperation = providerObservationToBridge('investec', oldObservation, 1, 'wf-acc-1', 'investec-connection')!
+    const newOperation = providerObservationToBridge('investec', newObservation, 1, 'wf-acc-1', 'investec-connection')!
+    expect(new Set([oldOperation.resourceId, newOperation.resourceId]).size).toBe(1)
+    expect(oldOperation.lifecycleSuccessorId).toBe(newOperation.lifecycleSuccessorId)
+    expect(oldOperation.resourceId).toContain(':versioned-pending-card')
+    expect(oldOperation.lifecycleSuccessorId).toContain(':versioned-posted-successor')
+    expect(oldOperation.idempotencyKey).not.toBe(newOperation.idempotencyKey)
   })
 
   it('correlates an exact settlement when the booked row omits card last four', async () => {

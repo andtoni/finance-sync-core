@@ -12,11 +12,14 @@ export interface InvestecCardPayload extends RecordValue {
   readonly currencyCode?: unknown
   readonly dateTime?: unknown
   readonly reference?: unknown
+  readonly merchantId?: unknown
+  readonly merchantCode?: unknown
+  readonly merchantReference?: unknown
   readonly merchant?: unknown
   readonly card?: unknown
 }
 
-const HASH_SPECIFICATION_VERSION = 4
+const CARD_HASH_SPECIFICATION_VERSION = 5
 
 function record(value: unknown): RecordValue | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : undefined
@@ -86,6 +89,18 @@ function merchantName(payload: InvestecCardPayload): string {
   return stringValue(merchant?.name) ?? stringValue(payload.merchant) ?? 'Card purchase'
 }
 
+function merchantIdentity(payload: InvestecCardPayload): string | undefined {
+  const merchant = record(payload.merchant)
+  for (const value of [
+    payload.merchantId, payload.merchantCode, payload.merchantReference,
+    merchant?.merchantId, merchant?.merchantCode, merchant?.merchantReference, merchant?.id,
+  ]) {
+    const identity = stringValue(value)
+    if (identity) return identity
+  }
+  return undefined
+}
+
 function strictProviderInstant(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const instant = value.trim()
@@ -126,6 +141,7 @@ export function investecCardObservation(input: {
   if (!dateTime) return null
   const date = dateTime.slice(0, 10)
   const merchant = merchantName(input.payload)
+  const merchantIdentityValue = merchantIdentity(input.payload)
   const reference = stringValue(input.payload.reference)
   if (hasConflictingLifecycleIds(input.payload)) return null
   const lifecycleTransactionId = providerLifecycleTransactionId(input.payload)
@@ -178,6 +194,7 @@ export function investecCardObservation(input: {
             status: currencyEvidenceStatus,
             settlementCurrency: null,
           },
+          ...(merchantIdentityValue === undefined ? {} : { merchantIdentity: merchantIdentityValue }),
           ...(!isCredit ? { provisionalSpending: true, provisionalSpendingReason: 'AUTHORIZED_NO_SETTLEMENT' } : {}),
         },
       },
@@ -198,7 +215,7 @@ export function investecCardObservation(input: {
     input.deploymentId, input.localOwnerId, input.sourceResourceIncarnationId,
     'cash_ledger', transactionId, amount, accountCurrency, originalAmount ?? '', originalCurrency ?? '',
     currencyEvidenceStatus, 'provisional-spending-v1', dateTime,
-    merchant, cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
+    merchant, merchantIdentityValue ?? '', cardDisplay ?? '', 'PENDING', lifecycleTransactionId ?? '',
   ].join('\x00'))
   return Object.freeze({
     deploymentId: input.deploymentId,
@@ -206,7 +223,7 @@ export function investecCardObservation(input: {
     sourceResourceIncarnationId: input.sourceResourceIncarnationId,
     providerVersion: `investec:card:${transactionId}`,
     semanticHash,
-    hashSpecificationVersion: HASH_SPECIFICATION_VERSION,
+    hashSpecificationVersion: CARD_HASH_SPECIFICATION_VERSION,
     domain: 'cash_ledger',
     payload,
     rawPayload: input.payload,

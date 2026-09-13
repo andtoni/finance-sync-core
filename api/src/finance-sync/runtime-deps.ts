@@ -542,7 +542,29 @@ function providerReference(payload: Readonly<Record<string, unknown>>): string |
   return value || undefined
 }
 
+function providerMerchantIdentity(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const metadata = recordPayload(payload.metadata)
+  const owned = recordPayload(metadata?.providerOwned)
+  const investec = recordPayload(owned?.investec)
+  for (const value of [
+    payload.merchantId, payload.merchantCode, payload.merchantReference,
+    investec?.merchantIdentity, investec?.merchantId, investec?.merchantCode,
+    investec?.merchantReference,
+  ]) {
+    const identity = normalizedText(value).normalize('NFKC')
+    if (identity) return identity
+  }
+  return undefined
+}
+
 function merchantMatches(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+  const cardIdentity = providerMerchantIdentity(card)
+  const settledIdentity = providerMerchantIdentity(settled)
+  // A provider identity is authoritative only when both feeds carry the same
+  // non-empty identity. If one feed lacks it, retain the exact description
+  // boundary below rather than treating the missing value as a mismatch.
+  if (cardIdentity && settledIdentity) return cardIdentity === settledIdentity
+
   const cardMerchant = normalizedText(card.description).normalize('NFKC')
   const postedMerchant = normalizedText(settled.description).normalize('NFKC')
   if (!cardMerchant || cardMerchant.length < 3 || !postedMerchant) return false
@@ -600,6 +622,68 @@ export function investecProviderFactPairShapeMatches(
     && settlementAmount && settlementCurrency && accountCurrency && settlementCurrency === accountCurrency
     && originalMagnitude !== undefined && originalMagnitude.units > 0n
     && settlementMagnitude !== undefined && settlementMagnitude.units > 0n)
+}
+
+type InvestecMatcherDiagnosticReason =
+  | 'NO_CANDIDATE'
+  | 'MERCHANT_MISMATCH'
+  | 'DIRECTION_MISMATCH'
+  | 'CURRENCY_OR_AMOUNT_MISMATCH'
+  | 'REVERSE_AMBIGUITY'
+  | 'PROVIDER_FACT_MISMATCH'
+
+const INVESTEC_MATCH_DIAGNOSTIC_LIMIT = 100
+let investecMatchDiagnosticsEmitted = 0
+
+function resetInvestecMatcherDiagnostics(): void {
+  investecMatchDiagnosticsEmitted = 0
+}
+
+function emitInvestecMatcherDiagnostic(reason: InvestecMatcherDiagnosticReason, candidateCount: number): void {
+  if (investecMatchDiagnosticsEmitted >= INVESTEC_MATCH_DIAGNOSTIC_LIMIT) return
+  investecMatchDiagnosticsEmitted += 1
+  console.warn('FINANCE_SYNC_INVESTEC_CARD_MATCH_REJECTED', JSON.stringify({
+    reason, candidateCount, status: 'unresolved', stage: 'lifecycle_matcher',
+  }))
+}
+
+function providerFactPairMismatchReason(
+  card: Readonly<Record<string, unknown>>,
+  settled: Readonly<Record<string, unknown>>,
+): InvestecMatcherDiagnosticReason | undefined {
+  if (hasConflictingLifecycleIds(card) || hasConflictingLifecycleIds(settled)
+    || providerLifecycleTransactionId(card) || providerLifecycleTransactionId(settled)
+    || normalizedText(card.status) !== 'PENDING' || normalizedText(settled.status) !== 'POSTED'
+    || providerTransactionType(settled) !== 'CARDPURCHASES') return 'PROVIDER_FACT_MISMATCH'
+  const cardFour = terminalFour(card.cardNumber)
+  const settledFour = terminalFour(settled.cardNumber)
+  const cardReference = providerReference(card)
+  const settledReference = providerReference(settled)
+  if ((cardFour && settledFour && cardFour !== settledFour) || ((!cardFour || !settledFour)
+    && (cardReference === undefined || cardReference !== settledReference))) return 'PROVIDER_FACT_MISMATCH'
+  const cardDate = typeof card.transactionDate === 'string' ? card.transactionDate : undefined
+  const settledDate = typeof settled.transactionDate === 'string' ? settled.transactionDate : undefined
+  if (!cardDate || !settledDate || !cardSettlementDateMatches(cardDate, settledDate)) return 'PROVIDER_FACT_MISMATCH'
+  const cardDirection = providerDirection(card)
+  if (!cardDirection || cardDirection !== providerDirection(settled)) return 'DIRECTION_MISMATCH'
+  if (!merchantMatches(card, settled)) return 'MERCHANT_MISMATCH'
+  const originalAmount = typeof card.originalAmount === 'string' ? card.originalAmount : undefined
+  const originalCurrency = currencyCode(card.originalCurrency)
+  const cardCurrency = currencyCode(card.currency)
+  const settlementAmount = settled.settlementAmount ?? settled.amount
+  const settlementCurrency = currencyCode(settled.settlementCurrency ?? settled.currency)
+  const accountCurrency = providerCardAccountCurrency(card)
+  const originalMagnitude = cashDecimalMagnitude(originalAmount)
+  const settlementMagnitude = cashDecimalMagnitude(settlementAmount)
+  if (!originalAmount || !originalCurrency || !cardCurrency || cardCurrency !== originalCurrency
+    || !settlementAmount || !settlementCurrency || !accountCurrency || settlementCurrency !== accountCurrency
+    || originalMagnitude === undefined || originalMagnitude.units <= 0n
+    || settlementMagnitude === undefined || settlementMagnitude.units <= 0n) return 'CURRENCY_OR_AMOUNT_MISMATCH'
+  if (originalCurrency === settlementCurrency && !sameCurrencyAmountWithinTolerance(
+    { amount: originalAmount, currency: originalCurrency },
+    { amount: settlementAmount, currency: settlementCurrency },
+  )) return 'CURRENCY_OR_AMOUNT_MISMATCH'
+  return undefined
 }
 
 function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
@@ -779,7 +863,11 @@ async function findInvestecCounterpart(
       if (candidateLink !== undefined && candidateLink !== currentTransactionId) return { ambiguous: true }
       return candidates[0]
     }
-    if (candidates.length > 1 || linkedTransactionId) return candidates.length > 1 ? { ambiguous: true } : undefined
+    if (candidates.length > 1 || linkedTransactionId) {
+      if (candidates.length > 1) emitInvestecMatcherDiagnostic('REVERSE_AMBIGUITY', candidates.length)
+      else emitInvestecMatcherDiagnostic('NO_CANDIDATE', 0)
+      return candidates.length > 1 ? { ambiguous: true } : undefined
+    }
   }
 
   const providerDate = typeof payload.transactionDate === 'string' ? payload.transactionDate : undefined
@@ -823,7 +911,20 @@ async function findInvestecCounterpart(
   const currentCandidates = isCard
     ? settled.filter(row => exactProviderFactPair(payload, row.payload))
     : cards.filter(row => exactProviderFactPair(row.payload, payload))
-  if (currentCandidates.length !== 1) return currentCandidates.length > 1 ? { ambiguous: true } : undefined
+  if (currentCandidates.length !== 1) {
+    if (currentCandidates.length > 1) {
+      emitInvestecMatcherDiagnostic('REVERSE_AMBIGUITY', currentCandidates.length)
+    } else {
+      const possible = isCard ? settled : cards
+      const reason = possible.length === 0
+        ? 'NO_CANDIDATE'
+        : (possible.map(row => isCard
+          ? providerFactPairMismatchReason(payload, row.payload)
+          : providerFactPairMismatchReason(row.payload, payload)).find(value => value !== undefined) ?? 'PROVIDER_FACT_MISMATCH')
+      emitInvestecMatcherDiagnostic(reason, possible.length)
+    }
+    return currentCandidates.length > 1 ? { ambiguous: true } : undefined
+  }
   const candidate = currentCandidates[0]
   const currentId = currentTransactionId
   const cardRows = isCard
@@ -835,7 +936,10 @@ async function findInvestecCounterpart(
   const reverseCount = isCard
     ? cardRows.filter(card => exactProviderFactPair(card.payload, candidate.payload)).length
     : settledRows.filter(posted => exactProviderFactPair(candidate.payload, posted.payload)).length
-  if (reverseCount !== 1) return { ambiguous: true }
+  if (reverseCount !== 1) {
+    emitInvestecMatcherDiagnostic('REVERSE_AMBIGUITY', reverseCount)
+    return { ambiguous: true }
+  }
   return { ...candidate, provenance: 'provider-facts-exact' }
 }
 
@@ -1028,6 +1132,9 @@ export async function reconcileInvestecCardLifecycles(
   deps: SyncRuntimeDependencies,
 ): Promise<number> {
   if (connection.provider !== 'investec') return 0
+  // The sweep is the durable observability boundary. Reset the bounded budget
+  // so a prior large historical sweep cannot hide later live diagnostics.
+  resetInvestecMatcherDiagnostics()
   const rows = await sql<InvestecPostedCardLifecycleRow[]>`
     WITH latest AS (
       SELECT DISTINCT ON (payload->>'transactionId')

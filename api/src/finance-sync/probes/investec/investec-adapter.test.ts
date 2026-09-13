@@ -1,5 +1,5 @@
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { investecCardObservation } from '../../investec-card-observation'
 import {
   investecPrimeSaverSupersessionKey,
@@ -43,6 +43,21 @@ describe('Investec adapter G5', () => {
     const recovered = (await runInvestecAdapter(BASE_CONFIG, transport)).observations.find(item => item.payload.status === 'pending')
     expect(recovered?.providerVersion).toBe(webhook?.providerVersion)
     expect(recovered?.semanticHash).toBe(webhook?.semanticHash)
+    expect(recovered?.hashSpecificationVersion).toBe(5)
+    expect(webhook?.hashSpecificationVersion).toBe(5)
+  })
+
+  it('preserves provider merchant identity as provider-owned evidence', async () => {
+    const result = await runInvestecAdapter(BASE_CONFIG, makeTransport([{
+      uuid: 'pb-merchant-identity', status: 'POSTED', postedOrder: 1, type: 'DEBIT', amount: 100,
+      postingDate: '2026-07-10', transactionDate: '2026-07-10', description: 'Booked label',
+      merchantId: 'merchant-42', transactionType: 'CARDPURCHASES',
+    }]))
+    expect(transactionObservations(result)[0]?.payload).toMatchObject({
+      metadata: { providerOwned: { investec: { merchantIdentity: 'merchant-42' } } },
+    })
+    expect(transactionObservations(result)[0]?.hashSpecificationVersion).toBe(5)
+    expect(result.observations.find(observation => observation.domain === 'balance')?.hashSpecificationVersion).toBe(4)
   })
 
   it('maps to cash_ledger', () => expect(investecResourceKind()).toBe('cash_ledger'))
@@ -69,6 +84,7 @@ describe('Investec adapter G5', () => {
     expect(JSON.stringify(recovered?.payload)).not.toContain('exec-12345678')
     expect(JSON.stringify(recovered?.rawPayload)).not.toContain('4111111111111111')
     const audit = executionObservations(result).find(item => item.domain === 'provider_audit')
+    expect(audit?.hashSpecificationVersion).toBe(4)
     expect(JSON.stringify(audit?.rawPayload)).not.toContain('4111111111111111')
   })
 
@@ -141,6 +157,22 @@ describe('Investec adapter G5', () => {
     expect(executionObservations(result)[0].payload).toMatchObject({
       outcome: 'AUDIT_ONLY', reason: 'AUTHORIZATION_NORMALIZATION_FAILED',
     })
+  })
+
+  it('emits redacted recovery diagnostics without provider error details', async () => {
+    const transport = makeTransport([], undefined, [{ accountId: 'acc-1', accountNumber: '10001111', productName: 'Private Bank Account' }])
+    transport.listCards = async () => { throw new Error('provider response body must not be logged') }
+    transport.listCardExecutions = async () => []
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      const result = await runInvestecAdapter(BASE_CONFIG, transport)
+      expect(transactionObservations(result)).toHaveLength(0)
+      expect(diagnostic).toHaveBeenCalledWith('FINANCE_SYNC_CARD_EXECUTION_RECOVERY_FAILED', expect.stringContaining('"stage":"card_list"'))
+      expect(diagnostic.mock.calls.flat().join(' ')).not.toContain('provider response body')
+      expect(diagnostic.mock.calls.flat().join(' ')).toContain('"status":"failed"')
+    } finally {
+      diagnostic.mockRestore()
+    }
   })
 
   it('keeps the PB cycle healthy when the official Card API backstop is unavailable', async () => {

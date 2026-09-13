@@ -50,6 +50,26 @@ describe('Investec card observations', () => {
     })
   })
 
+  it('versions hashes when provider merchant identity is added without changing resource identity', () => {
+    const basePayload = {
+      accountNumber: '90000000000', centsAmount: 1234, currencyCode: 'usd', type: 'card',
+      dateTime: '2026-01-06T02:30:00.000Z', reference: 'TEST-REF-HASH-V5',
+      merchant: { name: 'SYNTHETIC CARD MERCHANT' },
+    }
+    const missingIdentity = investecCardObservation({ ...input, payload: basePayload })
+    const presentIdentity = investecCardObservation({
+      ...input, payload: { ...basePayload, merchantId: 'merchant-42' },
+    })
+    expect(missingIdentity?.providerVersion).toBe(presentIdentity?.providerVersion)
+    expect(missingIdentity?.semanticHash).not.toBe(presentIdentity?.semanticHash)
+    expect(missingIdentity?.hashSpecificationVersion).toBe(5)
+    expect(presentIdentity?.hashSpecificationVersion).toBe(5)
+    expect(missingIdentity?.payload.metadata).not.toMatchObject({ providerOwned: { investec: { merchantIdentity: expect.anything() } } })
+    expect(presentIdentity?.payload.metadata).toMatchObject({
+      providerOwned: { investec: { merchantIdentity: 'merchant-42' } },
+    })
+  })
+
   it('does not invent an original currency or amount when the webhook omits card currency', () => {
     const observation = investecCardObservation({
       ...input,
@@ -192,7 +212,7 @@ describe('Investec card observations', () => {
         hashSpecificationVersion: number
       }>) => {
         persisted.push(observations.map(observation => observation.payload))
-        expect(observations[0]?.hashSpecificationVersion).toBe(4)
+        expect(observations[0]?.hashSpecificationVersion).toBe(5)
         return observations.length
       },
       projectPending: async () => ({ delivered: 1, failed: 0 }),
@@ -201,6 +221,131 @@ describe('Investec card observations', () => {
     await expect(reprojectRetainedInvestecCards(sql, connection.deploymentId, deps)).resolves.toBe(1)
     expect(persisted).toHaveLength(1)
     expect(persisted[0][0]).toMatchObject({ currency: 'ZAR', originalAmount: '123.45', originalCurrency: 'ZAR' })
+  })
+
+  it('upgrades a retained v4 card observation to v5 once without duplicate active projection', async () => {
+    const connection: RuntimeConnection = {
+      deploymentId: 'wealthfolio-production', provider: 'investec', connectionId: 'connection:provider-account',
+      clientId: 'client', clientSecret: 'secret', apiKey: 'key', localOwnerId: 'urn:wealthfolio:password#local',
+      sourceResourceIncarnationId: input.sourceResourceIncarnationId, accountIds: ['provider-account'],
+      wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, providerGeneration: 1,
+      receiverAccessGeneration: 1, secretReference: 'INVESTEC', eligibleProductNames: ['Private Bank Account'],
+      fromDate: '2026-08-01', toDate: '2026-08-07',
+    }
+    const rawPayload = {
+      accountNumber: '90000000000', centsAmount: 12345, currencyCode: 'usd', type: 'card',
+      dateTime: '2026-01-06T02:30:00.000Z', reference: 'TEST-REF-REPLAY-V5',
+      merchant: { name: 'SYNTHETIC CARD MERCHANT' },
+    }
+    let retained: Record<string, unknown> = {
+      payload: { transactionId: 'old-resource', accountId: 'provider-account' }, raw_payload: rawPayload,
+      semantic_hash: 'old-v4-hash', hash_specification_version: 4,
+      observed_at: '2026-01-06T02:31:00.000Z', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+    }
+    const sql = (async (strings: TemplateStringsArray) => {
+      const text = strings.join('?')
+      if (/FROM raw_observations/i.test(text)) return [retained]
+      if (/FROM discovered_provider_accounts/i.test(text)) return [{
+        local_owner_id: connection.localOwnerId, connection_id: 'connection', provider_account_id: 'provider-account',
+        wealthfolio_account_id: 'wealthfolio-account', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+        currency: 'ZAR', mask: '3333',
+      }]
+      return []
+    }) as unknown as FinanceSyncSql
+    let writes = 0
+    const activeResources = new Set<string>()
+    const deps = {
+      loadConnections: async () => [connection],
+      persistAndEnqueue: async (_runtimeConnection: RuntimeConnection, observations: ReadonlyArray<{
+        providerVersion: string
+        semanticHash: string
+        hashSpecificationVersion: number
+        payload: Readonly<Record<string, unknown>>
+      }>) => {
+        writes += observations.length
+        for (const observation of observations) {
+          activeResources.add(observation.providerVersion)
+          retained = { ...retained, semantic_hash: observation.semanticHash, hash_specification_version: observation.hashSpecificationVersion }
+        }
+        return observations.length
+      },
+      projectPending: async () => ({ delivered: 1, failed: 0 }),
+    } as unknown as SyncRuntimeDependencies
+
+    await expect(reprojectRetainedInvestecCards(sql, connection.deploymentId, deps)).resolves.toBe(1)
+    await expect(reprojectRetainedInvestecCards(sql, connection.deploymentId, deps)).resolves.toBe(0)
+    expect(writes).toBe(1)
+    expect(activeResources).toEqual(new Set(['investec:card:investec-card:provider-account:reference-TEST-REF-REPLAY-V5']))
+    expect(retained.hash_specification_version).toBe(5)
+  })
+
+  it('does not revive a quarantined v4 card when retained replay normalizes to v5', async () => {
+    const connection: RuntimeConnection = {
+      deploymentId: 'wealthfolio-production', provider: 'investec', connectionId: 'connection:provider-account',
+      clientId: 'client', clientSecret: 'secret', apiKey: 'key', localOwnerId: 'urn:wealthfolio:password#local',
+      sourceResourceIncarnationId: input.sourceResourceIncarnationId, accountIds: ['provider-account'],
+      wealthfolioAccountIds: { 'provider-account': 'wealthfolio-account' }, providerGeneration: 1,
+      receiverAccessGeneration: 1, secretReference: 'INVESTEC', eligibleProductNames: ['Private Bank Account'],
+      fromDate: '2026-08-01', toDate: '2026-08-07',
+    }
+    const retained = {
+      payload: { transactionId: 'quarantined-resource', accountId: 'provider-account' },
+      raw_payload: {
+        schemaVersion: 1, eventType: 'after_transaction', providerEventTime: '2026-01-06T02:30:00.000Z',
+        transaction: {
+          accountNumber: '90000000000', centsAmount: 12345, currencyCode: 'usd', type: 'card',
+          dateTime: '2026-01-06T02:30:00.000Z', reference: 'QUARANTINED-V4',
+          merchant: { name: 'SYNTHETIC CARD MERCHANT' },
+        },
+      },
+      semantic_hash: 'quarantined-v4-hash', hash_specification_version: 4,
+      observed_at: '2026-01-06T02:31:00.000Z', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+    }
+    let quarantineFilterSeen = false
+    let matchingQuarantine = true
+    const persistedRawPayloads: unknown[] = []
+    const sql = (async (strings: TemplateStringsArray) => {
+      const text = strings.join('?')
+      if (/FROM raw_observations/i.test(text)) {
+        quarantineFilterSeen = /observation_quarantines/i.test(text)
+        expect(text).toMatch(/q\.deployment_id = o\.deployment_id/)
+        expect(text).toMatch(/q\.local_owner_id = o\.local_owner_id/)
+        expect(text).toMatch(/q\.source_resource_incarnation_id = o\.source_resource_incarnation_id/)
+        expect(text).toMatch(/q\.provider_version = o\.provider_version/)
+        expect(text).toMatch(/q\.semantic_hash = o\.semantic_hash/)
+        expect(text).toMatch(/q\.hash_specification_version = o\.hash_specification_version/)
+        return matchingQuarantine ? [] : [retained]
+      }
+      if (/FROM discovered_provider_accounts/i.test(text)) return [{
+        local_owner_id: connection.localOwnerId, connection_id: 'connection', provider_account_id: 'provider-account',
+        wealthfolio_account_id: 'wealthfolio-account', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+        currency: 'ZAR', mask: '3333',
+      }]
+      return []
+    }) as unknown as FinanceSyncSql
+    let persisted = false
+    const deps = {
+      loadConnections: async () => [connection],
+      persistAndEnqueue: async (_connection: RuntimeConnection, observations: ReadonlyArray<{ rawPayload?: unknown }>) => {
+        persisted = true
+        persistedRawPayloads.push(...observations.map(observation => observation.rawPayload))
+        return observations.length
+      },
+      projectPending: async () => ({ delivered: 1, failed: 0 }),
+    } as unknown as SyncRuntimeDependencies
+
+    // The matching tombstone excludes this retained v4 row before the
+    // normalizer can produce a v5 observation.
+    await expect(reprojectRetainedInvestecCards(sql, connection.deploymentId, deps)).resolves.toBe(0)
+    expect(quarantineFilterSeen).toBe(true)
+    expect(persisted).toBe(false)
+
+    // A tombstone for a different provider fact must not suppress valid replay;
+    // the original raw evidence remains the payload handed to persistence.
+    matchingQuarantine = false
+    await expect(reprojectRetainedInvestecCards(sql, connection.deploymentId, deps)).resolves.toBe(1)
+    expect(persisted).toBe(true)
+    expect(persistedRawPayloads).toEqual([retained.raw_payload.transaction])
   })
 
   it('is deterministic for webhook redelivery and uses the provider currency leg', () => {
@@ -215,7 +360,7 @@ describe('Investec card observations', () => {
     expect(first?.payload.originalAmount).toBe('12.34')
     expect(first?.payload.originalCurrency).toBe('USD')
     expect(first?.payload.settlementCurrency).toBeUndefined()
-    expect(first?.hashSpecificationVersion).toBe(4)
+    expect(first?.hashSpecificationVersion).toBe(5)
   })
 
   it('rejects an invalid provider authorization time instead of using receipt time', () => {

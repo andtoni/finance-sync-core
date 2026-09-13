@@ -15,7 +15,7 @@ interface CardAccountMapping {
   readonly local_owner_id: string; readonly connection_id: string; readonly provider_account_id: string;
   readonly wealthfolio_account_id: string; readonly source_resource_incarnation_id: string; readonly currency: string; readonly mask: string
 }
-const HASH_SPECIFICATION_VERSION = 4
+const CARD_HASH_SPECIFICATION_VERSION = 5
 async function exactCardAccount(sql: FinanceSyncSql, deploymentId: string, mask: string): Promise<CardAccountMapping> {
   const rows = await sql<CardAccountMapping[]>`
     SELECT dpa.local_owner_id, dpa.connection_id::text, dpa.provider_account_id,
@@ -81,11 +81,20 @@ export async function reprojectRetainedInvestecCards(
     WITH latest AS (
       SELECT DISTINCT ON (source_resource_incarnation_id, payload->>'transactionId')
         payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id::text
-      FROM raw_observations
-      WHERE deployment_id = ${deploymentId}
-        AND provider_version LIKE 'investec:card:%'
-        AND raw_payload IS NOT NULL
-      ORDER BY source_resource_incarnation_id, payload->>'transactionId', recorded_at DESC, observation_id DESC
+      FROM raw_observations o
+      WHERE o.deployment_id = ${deploymentId}
+        AND o.provider_version LIKE 'investec:card:%'
+        AND o.raw_payload IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM observation_quarantines q
+          WHERE q.deployment_id = o.deployment_id
+            AND q.local_owner_id = o.local_owner_id
+            AND q.source_resource_incarnation_id = o.source_resource_incarnation_id
+            AND q.provider_version = o.provider_version
+            AND q.semantic_hash = o.semantic_hash
+            AND q.hash_specification_version = o.hash_specification_version
+        )
+      ORDER BY o.source_resource_incarnation_id, o.payload->>'transactionId', o.recorded_at DESC, o.observation_id DESC
     )
     SELECT payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id
     FROM latest
@@ -135,7 +144,7 @@ export async function reprojectRetainedInvestecCards(
       continue
     }
     if (observation.semanticHash === row.semantic_hash
-      && row.hash_specification_version === HASH_SPECIFICATION_VERSION) continue
+      && row.hash_specification_version === CARD_HASH_SPECIFICATION_VERSION) continue
     const identity = `${connection.connectionId}:${observation.semanticHash}`
     if (seen.has(identity)) continue
     seen.add(identity)
