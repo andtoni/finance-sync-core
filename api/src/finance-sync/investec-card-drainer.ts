@@ -79,7 +79,7 @@ export async function reprojectRetainedInvestecCards(
 ): Promise<number> {
   const rows = await sql<RetainedCardObservationRow[]>`
     WITH latest AS (
-      SELECT DISTINCT ON (source_resource_incarnation_id, payload->>'transactionId')
+      SELECT DISTINCT ON (o.source_resource_incarnation_id, o.payload->>'transactionId')
         payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id::text
       FROM raw_observations o
       WHERE o.deployment_id = ${deploymentId}
