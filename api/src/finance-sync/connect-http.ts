@@ -4,6 +4,7 @@ import { ConnectControlError, FinanceSyncConnectControl } from './connect-contro
 import { ObservationQuarantineError, type ObservationQuarantineRequest } from './observation-quarantine'
 import { InvestecCardCurrencyCorrectionError, type InvestecCardCurrencyCorrectionRequest } from './investec-card-correction'
 import { InvestecCardLifecycleLinkError, type InvestecCardLifecycleLinkRequest } from './investec-card-lifecycle-link'
+import type { TerminalRevisionRecoveryRequest } from './investec-terminal-revision-recovery'
 
 const MAX_JSON_BODY_BYTES = 16 * 1024
 
@@ -50,6 +51,7 @@ export function createFinanceSyncHttpHandler(input: {
   readonly quarantine?: { create(rawSubject: string, request: ObservationQuarantineRequest): Promise<unknown> }
   readonly investecCardCorrection?: { create(rawSubject: string, request: InvestecCardCurrencyCorrectionRequest): Promise<unknown> }
   readonly investecCardLifecycleLink?: { create(rawSubject: string, request: InvestecCardLifecycleLinkRequest): Promise<unknown> }
+  readonly investecTerminalRevisionRecovery?: { recover(rawSubject: string, request: TerminalRevisionRecoveryRequest): Promise<unknown> }
   readonly health: () => { readonly status: number; readonly body: unknown }
 }) {
   return async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -99,6 +101,22 @@ export function createFinanceSyncHttpHandler(input: {
           amount,
           currency,
           reason: reason.trim(),
+        }))
+      }
+      if (request.method === 'POST' && path === '/control/v1/investec/terminal-revision-recoveries') {
+        if (!input.investecTerminalRevisionRecovery) return send(response, 404, { error: 'not_found' })
+        const body = await jsonBody(request)
+        const outboxId = body.outboxId
+        const expectedPayloadHash = body.expectedPayloadHash
+        const reason = body.reason
+        if (typeof outboxId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(outboxId)
+          || typeof expectedPayloadHash !== 'string' || !/^[a-f0-9]{64}$/i.test(expectedPayloadHash)
+          || typeof reason !== 'string' || reason.trim().length < 1 || reason.trim().length > 2048
+          || (body.apply !== undefined && typeof body.apply !== 'boolean')) {
+          throw new ConnectControlError(400, 'invalid terminal revision recovery request')
+        }
+        return send(response, 200, await input.investecTerminalRevisionRecovery.recover(rawSubject, {
+          outboxId, expectedPayloadHash: expectedPayloadHash.toLowerCase(), reason: reason.trim(), apply: body.apply === true,
         }))
       }
       if (request.method === 'POST' && path === '/control/v1/investec/card-lifecycle-links') {

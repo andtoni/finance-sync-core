@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -95,6 +95,19 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/pg_advisory_xact_lock/i);
     expect(sql).toMatch(/REVOKE UPDATE, DELETE ON investec_card_lifecycle_overrides FROM finance_sync_runtime/i);
     expect(sql).toMatch(/Investec card lifecycle overrides are append-only/i);
+  });
+
+  it("defines the append-only observation revision ledger", () => {
+    const sql = readFileSync(resolve(root, "0021_observation_revision.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS observation_revision_ledger/i);
+    expect(sql).toMatch(/ON CONFLICT DO NOTHING/i);
+    expect(sql).not.toMatch(/UPDATE raw_observations/i);
+    expect(sql).toMatch(/finance_sync_observation_revision_seq/i);
+    expect(sql).toMatch(/row_number\(\) OVER/i);
+    expect(sql).toMatch(/WHERE provider_version IS NOT NULL/i);
+    expect(sql).toMatch(/GRANT SELECT, INSERT ON observation_revision_ledger TO finance_sync_runtime/i);
+    expect(sql).toMatch(/GRANT USAGE, SELECT ON SEQUENCE finance_sync_observation_revision_seq TO finance_sync_runtime/i);
+    expect(sql).toMatch(/REVOKE UPDATE, DELETE ON observation_revision_ledger FROM finance_sync_runtime/i);
   });
 
   it("indexes exact delivered and uncertain Investec lifecycle identities", () => {

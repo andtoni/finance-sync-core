@@ -3,7 +3,7 @@ import postgres from 'postgres'
 import { resolve } from 'node:path'
 import { createRuntimeDependencies } from './runtime-deps'
 import { migrate } from './storage/migrate'
-import { currentStateToBridge } from './projection/bridge-client'
+import { bridgeOperationToWire, currentStateToBridge } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
@@ -206,6 +206,68 @@ suite('runtime dependencies with PostgreSQL', () => {
         SELECT state, last_error FROM projection_outbox
         WHERE deployment_id=${deploymentId} AND idempotency_key=${pending.payload.idempotencyKey}`
       expect(suppressed).toEqual({ state: 'suppressed', last_error: 'INVESTEC_LIFECYCLE_ALREADY_TERMINAL' })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('updates a delivered settlement as an ordinary posted successor when provider metadata changes', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const posted = { ...observation('revision-posted', {
+      transactionId: 'revision-posted', accountId: 'provider-account', amount: '-10', currency: 'ZAR',
+      transactionDate: '2026-07-17', date: '2026-07-17', postingDate: '2026-07-17', settlementDate: '2026-07-17',
+      description: 'SYNTHETIC REVISION MERCHANT', reference: 'revision-ref', type: 'DEBIT',
+      transactionType: 'CARDPURCHASES', direction: 'DEBIT', status: 'posted',
+    }), providerVersion: 'investec:txn:revision-posted' }
+    const card = { ...observation('revision-card', {
+      transactionId: 'revision-card', accountId: 'provider-account', amount: '-10', currency: 'ZAR',
+      transactionDate: '2026-07-17', originalAmount: '10', originalCurrency: 'ZAR', date: '2026-07-17',
+      authorizationDateTime: '2026-07-17T10:00:00.000Z', description: 'SYNTHETIC REVISION MERCHANT',
+      reference: 'revision-ref', type: 'DEBIT', transactionType: 'CARD', cardNumber: 'TEST-CARD-0011',
+      metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } },
+      direction: 'DEBIT', status: 'pending',
+    }), providerVersion: 'investec:card:revision-card' }
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    await deps.persistAndEnqueue(investecConnection, [posted], { skipCurrentState: true })
+    await deps.persistAndEnqueue(investecConnection, [card], { skipCurrentState: true })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_input, init) => {
+      const wire = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+      const successor = typeof wire.lifecycle_successor_id === 'string' ? wire.lifecycle_successor_id : null
+      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', 'activity_upsert', String(wire.resource_id), 'wealthfolio-account', successor === null ? '0' : '1', successor ?? '', 'accepted', '0', '']
+      return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner,
+        idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation: 'activity_upsert',
+        resourceId: wire.resource_id, lifecycleSuccessorId: successor, outcome: 'Accepted', bindingVersion: 3,
+        receiptBinding: binding(fields), semanticHash: null }), { status: 200 })
+    }) as typeof fetch
+    try {
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 3, failed: 0 })
+      const [terminal] = await sql<{ payload: BridgeDisclosureOperation }[]>`SELECT payload FROM projection_outbox WHERE deployment_id=${deploymentId} AND payload->>'lifecycleSuccessorId' IS NOT NULL AND state='delivered'`
+      await deps.persistAndEnqueue(investecConnection, [posted, card], { skipCurrentState: true })
+      const [unchanged] = await sql<{ payload: BridgeDisclosureOperation }[]>`SELECT payload FROM projection_outbox WHERE deployment_id=${deploymentId} AND payload->>'resourceId'=${terminal.payload.lifecycleSuccessorId!} AND payload->>'lifecycleSuccessorId' IS NULL ORDER BY created_at DESC LIMIT 1`
+      expect(unchanged.payload.activity).toEqual(terminal.payload.activity)
+      expect(unchanged.payload.observationRevision).toBe(terminal.payload.observationRevision)
+      expect(unchanged.payload.idempotencyKey).not.toBe(terminal.payload.idempotencyKey)
+      expect(typeof bridgeOperationToWire(unchanged.payload).observation_revision).toBe('number')
+      const revision = { ...posted, semanticHash: 'revision-posted-action-date', payload: {
+        ...posted.payload, metadata: { providerOwned: { investec: { actionDate: '2026-07-18' } } },
+      } }
+      await expect(deps.persistAndEnqueue(investecConnection, [revision], { skipCurrentState: true })).resolves.toBe(1)
+      const [ordinary] = await sql<{ payload: BridgeDisclosureOperation }[]>`SELECT payload FROM projection_outbox
+        WHERE deployment_id=${deploymentId} AND payload->>'resourceId' LIKE ${`${deploymentId}:${sourceId}:revision-posted`}
+          AND payload->>'lifecycleSuccessorId' IS NULL
+        ORDER BY created_at DESC LIMIT 1`
+      expect(ordinary.payload?.activity?.status).toBe('POSTED')
+      const metadata = ordinary.payload?.activity?.metadata as Record<string, any> | undefined
+      expect(metadata?.providerOwned?.investec?.actionDate).toBe('2026-07-18')
+      expect(ordinary.payload?.lifecycleSuccessorId).toBeUndefined()
+      expect(ordinary.payload?.resourceId).toBe(`${deploymentId}:${sourceId}:revision-posted`)
+      expect(ordinary.payload?.resourceId).not.toBe(`${deploymentId}:${sourceId}:revision-card`)
     } finally {
       globalThis.fetch = originalFetch
       await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
@@ -457,6 +519,21 @@ suite('runtime dependencies with PostgreSQL', () => {
       await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
     }
   })
+  it('encodes a real PostgreSQL bigint revision as numeric uncorrelated wire JSON without precision loss', async () => {
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    const item = observation('numeric-wire', { transactionId: 'numeric-wire', accountId: 'provider-account', amount: '5', currency: 'USD', date: '2026-09-14', status: 'posted' })
+    await deps.persistAndEnqueue(connection, [item], { skipCurrentState: true })
+    const [ledger] = await sql`SELECT observation_revision FROM observation_revision_ledger WHERE deployment_id=${deploymentId} AND provider_version=${item.providerVersion}`
+    expect(typeof ledger.observation_revision).toBe('string')
+    const [row] = await sql<{ payload: BridgeDisclosureOperation }[]>`SELECT payload FROM projection_outbox WHERE deployment_id=${deploymentId} AND payload->>'resourceId'=${`${deploymentId}:${sourceId}:numeric-wire`}`
+    expect(typeof row.payload.observationRevision).toBe('number')
+    const wire = JSON.parse(JSON.stringify(bridgeOperationToWire(row.payload)))
+    expect(wire.observation_revision).toBe(Number(ledger.observation_revision))
+    expect(Number.isSafeInteger(wire.observation_revision)).toBe(true)
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+  })
+
+
 })
 
 afterAll(async () => { await sql?.end() })

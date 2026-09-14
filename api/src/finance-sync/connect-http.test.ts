@@ -11,12 +11,14 @@ let admitted: Record<string, unknown>[]
 let quarantined: Record<string, unknown>[]
 let corrected: Record<string, unknown>[]
 let linked: Record<string, unknown>[]
+let recovered: Record<string, unknown>[]
 
 beforeEach(async () => {
   admitted = []
   quarantined = []
   corrected = []
   linked = []
+  recovered = []
   const connect = new FinanceSyncConnectControl({
     deploymentId: 'deployment-1',
     connections: [{
@@ -81,6 +83,13 @@ beforeEach(async () => {
         return result
       },
     },
+    investecTerminalRevisionRecovery: {
+      recover: async (rawSubject, request) => {
+        const result = { rawSubject, ...request, intentId: 'intent-1' }
+        recovered.push(result)
+        return result
+      },
+    },
     health: () => ({ status: 200, body: { ok: true } }),
   })
   server = createServer((request, response) => { void handler(request, response) })
@@ -97,6 +106,16 @@ function headers(extra: Record<string, string> = {}): Record<string, string> {
 }
 
 describe('Finance Sync internal Connect HTTP routes', () => {
+  it('dispatches the authenticated terminal revision recovery control with exact CAS fields', async () => {
+    const response = await fetch(`${base}/control/v1/investec/terminal-revision-recoveries`, {
+      method: 'POST', headers: { ...headers(), 'content-type': 'application/json' },
+      body: JSON.stringify({ outboxId: '00000000-0000-4000-8000-000000000001', expectedPayloadHash: 'a'.repeat(64), reason: 'reconcile terminal revision', apply: false }),
+    })
+    expect(response.status).toBe(200)
+    expect(recovered).toHaveLength(1)
+    expect(recovered[0]).toMatchObject({ rawSubject: subject, apply: false })
+  })
+
   it('authenticates the shared list and start routes with the dedicated bearer and subject headers', async () => {
     expect((await fetch(`${base}/control/v1/provider-connections`)).status).toBe(401)
     expect((await fetch(`${base}/control/v1/provider-connections`, { headers: { authorization: 'Bearer wrong', 'x-authenticated-subject': subject } })).status).toBe(401)

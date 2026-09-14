@@ -89,6 +89,8 @@ export interface ObservationOutput {
   readonly payload: Readonly<Record<string, unknown>>
   readonly rawPayload?: unknown
   readonly observedAt: string
+  /** Database-assigned durable ordering token, populated after persistence. */
+  readonly observationRevision?: number
 }
 
 export interface PlaidSyncResult {

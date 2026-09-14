@@ -127,7 +127,12 @@ function outboxSql(
           semanticHash: values[4],
           observedAt: values[8],
         })
+        return [{ observation_id: `observation-${storedRows.length}`, observation_revision: storedRows.length }]
       }
+    }
+    if (/INSERT\s+INTO\s+observation_revision_ledger/i.test(text)) return []
+    if (/SELECT\s+observation_revision\s+FROM\s+observation_revision_ledger/i.test(text)) {
+      return [{ observation_revision: 1 }]
     }
     if (/INSERT\s+INTO\s+projection_outbox/i.test(text)) {
       const payload = values.find(value => value !== null && typeof value === 'object' && 'kind' in value) as BridgeDisclosureOperation | undefined
@@ -144,6 +149,9 @@ function outboxSql(
       return match ? [{ state: 'delivered' }] : []
     }
     queries.push(text)
+    if (/SELECT\s+observation_revision\s+FROM\s+raw_observations/i.test(text)) {
+      return [{ observation_revision: 1 }]
+    }
     if (/FROM\s+raw_observations/i.test(text) && /provider_version/i.test(text) && /semantic_hash/i.test(text)) {
       if (/provider_version\s*=\s*\?/i.test(text)) {
         const counterpartId = values.at(-1)
@@ -851,15 +859,18 @@ describe('Investec card and poll lifecycle correlation', () => {
       domain: 'cash_ledger' as const, payload: inferredCardPayload,
     }
 
-    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [observation], { skipCurrentState: true })).resolves.toBe(0)
+    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [observation], { skipCurrentState: true })).resolves.toBe(1)
     const firstActivities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
     expect(firstActivities).toHaveLength(1)
-    expect(firstActivities[0].lifecycleSuccessorId).toBe(oldLifecycle.lifecycleSuccessorId)
-    expect(firstActivities.every(operation => operation.lifecycleSuccessorId !== undefined)).toBe(true)
+    expect(firstActivities[0].lifecycleSuccessorId).toBeUndefined()
+    expect(firstActivities[0].activity?.status).toBe('POSTED')
+    expect(firstActivities[0].resourceId).toBe(oldLifecycle.lifecycleSuccessorId)
+    expect(firstActivities[0].resourceId).not.toBe(oldLifecycle.resourceId)
 
-    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [observation], { skipCurrentState: true })).resolves.toBe(0)
+    await expect(deps.persistAndEnqueue(INVESTEC_CONNECTION, [observation], { skipCurrentState: true })).resolves.toBe(1)
     const allActivities = fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')
-    expect(allActivities.every(operation => operation.lifecycleSuccessorId !== undefined)).toBe(true)
+    expect(allActivities).toHaveLength(2)
+    expect(allActivities.every(operation => operation.lifecycleSuccessorId === undefined)).toBe(true)
   })
 
   it('does not use a terminal lifecycle from another owner or account', async () => {
@@ -910,7 +921,7 @@ describe('Investec card and poll lifecycle correlation', () => {
       providerVersion: inferredCardPayload.providerVersion, semanticHash: 'changed-merchant-v5-hash',
       hashSpecificationVersion: 5, observedAt: inferredCardPayload.observedAt,
       domain: 'cash_ledger', payload: { ...inferredCardPayload, description: 'CHANGED EVIDENCE' },
-    }], { skipCurrentState: true })).resolves.toBe(0)
+    }], { skipCurrentState: true })).resolves.toBe(1)
     expect(fixture.enqueued.filter(operation => operation.kind === 'ActivityUpsert')).toEqual([])
   })
 

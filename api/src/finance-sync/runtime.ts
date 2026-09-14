@@ -76,7 +76,16 @@ export interface ProviderRun {
   readonly transferAccounts?: Readonly<Record<string, string>>
 }
 export interface PersistEnqueueOptions { readonly skipCurrentState?: boolean }
+export interface TerminalRevisionResolver {
+  resolve(operation: import('./projection/bridge-client').BridgeDisclosureOperation): Promise<{
+    readonly lifecycleOperation: import('./projection/bridge-client').BridgeDisclosureOperation
+    readonly ordinaryOperation: import('./projection/bridge-client').BridgeDisclosureOperation
+    readonly boundReceipt: unknown
+  }>
+  deliver(operation: import('./projection/bridge-client').BridgeDisclosureOperation): Promise<unknown>
+}
 export interface SyncRuntimeDependencies {
+  readonly terminalRevisionResolver?: TerminalRevisionResolver
   loadConnections(deploymentId: string): Promise<readonly RuntimeConnection[]>
   loadCheckpoint(connection: RuntimeConnection): Promise<string | null>
   loadPlaidItemCheckpoint?(connection: Extract<RuntimeConnection, { provider: 'plaid' }>): Promise<string | null>

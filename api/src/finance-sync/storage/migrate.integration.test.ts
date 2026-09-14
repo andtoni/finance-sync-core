@@ -121,6 +121,45 @@ suite("PostgreSQL migrations (integration)", () => {
     });
   });
 
+  it("preserves populated raw observations while adding observation revisions", async () => {
+    const schemaName = `finance_sync_revision_upgrade_${process.pid}_${Date.now()}`;
+    await withSchema(schemaName, async tx => {
+      const migrations = await applyThroughEight(tx, schemaName);
+      for (const migration of migrations.filter(candidate => candidate.version > 8 && candidate.version <= 20)) {
+        await tx.unsafe(migration.sql);
+      }
+      const deploymentId = 'revision-upgrade-deployment';
+      const owner = 'urn:wealthfolio:test#revision-owner';
+      const principalId = '51000000-0000-4000-8000-000000000001';
+      const connectionId = '52000000-0000-4000-8000-000000000002';
+      const accountIncarnationId = '53000000-0000-4000-8000-000000000003';
+      const sourceId = '54000000-0000-4000-8000-000000000004';
+      await tx`INSERT INTO provider_principals (deployment_id,local_owner_id,provider,provider_principal_id,provider_subject_id)
+        VALUES (${deploymentId},${owner},'investec',${principalId}::uuid,'revision-subject')`;
+      await tx`INSERT INTO connection_incarnations (deployment_id,local_owner_id,connection_incarnation_id,provider_principal_id,provider_connection_id,incarnation)
+        VALUES (${deploymentId},${owner},${connectionId}::uuid,${principalId}::uuid,'revision-connection',1)`;
+      await tx`INSERT INTO account_incarnations (deployment_id,local_owner_id,account_incarnation_id,connection_incarnation_id,provider_account_id,incarnation)
+        VALUES (${deploymentId},${owner},${accountIncarnationId}::uuid,${connectionId}::uuid,'revision-account',1)`;
+      await tx`INSERT INTO resource_incarnations (deployment_id,local_owner_id,source_resource_incarnation_id,account_incarnation_id,resource_kind,provider_resource_id,incarnation)
+        VALUES (${deploymentId},${owner},${sourceId}::uuid,${accountIncarnationId}::uuid,'cash_ledger','revision-resource',1)`;
+      const payload = { transactionId: 'revision-fact', accountId: 'revision-account', amount: '-1', currency: 'ZAR' };
+      await tx`INSERT INTO raw_observations (deployment_id,local_owner_id,observation_id,source_resource_incarnation_id,provider_version,semantic_hash,hash_specification_version,payload,observed_at)
+        VALUES (${deploymentId},${owner},'55000000-0000-4000-8000-000000000005'::uuid,${sourceId}::uuid,'investec:txn:revision-fact',${'a'.repeat(64)},1,${tx.json(payload)},'2026-09-14T00:00:00Z')`;
+      const legacyPayload = { ...payload, transactionId: 'legacy-null-provider' };
+      await tx`INSERT INTO raw_observations (deployment_id,local_owner_id,observation_id,source_resource_incarnation_id,provider_version,semantic_hash,hash_specification_version,payload,observed_at)
+        VALUES (${deploymentId},${owner},'56000000-0000-4000-8000-000000000006'::uuid,${sourceId}::uuid,NULL,${'b'.repeat(64)},1,${tx.json(legacyPayload)},'2026-09-14T00:00:01Z')`;
+      await tx.unsafe(migrations.find(migration => migration.version === 21)!.sql);
+      const raw = await tx`SELECT payload, observation_id, provider_version FROM raw_observations WHERE deployment_id=${deploymentId} ORDER BY observation_id`;
+      const revisions = await tx`SELECT observation_revision FROM observation_revision_ledger WHERE deployment_id=${deploymentId}`;
+      expect(raw).toHaveLength(2);
+      expect(raw[0].payload).toEqual(payload);
+      expect(raw[1].payload).toEqual(legacyPayload);
+      expect(raw[1].provider_version).toBeNull();
+      expect(revisions).toHaveLength(1);
+      expect(Number(revisions[0].observation_revision)).toBeGreaterThan(0);
+    });
+  });
+
   it("fails closed when a legacy runtime row has no matching provider connection", async () => {
     const schemaName = `finance_sync_unmatched_${process.pid}_${Date.now()}`;
     await expect(withSchema(schemaName, async tx => {
@@ -136,7 +175,12 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql!, directory);
     await migrate(sql!, directory);
     const rows = await sql!`select version from finance_sync_schema_migrations order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+    const revisionLedger = await sql!`
+      select table_name from information_schema.tables
+      where table_name = 'observation_revision_ledger'
+    `;
+    expect(revisionLedger).toHaveLength(1);
     const rawColumns = await sql!`
       select column_name from information_schema.columns
       where table_name = 'raw_observations' and column_name = 'raw_payload'

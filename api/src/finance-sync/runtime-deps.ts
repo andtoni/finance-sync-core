@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import type { FinanceSyncSql } from './storage/pg'
+import { observationRevisionNumber, type FinanceSyncSql } from './storage/pg'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import { investecPrimeSaverSupersessionKey } from './probes/investec/investec-adapter'
 import {
@@ -28,6 +28,8 @@ import {
   fixtureModeEnabled,
   FIXTURE_OWNER_SUBJECT,
 } from './fixture-runtime'
+
+type ProjectionConnection = Pick<RuntimeConnection, 'provider' | 'localOwnerId' | 'sourceResourceIncarnationId' | 'accountIds' | 'connectionId'>
 
 const MAX_PROJECTION_DELIVERY_ATTEMPTS = 3
 const MAX_PROJECTION_BATCH = 25
@@ -282,7 +284,7 @@ function primeSaverWeakRawPayload(value: unknown): boolean {
 async function primeSaverDuplicateRows(
   sql: FinanceSyncSql,
   deploymentId: string,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   payload: Readonly<Record<string, unknown>>,
 ): Promise<readonly PrimeSaverDuplicateRow[]> {
   const accountId = typeof payload.accountId === 'string' ? payload.accountId : undefined
@@ -342,7 +344,7 @@ function primeSaverStrongIdentityIds(
 async function primeSaverWeakObservationAlreadyCanonical(
   sql: FinanceSyncSql,
   deploymentId: string,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   observation: ObservationOutput,
 ): Promise<boolean> {
   const payload = observationPayload(observation.payload)
@@ -371,7 +373,7 @@ async function primeSaverWeakObservationAlreadyCanonical(
 async function investecSupersededResourceIds(
   sql: FinanceSyncSql,
   deploymentId: string,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   observation: ObservationOutput,
 ): Promise<readonly string[]> {
   if (connection.provider !== 'investec') return []
@@ -450,6 +452,7 @@ interface InvestecCounterpart {
   readonly payload: Readonly<Record<string, unknown>>
   readonly providerVersion: string
   readonly semanticHash: string
+  readonly hashSpecificationVersion: number
   readonly observedAt: string
   readonly provenance: 'provider-explicit' | 'provider-facts-exact' | 'operator-authorized'
 }
@@ -464,6 +467,7 @@ interface InvestecCounterpartRow {
   readonly payload: unknown
   readonly provider_version: string
   readonly semantic_hash: string
+  readonly hash_specification_version: number
   readonly observed_at: string
 }
 
@@ -704,7 +708,8 @@ function exactProviderFactPair(card: Readonly<Record<string, unknown>>, settled:
 function counterpartFromRow(row: InvestecCounterpartRow): InvestecCounterpart | undefined {
   const payload = recordPayload(row.payload)
   if (!payload || !transactionId(payload) || !row.semantic_hash || !row.observed_at) return undefined
-  return { payload, providerVersion: row.provider_version, semanticHash: row.semantic_hash, observedAt: row.observed_at, provenance: 'provider-explicit' }
+  return { payload, providerVersion: row.provider_version, semanticHash: row.semantic_hash,
+    hashSpecificationVersion: row.hash_specification_version, observedAt: row.observed_at, provenance: 'provider-explicit' }
 }
 
 function providerLifecycleTransactionIds(payload: Readonly<Record<string, unknown>>): readonly string[] {
@@ -736,7 +741,7 @@ interface InvestecLifecycleOverrideRow {
 async function findManualInvestecLifecycleCounterpart(
   sql: FinanceSyncSql,
   deploymentId: string,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   payload: Readonly<Record<string, unknown>>,
   isCard: boolean,
   currentTransactionId: string,
@@ -766,7 +771,7 @@ async function findManualInvestecLifecycleCounterpart(
         AND provider_version = ${counterpartProviderVersion}
       ORDER BY provider_version, recorded_at DESC, observed_at DESC, observation_id DESC
     )
-    SELECT payload, provider_version, semantic_hash, observed_at
+    SELECT payload, provider_version, semantic_hash, hash_specification_version, observed_at
     FROM latest
     WHERE payload->>'transactionId' = ${counterpartTransactionId}
       AND payload->>'isRemoved' IS DISTINCT FROM 'true'
@@ -798,7 +803,7 @@ async function findManualInvestecLifecycleCounterpart(
 async function findInvestecCounterpart(
   sql: FinanceSyncSql,
   deploymentId: string,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   observation: ObservationOutput,
 ): Promise<InvestecCounterpartMatch | undefined> {
   if (connection.provider !== 'investec' || observation.payload.isRemoved === true) return undefined
@@ -836,7 +841,7 @@ async function findInvestecCounterpart(
           AND payload->>'accountId' = ${accountId}
         ORDER BY payload->>'transactionId', recorded_at DESC, observed_at DESC, observation_id DESC
       )
-      SELECT payload, provider_version, semantic_hash, observed_at
+      SELECT payload, provider_version, semantic_hash, hash_specification_version, observed_at
       FROM latest
       WHERE payload->>'isRemoved' IS DISTINCT FROM 'true'
         AND (payload->>'transactionId' = ${linkedTransactionId ?? ''}
@@ -884,7 +889,7 @@ async function findInvestecCounterpart(
         AND (provider_version LIKE 'investec:card:%' OR provider_version LIKE 'investec:txn:%')
       ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
     )
-    SELECT payload, provider_version, semantic_hash, observed_at
+    SELECT payload, provider_version, semantic_hash, hash_specification_version, observed_at
     FROM latest
     WHERE (payload->>'transactionDate')::date BETWEEN
         (${providerDate}::date - INTERVAL '3 days')::date
@@ -1038,9 +1043,29 @@ function correlatedInvestecPayload(
 
 type InvestecLifecycleDisposition = 'none' | 'delivered' | 'uncertain'
 
+async function investecObservationRevision(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  localOwnerId: string,
+  sourceResourceIncarnationId: string,
+  observation: Pick<InvestecCounterpart, 'providerVersion' | 'semanticHash' | 'hashSpecificationVersion'>,
+): Promise<number | undefined> {
+  const rows = await sql<{ observation_revision: string | number }[]>`
+    SELECT observation_revision FROM observation_revision_ledger
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${localOwnerId}
+      AND source_resource_incarnation_id = ${sourceResourceIncarnationId}::uuid
+      AND provider_version = ${observation.providerVersion}
+      AND semantic_hash = ${observation.semanticHash}
+      AND hash_specification_version = ${observation.hashSpecificationVersion}
+    LIMIT 1
+  `
+  return rows[0] ? observationRevisionNumber(rows[0].observation_revision) : undefined
+}
+
 async function investecLifecycleDisposition(
   sql: FinanceSyncSql,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   operation: BridgeDisclosureOperation,
   expectedSuccessor?: string,
 ): Promise<InvestecLifecycleDisposition> {
@@ -1071,7 +1096,7 @@ async function investecLifecycleDisposition(
 async function investecProjectionOperations(
   sql: FinanceSyncSql,
   deploymentId: string,
-  connection: RuntimeConnection,
+  connection: ProjectionConnection,
   observation: ObservationOutput,
   accessGeneration: number,
   accountId: string,
@@ -1118,10 +1143,18 @@ async function investecProjectionOperations(
     String(settled.settlementDate ?? ''),
     canonicalJson(correlated),
   ].join('\\x00'), 'utf8').digest('hex')
+  const counterpartRevision = await investecObservationRevision(
+    sql, deploymentId, connection.localOwnerId, connection.sourceResourceIncarnationId, counterpart,
+  )
+  // The correlated card payload contains both canonical provider facts. Its
+  // revision must dominate either fact, so a late re-observation cannot move
+  // metadata backwards when the other leg was revised more recently.
+  const postedRevision = Math.max(observation.observationRevision ?? 0, counterpartRevision ?? 0) || undefined
   const lifecycleObservation: ObservationOutput = {
     ...observation,
     semanticHash: lifecycleSemanticHash,
     payload: correlated,
+    observationRevision: postedRevision,
   }
   const lifecycle = providerObservationToBridge(connection.provider, lifecycleObservation, accessGeneration, accountId, connectionId)
   if (!lifecycle) return []
@@ -1143,6 +1176,19 @@ async function investecProjectionOperations(
       observedAt: counterpart.observedAt,
     }
   const lifecycleDisposition = await investecLifecycleDisposition(sql, connection, lifecycle, lifecycle.lifecycleSuccessorId)
+  if (lifecycleDisposition === 'uncertain') return []
+  if (lifecycleDisposition === 'delivered') {
+    // The settlement is already terminal in Wealthfolio. A provider metadata
+    // revision must update that posted resource as an ordinary upsert: replaying
+    // the lifecycle would require a predecessor that the receiver has already
+    // consumed, and would dead-letter the whole activity batch.
+    const revisionKey = createHash('sha256').update([
+      'investec-card-posted-revision-v1', lifecycle.idempotencyKey,
+    ].join('\\x00'), 'utf8').digest('hex')
+    const { lifecycleSuccessorId, ...ordinaryLifecycle } = lifecycle
+    if (lifecycleSuccessorId === undefined) return []
+    return [{ ...ordinaryLifecycle, resourceId: lifecycleSuccessorId, idempotencyKey: revisionKey }]
+  }
   const pending = lifecycleDisposition === 'none'
     ? providerObservationToBridge(connection.provider, pendingObservation, accessGeneration, accountId, connectionId)
     : undefined
@@ -1409,8 +1455,43 @@ export function createRuntimeDependencies(
         ON CONFLICT DO NOTHING
         RETURNING observation_id
       `
+      const existingRevision = await tx<{ observation_revision: number }[]>`
+        SELECT observation_revision FROM observation_revision_ledger
+        WHERE deployment_id = ${enriched.deploymentId}
+          AND local_owner_id = ${enriched.localOwnerId}
+          AND source_resource_incarnation_id = ${enriched.sourceResourceIncarnationId}::uuid
+          AND provider_version = ${enriched.providerVersion}
+          AND semantic_hash = ${enriched.semanticHash}
+          AND hash_specification_version = ${enriched.hashSpecificationVersion}
+        LIMIT 1
+      `
+      if (existingRevision.length === 0) {
+        await tx`
+          INSERT INTO observation_revision_ledger (
+            deployment_id, local_owner_id, source_resource_incarnation_id,
+            provider_version, semantic_hash, hash_specification_version, observation_revision
+          ) VALUES (
+            ${enriched.deploymentId}, ${enriched.localOwnerId}, ${enriched.sourceResourceIncarnationId}::uuid,
+            ${enriched.providerVersion}, ${enriched.semanticHash}, ${enriched.hashSpecificationVersion},
+            nextval('finance_sync_observation_revision_seq')
+          ) ON CONFLICT DO NOTHING
+        `
+      }
       insertedCount += inserted.length
-      enrichedObservations.push({ observation: enriched, wealthfolioAccountId })
+      const revisionRows = await tx<{ observation_revision: string | number }[]>`
+        SELECT observation_revision FROM observation_revision_ledger
+        WHERE deployment_id = ${enriched.deploymentId}
+          AND local_owner_id = ${enriched.localOwnerId}
+          AND source_resource_incarnation_id = ${enriched.sourceResourceIncarnationId}::uuid
+          AND provider_version = ${enriched.providerVersion}
+          AND semantic_hash = ${enriched.semanticHash}
+          AND hash_specification_version = ${enriched.hashSpecificationVersion}
+        LIMIT 1
+      `
+      const revision = revisionRows[0] ? observationRevisionNumber(revisionRows[0].observation_revision) : undefined
+      if (revision !== undefined) {
+        enrichedObservations.push({ observation: { ...enriched, observationRevision: revision }, wealthfolioAccountId })
+      }
     }
 
     // Derive projections only after the whole batch is visible in the raw
@@ -1491,7 +1572,102 @@ export function createRuntimeDependencies(
     return insertedCount
   }
 
+  const terminalRevisionResolver = bridgeUrl && bridgeReceiptUrl && bridgeToken ? {
+    resolve: async (operation: BridgeDisclosureOperation) => {
+      const successor = operation.lifecycleSuccessorId
+      if (operation.kind !== 'ActivityUpsert' || !successor) throw new Error('terminal recovery requires a lifecycle activity')
+      const retained = await sql<{ lifecycle_operation: BridgeDisclosureOperation; connection_id: string; source_resource_incarnation_id: string; provider_account_id: string }[]>`
+        SELECT l1.payload AS lifecycle_operation, selected.connection_id, dpa.source_resource_incarnation_id, dpa.provider_account_id
+        FROM projection_outbox selected
+        JOIN provider_connections pc ON pc.deployment_id=selected.deployment_id AND pc.local_owner_id=selected.local_owner_id
+        JOIN discovered_provider_accounts dpa ON dpa.deployment_id=pc.deployment_id AND dpa.local_owner_id=pc.local_owner_id AND dpa.connection_id=pc.connection_id
+          AND selected.connection_id=pc.connection_id::text || ':' || dpa.provider_account_id
+        JOIN provider_account_admissions paa ON paa.deployment_id=dpa.deployment_id AND paa.local_owner_id=dpa.local_owner_id
+          AND paa.connection_id=dpa.connection_id AND paa.provider_account_id=dpa.provider_account_id
+        JOIN projection_outbox l1 ON l1.deployment_id=selected.deployment_id AND l1.local_owner_id=selected.local_owner_id
+          AND l1.connection_id=selected.connection_id AND l1.provider_generation=selected.provider_generation
+        WHERE selected.deployment_id=${deploymentId} AND selected.local_owner_id=${operation.subject}
+          AND selected.payload=${sql.json(operation as never)} AND selected.idempotency_key=${operation.idempotencyKey}
+          AND selected.state='dead_letter' AND pc.provider='investec' AND pc.state='active' AND pc.disabled_at IS NULL
+          AND pc.provider_generation=selected.provider_generation AND dpa.discovery_generation=pc.provider_generation
+          AND paa.provider_generation=pc.provider_generation AND paa.baseline_state='verified' AND paa.revoked_at IS NULL
+          AND paa.wealthfolio_account_id=${operation.accountId} AND paa.receiver_access_generation=${operation.accessGeneration}
+          AND l1.state='delivered' AND l1.created_at < selected.created_at
+          AND l1.payload->>'kind'='ActivityUpsert' AND l1.payload->>'deploymentId'=${deploymentId}
+          AND l1.payload->>'subject'=${operation.subject} AND l1.payload->>'accountId'=${operation.accountId}
+          AND l1.payload->>'resourceId'=${operation.resourceId} AND l1.payload->>'lifecycleSuccessorId'=${successor}
+          AND l1.idempotency_key<>${operation.idempotencyKey} AND l1.payload->>'idempotencyKey'=l1.idempotency_key
+        ORDER BY l1.created_at DESC, l1.id DESC LIMIT 1
+      `
+      const evidence = retained[0]
+      if (!evidence) throw new Error('retained delivered lifecycle evidence is missing or outside recovery scope')
+      const sourcePrefix = `${deploymentId}:${evidence.source_resource_incarnation_id}:`
+      if (operation.deploymentId !== deploymentId || !operation.resourceId.startsWith(sourcePrefix) || !successor.startsWith(sourcePrefix)) throw new Error('recovery incarnation scope mismatch')
+      const lifecycleOperation = evidence.lifecycle_operation
+      const receiptBase = bridgeReceiptUrl!.toString().replace(/\/+$/, '')
+      const response = await fetch(`${receiptBase}/${encodeURIComponent(lifecycleOperation.subject)}/${encodeURIComponent(lifecycleOperation.idempotencyKey)}`, {
+        method: 'GET', redirect: 'error', headers: { authorization: `Bearer ${bridgeToken}` },
+        signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
+      })
+      if (response.status === 404) throw new Error('bound lifecycle receipt is missing')
+      if (!response.ok) throw new Error('bound lifecycle receipt lookup failed')
+      const boundReceipt = await response.json()
+      validateBridgeReceipt(lifecycleOperation, boundReceipt)
+
+      // L2 is only the failed-row CAS target. Derive S from the latest retained
+      // canonical facts, not L2's obsolete metadata or observation revision.
+      const ordinary = await sql.begin('isolation level repeatable read read only', async transaction => {
+        const tx = transaction as unknown as FinanceSyncSql
+        const [latest] = await tx<InvestecPostedCardLifecycleRow[]>`
+          SELECT payload,raw_payload,provider_version,semantic_hash,hash_specification_version,observed_at
+          FROM raw_observations WHERE deployment_id=${deploymentId} AND local_owner_id=${operation.subject}
+            AND source_resource_incarnation_id=${evidence.source_resource_incarnation_id}::uuid
+            AND provider_version LIKE 'investec:txn:%' AND payload->>'transactionId'=${successor.slice(sourcePrefix.length)}
+          ORDER BY recorded_at DESC,observation_id DESC LIMIT 1
+        `
+        const payload = latest && recordPayload(latest.payload)
+        if (!latest || !payload || payload.accountId !== evidence.provider_account_id || payload.status !== 'posted' || payload.isRemoved === true) throw new Error('latest canonical settlement is missing or outside recovery scope')
+        const observation: ObservationOutput = {
+          deploymentId, localOwnerId: operation.subject, sourceResourceIncarnationId: evidence.source_resource_incarnation_id,
+          providerVersion: latest.provider_version, semanticHash: latest.semantic_hash, hashSpecificationVersion: latest.hash_specification_version,
+          observedAt: latest.observed_at, domain: 'cash_ledger', payload,
+        }
+        if (await observationIsQuarantined(tx, deploymentId, operation.subject, observation)) throw new Error('latest canonical settlement is quarantined')
+        const connection: ProjectionConnection = { provider: 'investec', localOwnerId: operation.subject,
+          sourceResourceIncarnationId: evidence.source_resource_incarnation_id, accountIds: [evidence.provider_account_id], connectionId: evidence.connection_id }
+        const counterpart = await findInvestecCounterpart(tx, deploymentId, connection, observation)
+        if (!counterpart || 'ambiguous' in counterpart || transactionId(counterpart.payload) !== operation.resourceId.slice(sourcePrefix.length)) throw new Error('latest canonical lifecycle pair is outside recovery scope')
+        if (await investecObservationRevision(tx, deploymentId, operation.subject, evidence.source_resource_incarnation_id, counterpart) === undefined) throw new Error('latest canonical card revision is missing')
+        const observationRevision = await investecObservationRevision(tx, deploymentId, operation.subject, evidence.source_resource_incarnation_id, observation)
+        if (observationRevision === undefined) throw new Error('latest canonical revision is missing')
+        const operations = await investecProjectionOperations(tx, deploymentId, connection, { ...observation, observationRevision }, operation.accessGeneration, operation.accountId, evidence.connection_id)
+        const ordinary = operations[0]
+        if (operations.length !== 1 || ordinary.kind !== 'ActivityUpsert' || ordinary.resourceId !== successor || ordinary.lifecycleSuccessorId !== undefined || ordinary.activity?.status !== 'POSTED') throw new Error('latest canonical successor cannot be recovered')
+        return ordinary
+      })
+      return { lifecycleOperation, ordinaryOperation: ordinary, boundReceipt }
+    },
+    deliver: async (operation: BridgeDisclosureOperation, beforePost?: () => Promise<void>) => {
+      const receiptBase = bridgeReceiptUrl!.toString().replace(/\/+$/, '')
+      const existing = await fetch(`${receiptBase}/${encodeURIComponent(operation.subject)}/${encodeURIComponent(operation.idempotencyKey)}`, {
+        method: 'GET', redirect: 'error', headers: { authorization: `Bearer ${bridgeToken}` },
+        signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
+      })
+      if (existing.ok) return existing.json()
+      if (existing.status !== 404) throw new Error('terminal recovery ordinary receipt lookup failed')
+      await beforePost?.()
+      const response = await fetch(bridgeUrl!, {
+        method: 'POST', redirect: 'error', signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${bridgeToken}`, 'idempotency-key': operation.idempotencyKey },
+        body: JSON.stringify(bridgeOperationToWire(operation)),
+      })
+      if (!response.ok) throw new Error('terminal recovery bridge delivery failed')
+      return response.json()
+    },
+  } : undefined
+
   return {
+    terminalRevisionResolver,
     loadConnections: async () => {
       if (fixtureRuntime) {
         await ensureFixtureAuthority(sql, deploymentId)

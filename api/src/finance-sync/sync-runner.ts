@@ -23,6 +23,7 @@ import { replayQuarantinedInvestecCards, reprojectRetainedInvestecCards, startIn
 import { createObservationQuarantineControl } from './observation-quarantine'
 import { createInvestecCardCurrencyCorrectionControl } from './investec-card-correction'
 import { createInvestecCardLifecycleLinkControl } from './investec-card-lifecycle-link'
+import { createInvestecTerminalRevisionRecoveryControl } from './investec-terminal-revision-recovery'
 import type { DrainerHandle } from '../drain/drainer'
 
 interface CliArgs { help?: boolean; once?: boolean }
@@ -172,6 +173,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     await sweepInvestecCardLifecycles()
     if (args.once) { if (!databaseReady || cycleFailed || (connectionCount > 0 && !cycleReady)) process.exitCode = 1; return }
     const lifecycleLinkEnabled = process.env.FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_LINK_ENABLED === 'true'
+    const terminalRecoveryEnabled = process.env.FINANCE_SYNC_INVESTEC_TERMINAL_REVISION_RECOVERY_ENABLED === 'true'
     const handler = createFinanceSyncHttpHandler({
       controlToken: config.controlToken,
       providersEnabled: config.providersEnabled,
@@ -180,6 +182,9 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       investecCardCorrection: deps ? createInvestecCardCurrencyCorrectionControl(sql, config.deploymentId, deps) : undefined,
       investecCardLifecycleLink: deps && lifecycleLinkEnabled
         ? createInvestecCardLifecycleLinkControl(sql, config.deploymentId, deps)
+        : undefined,
+      investecTerminalRevisionRecovery: terminalRecoveryEnabled && deps?.terminalRevisionResolver
+        ? createInvestecTerminalRevisionRecoveryControl(sql, config.deploymentId, deps.terminalRevisionResolver)
         : undefined,
       health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount, cycleFailed); return { status: body.ok ? 200 : 503, body } },
     })

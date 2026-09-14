@@ -1,3 +1,4 @@
+import { observationRevisionNumber } from '../storage/pg'
 
 import { createHash } from 'node:crypto'
 import { currentStateSemanticHash, type CurrentStatePayload } from './current-state'
@@ -66,6 +67,7 @@ export interface BridgeDisclosureOperation {
   readonly lifecycleSuccessorId?: string
   /** Provider identity corrections that must be atomically merged into this resource. */
   readonly supersededResourceIds?: readonly string[]
+  readonly observationRevision?: number
 }
 
 export interface BridgeReceipt {
@@ -202,6 +204,7 @@ export function bridgeOperationToWire(operation: BridgeDisclosureOperation): Rec
     ...(operation.supersededResourceIds === undefined || operation.supersededResourceIds.length === 0
       ? {}
       : { superseded_resource_ids: [...operation.supersededResourceIds].sort() }),
+    ...(operation.observationRevision === undefined ? {} : { observation_revision: observationRevisionNumber(operation.observationRevision) }),
   }
 }
 
@@ -299,6 +302,7 @@ export function cashObservationToBridge(
     readonly payload: Readonly<Record<string, unknown>>
     readonly observedAt: string
     readonly supersededResourceIds?: readonly string[]
+    readonly observationRevision?: number
   },
   accessGeneration: number,
   accountId: string,
@@ -327,6 +331,7 @@ export function cashObservationToBridge(
       // becomes part of the native activity payload.
       'merchant-notes-v1',
       'activity-date-precision-v1',
+      ...(observation.observationRevision === undefined ? [] : ['observation-revision-v1', String(observation.observationRevision)]),
       ...(observation.supersededResourceIds ?? []).slice().sort(),
     ]),
     subject,
@@ -334,6 +339,7 @@ export function cashObservationToBridge(
     ...(observation.supersededResourceIds === undefined || observation.supersededResourceIds.length === 0
       ? {}
       : { supersededResourceIds: [...observation.supersededResourceIds].sort() }),
+    ...(observation.observationRevision === undefined ? {} : { observationRevision: observation.observationRevision }),
   }
   if (p.isRemoved === true) {
     return { ...common, kind: 'ActivityDelete', resourceId }

@@ -259,3 +259,13 @@ describe('Bridge client', () => {
     expect(receipts).toHaveLength(2)
   })
 })
+
+
+describe('observation revision numeric wire range', () => {
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN])('rejects unsafe revision %s', observationRevision => {
+    expect(() => bridgeOperationToWire(baseOperation({ observationRevision }))).toThrow(/observation revision/)
+  })
+  it('accepts the largest exact JSON integer', () => {
+    expect(bridgeOperationToWire(baseOperation({ observationRevision: Number.MAX_SAFE_INTEGER })).observation_revision).toBe(Number.MAX_SAFE_INTEGER)
+  })
+})
