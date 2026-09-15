@@ -241,7 +241,7 @@ export class FinanceSyncConnectControl {
     return connections.some(connection => connection.provider === selected)
   }
 
-  private async plaidItemConnection(rawSubject: string): Promise<PlaidRuntimeConnection> {
+  private async plaidItemConnection(rawSubject: string, selectedConnectionId?: string): Promise<PlaidRuntimeConnection> {
     const items = new Map<string, PlaidRuntimeConnection>()
     for (const connection of await this.subjectConnections(rawSubject)) {
       if (connection.provider !== 'plaid' || !connection.providerConnectionId) continue
@@ -253,6 +253,14 @@ export class FinanceSyncConnectControl {
         throw new ConnectControlError(409, 'Plaid connection credentials are inconsistent')
       }
       items.set(connection.providerConnectionId, connection)
+    }
+    // A re-authentication must target one exact Item: a multi-Item install cannot
+    // be re-authenticated through an unqualified request, and picking one
+    // implicitly could re-authorize the wrong bank connection.
+    if (selectedConnectionId !== undefined) {
+      const selected = items.get(selectedConnectionId)
+      if (!selected) throw new ConnectControlError(404, 'provider connection not found')
+      return selected
     }
     if (items.size === 0) throw new ConnectControlError(409, 'provider is not configured')
     if (items.size > 1) throw new ConnectControlError(409, 'multiple Plaid connections require selecting one')
@@ -383,11 +391,11 @@ export class FinanceSyncConnectControl {
     }
   }
 
-  async startPlaidUpdate(rawSubject: string): Promise<Record<string, string>> {
+  async startPlaidUpdate(rawSubject: string, selectedConnectionId?: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
     const plaid = this.deps.plaid
     if (!plaid?.createUpdateLinkToken) throw new ConnectControlError(503, 'provider update is unavailable')
-    const connection = await this.plaidItemConnection(boundSubject)
+    const connection = await this.plaidItemConnection(boundSubject, selectedConnectionId)
     const providerConnectionId = connection.providerConnectionId
     if (!providerConnectionId) throw new ConnectControlError(409, 'provider connection identity is unavailable')
     const continuationToken = await this.deps.sessionStore.create({

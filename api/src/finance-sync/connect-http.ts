@@ -22,6 +22,19 @@ function send(response: ServerResponse, status: number, body: unknown): void {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }).end(JSON.stringify(body))
 }
 
+/** Reads an optional JSON body; an absent or empty body yields undefined. */
+async function optionalJsonBody(request: IncomingMessage): Promise<Record<string, unknown> | undefined> {
+  const chunks: Buffer[] = []
+  for await (const chunk of request) chunks.push(Buffer.from(chunk as Buffer))
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (!raw) return undefined
+  try {
+    const value = JSON.parse(raw)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid')
+    return value as Record<string, unknown>
+  } catch { throw new ConnectControlError(400, 'invalid request body') }
+}
+
 async function jsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
   if (request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
     throw new ConnectControlError(415, 'JSON content type is required')
@@ -206,7 +219,17 @@ export function createFinanceSyncHttpHandler(input: {
         return send(response, 200, await connect.disconnect(rawSubject, decodeURIComponent(disconnect[1]), decodeURIComponent(disconnect[2])))
       }
       if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/update') {
-        return send(response, 200, await connect.startPlaidUpdate(rawSubject))
+        // Optional exact Item selection for multi-Item installs. The body is
+        // optional so the existing unqualified caller keeps working.
+        const body = await optionalJsonBody(request)
+        const selectedConnectionId = body?.connectionId
+        // A Plaid Item id is an opaque provider identifier, not a UUID.
+        if (selectedConnectionId !== undefined
+          && (typeof selectedConnectionId !== 'string' || selectedConnectionId.length === 0
+            || selectedConnectionId.length > 512 || /[\u0000-\u001f\u007f]/.test(selectedConnectionId))) {
+          throw new ConnectControlError(400, 'invalid provider connection selection')
+        }
+        return send(response, 200, await connect.startPlaidUpdate(rawSubject, selectedConnectionId))
       }
       const start = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/start$/)
       if (request.method === 'POST' && start) {

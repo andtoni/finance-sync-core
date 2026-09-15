@@ -245,6 +245,24 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(forgedReason.status).toBe(400)
   })
 
+  it('targets one exact Plaid Item for re-authentication and fails closed on an unknown selection', async () => {
+    const selected = await fetch(`${base}/control/v1/provider-connections/plaid/update`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ connectionId: 'item-1' }),
+    })
+    expect(selected.status).toBe(200)
+    expect(await selected.json()).toMatchObject({ provider: 'plaid', status: 'link_ready', linkToken: 'update-link-token' })
+
+    const unknown = await fetch(`${base}/control/v1/provider-connections/plaid/update`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ connectionId: 'item-unknown' }),
+    })
+    expect(unknown.status).toBe(404)
+
+    const malformed = await fetch(`${base}/control/v1/provider-connections/plaid/update`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ connectionId: '' }),
+    })
+    expect(malformed.status).toBe(400)
+  })
+
   it('does not expose lifecycle linking when the runtime feature is disabled', async () => {
     const disabledHandler = createFinanceSyncHttpHandler({
       controlToken,
