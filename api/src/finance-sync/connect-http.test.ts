@@ -131,6 +131,8 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(update.status).toBe(200)
     expect(await update.json()).toMatchObject({ provider: 'plaid', status: 'link_ready', message: 'Plaid Link is ready to add accounts.', linkToken: 'update-link-token', continuationToken: 'continuation-token' })
 
+    // The completion must resolve the session's exact Item, not re-guess among
+    // several Items, so it is exercised against the multi-Item ambiguity below.
     const updateComplete = await fetch(`${base}/control/v1/provider-connections/plaid/update/complete`, {
       method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ continuationToken: 'continuation-token' }),
     })

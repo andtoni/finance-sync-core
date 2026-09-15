@@ -428,7 +428,9 @@ export class FinanceSyncConnectControl {
     }
     const release = async () => { try { await this.deps.sessionStore.release({ deploymentId: this.deps.deploymentId, subject: boundSubject, provider: 'plaid', token: continuationToken, claimVersion: session.claimVersion }) } catch { /* expiry recovers the lease if PostgreSQL is temporarily unavailable */ } }
     try {
-      const connection = await this.plaidItemConnection(boundSubject)
+      // The consumed session already binds the exact Item, so the completion
+      // must resolve that Item rather than re-guess among the subject's Items.
+      const connection = await this.plaidItemConnection(boundSubject, session.providerConnectionId)
       if (connection.providerConnectionId !== session.providerConnectionId || connection.secretReference !== session.secretReference
         || connection.providerGeneration !== session.providerGeneration) {
         throw new ConnectControlError(409, 'Plaid connection changed during the update')
