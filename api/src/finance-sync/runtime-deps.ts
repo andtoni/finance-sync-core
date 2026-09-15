@@ -2015,9 +2015,12 @@ export function createRuntimeDependencies(
             })
           } catch {
             if (await recoverReceipt()) continue
+            // The commit may have landed: keep the row uncertain for the bound
+            // receipt lookup, but do not spend its terminal budget on an
+            // unreachable receiver.
             await tx`
               UPDATE projection_outbox
-              SET attempts = attempts + 1, last_error = 'BRIDGE_RESPONSE_UNCERTAIN', state = 'uncertain'
+              SET last_error = 'BRIDGE_RESPONSE_UNCERTAIN', state = 'uncertain'
               WHERE id = ${row.id}::uuid
                 AND provider_generation = ${connection.providerGeneration}
             `
@@ -2026,6 +2029,20 @@ export function createRuntimeDependencies(
           }
 
           if (!response.ok) {
+            // 5xx and 429 mean the receiver could not serve the request right
+            // now (an unwritable database, a restart, a rate limit). That is
+            // transient, so the row stays queued and does not consume the
+            // terminal-attempt budget: a receiver outage must never turn into
+            // dead letters that an operator has to resolve by hand.
+            if (response.status >= 500 || response.status === 429) {
+              await tx`
+                UPDATE projection_outbox SET last_error = 'BRIDGE_UNAVAILABLE'
+                WHERE id = ${row.id}::uuid
+                  AND provider_generation = ${connection.providerGeneration}
+              `
+              deliveryFailures++
+              continue
+            }
             const nextAttempts = row.attempts + 1
             if (nextAttempts >= MAX_PROJECTION_DELIVERY_ATTEMPTS) {
               await tx`

@@ -1641,6 +1641,26 @@ describe('projectPending transaction and receipt contract', () => {
     }
   })
 
+  it('keeps a row queued, not dead-lettered, while the receiver is unavailable', async () => {
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000021', payload: operation, attempts: 2 })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response('{"error":"service unavailable"}', { status: 503 })) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env())
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('pending')
+      // The row keeps its place without spending the terminal budget: the
+      // update records availability only and never dead-letters.
+      const updates = fixture.queries.filter(query => /UPDATE\s+projection_outbox/i.test(query))
+      expect(updates.some(query => query.includes('BRIDGE_UNAVAILABLE'))).toBe(true)
+      expect(updates.every(query => !query.includes('dead_letter'))).toBe(true)
+      await expect(deps.projectPending(CONNECTION)).resolves.toEqual({ delivered: 0, failed: 1 })
+      expect(fixture.state()).toBe('pending')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('bounds a hanging bridge POST and keeps the operation uncertain', async () => {
     const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000012', payload: operation, attempts: 0 })
     const originalFetch = globalThis.fetch
