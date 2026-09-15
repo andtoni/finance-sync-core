@@ -74,6 +74,21 @@ export interface ProviderRun {
   readonly observations: readonly ObservationOutput[]
   /** Transient full account evidence used only for exact cross-account pairing. */
   readonly transferAccounts?: Readonly<Record<string, string>>
+  /** Bounded Plaid ingestion counters. Counts only — never provider text or values. */
+  readonly plaidSync?: PlaidSyncDiagnostics
+}
+
+/**
+ * Bounded Plaid ingestion counters used to make silent row filtering visible.
+ * `skipped*` counts explain why a provider row never became an observation.
+ */
+export interface PlaidSyncDiagnostics {
+  readonly added: number
+  readonly modified: number
+  readonly removed: number
+  readonly skippedUnadmittedAccount: number
+  readonly skippedMissingAccountMetadata: number
+  readonly skippedMissingCurrency: number
 }
 export interface PersistEnqueueOptions { readonly skipCurrentState?: boolean }
 export interface TerminalRevisionResolver {
@@ -168,6 +183,33 @@ function plaidItemConnection(connections: readonly PlaidRuntimeConnection[]): Pl
   }
 }
 
+/** Bounded Plaid ingestion counters. Logged only when the cycle saw rows or dropped rows. */
+function logPlaidItemObserved(run: ProviderRun): void {
+  const counts = run.plaidSync
+  if (!counts) return
+  const total = counts.added + counts.modified + counts.removed
+    + counts.skippedUnadmittedAccount + counts.skippedMissingAccountMetadata + counts.skippedMissingCurrency
+  if (total === 0) return
+  console.log('FINANCE_SYNC_PLAID_ITEM_OBSERVED', JSON.stringify(counts))
+}
+
+/**
+ * Safe provider-failure diagnostic. Emits only a fixed stage, the JavaScript
+ * error class, and an allowlisted Plaid error code — never provider text,
+ * identifiers, or financial values.
+ */
+function logPlaidItemFailure(stage: 'item_sync' | 'persist_or_project', error: unknown): void {
+  const code = typeof error === 'object' && error !== null && 'code' in error
+    && typeof (error as { code?: unknown }).code === 'string'
+    ? (error as { code: string }).code
+    : undefined
+  console.error('FINANCE_SYNC_PLAID_ITEM_FAILED', JSON.stringify({
+    stage,
+    errorClass: error instanceof Error ? error.name : typeof error,
+    ...(code === undefined ? {} : { code }),
+  }))
+}
+
 /** Read-only provider ingestion. With projection enabled, cursor promotion waits for full outbox delivery. */
 export async function runConfiguredSyncCycle(
   deploymentId: string,
@@ -215,6 +257,7 @@ export async function runConfiguredSyncCycle(
         const item = plaidItemConnection(expected)
         const cursor = await deps.loadPlaidItemCheckpoint!(item)
         const run = await deps.runProvider(item, cursor)
+        logPlaidItemObserved(run)
         const bySourceResource = new Map<string, ObservationOutput[]>()
         for (const observation of run.observations) {
           const rows = bySourceResource.get(observation.sourceResourceIncarnationId) ?? []
@@ -232,9 +275,10 @@ export async function runConfiguredSyncCycle(
             delivered += projection.delivered
             failures += projection.failed
             if (projection.failed > 0) itemFailed = true
-          } catch {
+          } catch (error) {
             itemFailed = true
             failures += 1
+            logPlaidItemFailure('persist_or_project', error)
             console.error('Finance Sync connection cycle failed')
           }
         }
@@ -245,8 +289,9 @@ export async function runConfiguredSyncCycle(
           await deps.savePlaidItemCheckpoint!(item, run.nextCursor)
           console.log('FINANCE_SYNC_PLAID_ITEM_SYNC')
         }
-      } catch {
+      } catch (error) {
         failures += 1
+        logPlaidItemFailure('item_sync', error)
         console.error('Finance Sync connection cycle failed')
       }
     }

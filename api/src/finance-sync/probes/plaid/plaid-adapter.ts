@@ -93,12 +93,31 @@ export interface ObservationOutput {
   readonly observationRevision?: number
 }
 
+export interface PlaidSyncSkippedCounts {
+  readonly unadmittedAccount: number
+  readonly missingAccountMetadata: number
+  readonly missingCurrency: number
+}
+
+export interface PlaidSyncCounts {
+  readonly added: number
+  readonly modified: number
+  readonly removed: number
+  readonly skipped: PlaidSyncSkippedCounts
+}
+
 export interface PlaidSyncResult {
   readonly nextCursor: string | null
   readonly accounts: readonly PlaidAccount[]
   readonly observations: readonly ObservationOutput[]
   readonly pagesStaged: number
   readonly mutationRestarts: number
+  /** Bounded ingestion counters. Counts only — never provider text or values. */
+  readonly counts: PlaidSyncCounts
+}
+
+function emptyCounts(): { added: number; modified: number; removed: number; skipped: { unadmittedAccount: number; missingAccountMetadata: number; missingCurrency: number } } {
+  return { added: 0, modified: 0, removed: 0, skipped: { unadmittedAccount: 0, missingAccountMetadata: 0, missingCurrency: 0 } }
 }
 
 function sha256(input: string): string {
@@ -121,6 +140,7 @@ export async function runPlaidSync(
   let observations: ObservationOutput[] = []
   let mutationRestarts = 0
   let pagesStaged = 0
+  let counts = emptyCounts()
   const sourceFor = (accountId: string): string =>
     config.sourceResourceIncarnationIds?.[accountId] ?? config.sourceResourceIncarnationId
   const removedSourceIds = (): readonly string[] => {
@@ -132,6 +152,7 @@ export async function runPlaidSync(
     let cursor = config.initialCursor
     pagesStaged = 0
     observations = []
+    counts = emptyCounts()
     accountMap.clear()
 
     try {
@@ -150,11 +171,18 @@ export async function runPlaidSync(
 
         // Build observations from added transactions
         for (const txn of page.added) {
-          if (!config.accountIds.includes(txn.account_id)) continue
+          if (!config.accountIds.includes(txn.account_id)) { counts.skipped.unadmittedAccount++; continue }
           const acct = accountMap.get(txn.account_id)
           const currency = txn.iso_currency_code ?? txn.unofficial_currency_code ?? acct?.balances.iso_currency_code
 
-          if (!currency) continue // quarantine: no currency
+          // No currency is unresolvable: the fallback needs the account object,
+          // so a missing account also lands here and is counted separately.
+          if (!currency) {
+            counts.skipped.missingCurrency++
+            if (!acct) counts.skipped.missingAccountMetadata++
+            continue
+          }
+          counts.added++
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
           const sourceResourceIncarnationId = sourceFor(txn.account_id)
@@ -200,10 +228,15 @@ export async function runPlaidSync(
 
         // Modified transactions: produce revision observations
         for (const txn of page.modified) {
-          if (!config.accountIds.includes(txn.account_id)) continue
+          if (!config.accountIds.includes(txn.account_id)) { counts.skipped.unadmittedAccount++; continue }
           const acct = accountMap.get(txn.account_id)
           const currency = txn.iso_currency_code ?? txn.unofficial_currency_code ?? acct?.balances.iso_currency_code
-          if (!currency) continue
+          if (!currency) {
+            counts.skipped.missingCurrency++
+            if (!acct) counts.skipped.missingAccountMetadata++
+            continue
+          }
+          counts.modified++
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
           const sourceResourceIncarnationId = sourceFor(txn.account_id)
@@ -247,6 +280,7 @@ export async function runPlaidSync(
         // rows, so item-level runs stage one tombstone per admitted native
         // resource; persistence keeps only the resource with matching history.
         for (const rem of page.removed) {
+          counts.removed++
           const payload = {
             transactionId: rem.transaction_id,
             isRemoved: true,
@@ -334,6 +368,7 @@ export async function runPlaidSync(
             observations,
             pagesStaged,
             mutationRestarts,
+            counts,
           }
         }
 

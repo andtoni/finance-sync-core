@@ -181,6 +181,66 @@ describe('configured sync runtime', () => {
     log.mockRestore()
   })
 
+  it('emits bounded Plaid ingestion counters for rows it could not admit', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [plaidConnection('item-1', 'token')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      savePlaidItemCheckpoint: async () => {},
+      runProvider: async () => ({
+        nextCursor: 'cursor-1',
+        observations: [],
+        plaidSync: {
+          added: 2, modified: 1, removed: 0,
+          skippedUnadmittedAccount: 3, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0,
+        },
+      }),
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }
+
+    try {
+      await runConfiguredSyncCycle('d', deps, { providersEnabled: true, projectionEnabled: true })
+      const observed = log.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_OBSERVED')
+      expect(observed).toBeDefined()
+      expect(JSON.parse(String(observed![1]))).toEqual({
+        added: 2, modified: 1, removed: 0,
+        skippedUnadmittedAccount: 3, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0,
+      })
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it('classifies a Plaid item failure with an allowlisted code and no provider text', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [plaidConnection('item-1', 'token')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      savePlaidItemCheckpoint: async () => {},
+      runProvider: async () => {
+        throw Object.assign(new Error('plaid request failed: HTTP 400 item-1 secret-account'), { code: 'ITEM_LOGIN_REQUIRED' })
+      },
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }
+
+    try {
+      const result = await runConfiguredSyncCycle('d', deps)
+      expect(result.failures).toBe(1)
+      const diagnostic = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
+      expect(diagnostic).toBeDefined()
+      expect(JSON.parse(String(diagnostic![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', code: 'ITEM_LOGIN_REQUIRED' })
+      expect(JSON.stringify(error.mock.calls)).not.toMatch(/secret-account|item-1|plaid request failed/)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
   it('does not advance a cursor when projection fails', async () => {
     let checkpointed = false
     const deps: SyncRuntimeDependencies = {

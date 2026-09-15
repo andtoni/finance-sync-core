@@ -172,6 +172,24 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
   })
 }
 
+/**
+ * Plaid error codes safe to emit in diagnostics: stable, documented,
+ * operator-actionable identifiers that carry no account data or provider text.
+ */
+const PLAID_DIAGNOSTIC_CODES = new Set([
+  'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION',
+  'ITEM_LOGIN_REQUIRED',
+  'INVALID_ACCESS_TOKEN',
+  'INVALID_CREDENTIALS',
+  'ITEM_NOT_FOUND',
+  'PRODUCT_NOT_READY',
+  'PRODUCT_NOT_ENABLED',
+  'RATE_LIMIT_EXCEEDED',
+  'INSTITUTION_DOWN',
+  'INSTITUTION_NOT_RESPONDING',
+  'INSTITUTION_NOT_AVAILABLE',
+])
+
 function endpoint(raw: string | undefined, fallback: string, provider: ProviderName): URL {
   let url: URL
   try { url = new URL(raw ?? fallback) } catch { throw new Error(`${provider} endpoint must be a valid URL`) }
@@ -186,13 +204,14 @@ async function json(response: Response, provider: ProviderName): Promise<unknown
     throw new Error(`${provider} returned invalid JSON`)
   }
   if (!response.ok) {
-    const error = new Error(`${provider} request failed: HTTP ${response.status}`) as Error & { code?: string }
-    // Preserve only the Plaid control-flow code required by the documented
-    // Transactions Sync restart protocol; never propagate arbitrary API text.
-    if (provider === 'plaid'
-      && typeof (value as { error_code?: unknown } | null)?.error_code === 'string'
-      && (value as { error_code: string }).error_code === 'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION') {
-      error.code = 'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION'
+    const error = new Error(`${provider} request failed: HTTP ${response.status}`) as Error & { code?: string; status?: number }
+    error.status = response.status
+    // Preserve only Plaid codes from a fixed diagnostic allowlist: the
+    // documented Transactions Sync restart protocol plus operator-actionable
+    // item states. Arbitrary provider text is never propagated or logged.
+    if (provider === 'plaid') {
+      const code = (value as { error_code?: unknown } | null)?.error_code
+      if (typeof code === 'string' && PLAID_DIAGNOSTIC_CODES.has(code)) error.code = code
     }
     throw error
   }
@@ -447,7 +466,18 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
   switch (connection.provider) {
     case 'plaid': {
       const run = await runPlaidSync({ ...connection, initialCursor: cursor ?? undefined }, factories.plaid(connection))
-      return { observations: run.observations, nextCursor: run.nextCursor }
+      return {
+        observations: run.observations,
+        nextCursor: run.nextCursor,
+        plaidSync: {
+          added: run.counts.added,
+          modified: run.counts.modified,
+          removed: run.counts.removed,
+          skippedUnadmittedAccount: run.counts.skipped.unadmittedAccount,
+          skippedMissingAccountMetadata: run.counts.skipped.missingAccountMetadata,
+          skippedMissingCurrency: run.counts.skipped.missingCurrency,
+        },
+      }
     }
     case 'investec': {
       const run = await runInvestecAdapter({

@@ -198,4 +198,38 @@ describe('Plaid adapter G4', () => {
     expect(liabilityObs[0].payload.accountId).toBe('acc-credit')
     expect(liabilityObs[0].sourceResourceIncarnationId).toBe('src-credit')
   })
+
+  it('counts ingestion drops instead of filtering rows silently', async () => {
+    const transport = mockTransport({
+      syncTransactions: async (_accessToken, cursor) => cursor
+        ? { added: [], modified: [], removed: [], accounts: [], next_cursor: cursor, has_more: false }
+        : {
+          added: [
+            { transaction_id: 'txn-admitted', account_id: 'acc-1', amount: 5, date: '2026-07-10', name: 'ADMITTED' },
+            { transaction_id: 'txn-unadmitted', account_id: 'acc-other', amount: 5, date: '2026-07-10', name: 'UNADMITTED' },
+          ],
+          modified: [
+            { transaction_id: 'txn-modified-unadmitted', account_id: 'acc-other', amount: 7, date: '2026-07-10', name: 'UNADMITTED' },
+          ],
+          removed: [],
+          accounts: [
+            { account_id: 'acc-1', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 1000, iso_currency_code: 'USD' } },
+          ],
+          next_cursor: 'cursor-1',
+          has_more: false,
+        },
+    })
+    const result = await runPlaidSync({
+      accessToken: 'access-sandbox-abc',
+      deploymentId: 'g4-test',
+      localOwnerId: 'alexis',
+      sourceResourceIncarnationId: 'plaid:item-1',
+      accountIds: ['acc-1'],
+    }, transport)
+    expect(result.counts.added).toBe(1)
+    expect(result.counts.modified).toBe(0)
+    expect(result.counts.skipped.unadmittedAccount).toBe(2)
+    expect(transactionObservations(result)).toHaveLength(1)
+    expect(transactionObservations(result)[0].payload.transactionId).toBe('txn-admitted')
+  })
 })
