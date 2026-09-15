@@ -59,6 +59,20 @@ function boundReceipt(op: BridgeDisclosureOperation, overrides: Partial<BridgeRe
 const mockTransport = (): BridgeTransport => ({ commit: async op => boundReceipt(op) })
 
 describe('Bridge client', () => {
+  it('keeps a provider-retracted authorization VOID instead of rewriting it as POSTED', () => {
+    const op = cashObservationToBridge({
+      deploymentId: 'g8', localOwnerId: 'urn:wealthfolio:test#owner',
+      sourceResourceIncarnationId: 'inc-1', semanticHash: 'h-void',
+      observedAt: '2026-08-05T00:00:00.000Z',
+      payload: {
+        transactionId: 'investec-card:acct:reference-1', accountId: 'p1', amount: '-10.00', currency: 'ZAR',
+        status: 'void', transactionDate: '2026-08-05', date: '2026-08-05',
+        metadata: { providerOwned: { investec: { authorizationRetired: true } } },
+      },
+    }, 1, 'wf-1')
+    expect(op?.activity?.status).toBe('VOID')
+  })
+
   it('does not project provider audit observations or include them in current state', () => {
     const operation = providerObservationToBridge('investec', {
       deploymentId: 'dep-1', localOwnerId: 'urn:wealthfolio:test#alexis', sourceResourceIncarnationId: 'inc-1',

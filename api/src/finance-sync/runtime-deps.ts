@@ -800,7 +800,7 @@ async function findManualInvestecLifecycleCounterpart(
   return { ...counterpart, provenance: 'operator-authorized' }
 }
 
-async function findInvestecCounterpart(
+export async function findInvestecCounterpart(
   sql: FinanceSyncSql,
   deploymentId: string,
   connection: ProjectionConnection,
@@ -1273,6 +1273,119 @@ export async function reconcileInvestecCardLifecycles(
   if (observations.length === 0) return 0
   await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
   return observations.length
+}
+
+/**
+ * Days after which a card authorization with no settlement is retracted.
+ * Investec releases abandoned holds well inside this window; the exact
+ * settlement window used for matching is deliberately much shorter.
+ */
+const INVESTEC_CARD_AUTHORIZATION_TTL_DAYS = 10
+
+/**
+ * Retire card authorizations the provider never settled.
+ *
+ * A hold the provider abandons simply stops appearing in its pending feed, so
+ * nothing ever supersedes it and the row would otherwise stay PENDING forever
+ * (and keep counting as spending). The provider fact is immutable, so the
+ * retirement is an append-only revision: the same resource is re-projected with
+ * status VOID and a provider-owned reason. A settlement that arrives later
+ * still supersedes the retired row through the ordinary lifecycle path.
+ */
+export async function retireUnmatchedInvestecCardAuthorizations(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  deps: SyncRuntimeDependencies,
+  ttlDays = INVESTEC_CARD_AUTHORIZATION_TTL_DAYS,
+): Promise<number> {
+  if (connection.provider !== 'investec') return 0
+  if (!Number.isSafeInteger(ttlDays) || ttlDays < INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS || ttlDays > 90) {
+    throw new Error('invalid Investec authorization retirement window')
+  }
+  const rows = await sql<InvestecPostedCardLifecycleRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (payload->>'transactionId')
+        payload, raw_payload, provider_version, semantic_hash,
+        hash_specification_version, observed_at, deployment_id,
+        local_owner_id, source_resource_incarnation_id
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND local_owner_id = ${connection.localOwnerId}
+        AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+        AND provider_version LIKE 'investec:card:%'
+      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, raw_payload, provider_version, semantic_hash,
+      hash_specification_version, observed_at
+    FROM latest
+    WHERE payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND upper(coalesce(payload->>'status', '')) = 'PENDING'
+      AND coalesce(payload->'metadata'->'providerOwned'->'investec'->>'authorizationRetired', 'false') <> 'true'
+      AND coalesce(payload->>'transactionDate', payload->>'date')::date
+        <= (now()::date - (${ttlDays} || ' days')::interval)::date
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = latest.deployment_id
+          AND q.local_owner_id = latest.local_owner_id
+          AND q.source_resource_incarnation_id = latest.source_resource_incarnation_id
+          AND q.provider_version = latest.provider_version
+          AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  const retirements: ObservationOutput[] = []
+  const retiredAt = new Date().toISOString()
+  for (const row of rows) {
+    const payload = observationPayload(row.payload)
+    if (!payload || typeof payload.transactionId !== 'string' || typeof payload.accountId !== 'string') continue
+    const authorization: ObservationOutput = {
+      deploymentId,
+      localOwnerId: connection.localOwnerId,
+      sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+      providerVersion: row.provider_version,
+      semanticHash: row.semantic_hash,
+      hashSpecificationVersion: row.hash_specification_version,
+      domain: 'cash_ledger',
+      payload,
+      ...(row.raw_payload === null || row.raw_payload === undefined ? {} : { rawPayload: row.raw_payload }),
+      observedAt: row.observed_at,
+    }
+    // A settlement already in the raw store is paired by the ordinary path.
+    const counterpart = await findInvestecCounterpart(sql, deploymentId, connection, authorization)
+    if (counterpart !== undefined) continue
+    const existingMetadata = recordPayload(payload.metadata)
+    const existingProviderOwned = recordPayload(existingMetadata?.providerOwned)
+    const existingInvestec = recordPayload(existingProviderOwned?.investec)
+    retirements.push({
+      ...authorization,
+      semanticHash: createHash('sha256').update([
+        'investec-card-authorization-retirement-v1', row.provider_version, row.semantic_hash, retiredAt.slice(0, 10),
+      ].join('\x00'), 'utf8').digest('hex'),
+      payload: Object.freeze({
+        ...payload,
+        status: 'void',
+        metadata: {
+          ...(existingMetadata ?? {}),
+          providerOwned: {
+            ...(existingProviderOwned ?? {}),
+            investec: {
+              ...(existingInvestec ?? {}),
+              authorizationRetired: true,
+              authorizationRetiredReason: 'NO_SETTLEMENT_WITHIN_WINDOW',
+              authorizationRetiredAt: retiredAt,
+              authorizationRetiredWindowDays: ttlDays,
+            },
+          },
+        },
+      }),
+    })
+  }
+  if (retirements.length === 0) return 0
+  await deps.persistAndEnqueue(connection, retirements, { skipCurrentState: true })
+  const projection = await deps.projectPending(connection)
+  if (projection.failed > 0) throw new Error('Investec authorization retirement projection is unresolved')
+  return retirements.length
 }
 
 export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {

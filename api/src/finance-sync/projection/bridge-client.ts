@@ -349,6 +349,9 @@ export function cashObservationToBridge(
   const currency = p.currency.toUpperCase()
   const providerStatus = typeof p.status === 'string' ? p.status.toUpperCase() : undefined
   const isPending = p.pending === true || providerStatus === 'PENDING'
+  // A provider-retracted authorization is terminal but reversible evidence: it
+  // must reach the receiver as VOID, not be silently rewritten to POSTED.
+  const isVoid = providerStatus === 'VOID' || p.void === true
   const explicitActivityType = optionalString(p, 'activityType')
   const activityType = explicitActivityType ?? (parsedAmount.negative ? 'DEPOSIT' : 'WITHDRAWAL')
   const originalAmount = p.originalAmount === undefined ? undefined : absoluteDecimal(p.originalAmount)
@@ -365,7 +368,7 @@ export function cashObservationToBridge(
     activity: {
       accountId,
       activityType,
-      status: isPending ? 'PENDING' : 'POSTED',
+      status: isVoid ? 'VOID' : isPending ? 'PENDING' : 'POSTED',
       // Preserve real card authorization time; account feeds that only provide
       // a date remain date-only rather than receiving a fabricated timestamp.
       activityDate: activityDate.value,

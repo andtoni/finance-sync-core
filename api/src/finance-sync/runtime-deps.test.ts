@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
-import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
 import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
 import { bridgeOperationToWire, currentStateToBridge, providerObservationToBridge, validateBridgeReceipt } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
+import type { ObservationOutput } from './probes/investec/investec-adapter'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
 
@@ -1401,6 +1402,73 @@ describe('Investec card and poll lifecycle correlation', () => {
     expect(activityOperations).toHaveLength(1)
     expect(operation.activity?.needsReview).toBeUndefined()
     expect(operation.lifecycleSuccessorId).toBeUndefined()
+  })
+})
+
+describe('retireUnmatchedInvestecCardAuthorizations', () => {
+  const AGED_CARD_CONNECTION: RuntimeConnection = {
+    provider: 'investec',
+    connectionId: 'investec-connection:acc-1',
+    deploymentId: 'dep-1',
+    clientId: 'client-test',
+    clientSecret: 'secret-test',
+    apiKey: 'api-key-test',
+    localOwnerId: 'urn:wealthfolio:test#owner',
+    sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000001',
+    accountIds: ['acc-1'],
+    wealthfolioAccountIds: { 'acc-1': 'wf-acc-1' },
+    providerGeneration: 1,
+    receiverAccessGeneration: 1,
+    secretReference: 'TEST_SLOT',
+    eligibleProductNames: ['Private Bank Account'],
+    fromDate: '2026-01-01',
+    toDate: '2026-09-15',
+  }
+  const authorization = {
+    transactionId: 'investec-card:acc-1:reference-aged',
+    accountId: 'acc-1',
+    amount: '-10.00',
+    currency: 'ZAR',
+    status: 'pending',
+    transactionDate: '2026-08-01',
+    date: '2026-08-01',
+    metadata: { providerOwned: { investec: { accountCurrency: 'ZAR', provisionalSpending: true } } },
+  }
+
+  it('retires an aged unmatched authorization as a VOID revision without mutating the raw row', async () => {
+    const enqueued: ObservationOutput[][] = []
+    const sql = (async (strings: TemplateStringsArray) => {
+      const text = strings.join('?')
+      if (/authorizationRetired/.test(text)) {
+        return [{ payload: authorization, raw_payload: { reference: 'aged' }, provider_version: 'investec:card:acc-1:reference-aged',
+          semantic_hash: 'a'.repeat(64), hash_specification_version: 5, observed_at: '2026-08-01T10:00:00.000Z' }]
+      }
+      return [] // the matcher finds no settlement counterpart
+    }) as unknown as FinanceSyncSql
+    const deps = {
+      persistAndEnqueue: async (_connection: RuntimeConnection, observations: readonly ObservationOutput[]) => {
+        enqueued.push([...observations]); return observations.length
+      },
+      projectPending: async () => ({ delivered: 1, failed: 0 }),
+    } as unknown as SyncRuntimeDependencies
+
+    await expect(retireUnmatchedInvestecCardAuthorizations(sql, 'dep-1', AGED_CARD_CONNECTION, deps)).resolves.toBe(1)
+    expect(enqueued).toHaveLength(1)
+    const retirement = enqueued[0][0]
+    expect(retirement.payload.status).toBe('void')
+    const investec = (retirement.payload.metadata as Record<string, any>).providerOwned.investec
+    expect(investec.authorizationRetired).toBe(true)
+    expect(investec.authorizationRetiredReason).toBe('NO_SETTLEMENT_WITHIN_WINDOW')
+    expect(investec.accountCurrency).toBe('ZAR')
+    // The raw provider fact is untouched.
+    expect(authorization.status).toBe('pending')
+    expect(retirement.semanticHash).not.toBe('a'.repeat(64))
+  })
+
+  it('does not retire a non-Investec connection', async () => {
+    const sql = (async () => []) as unknown as FinanceSyncSql
+    const deps = {} as unknown as SyncRuntimeDependencies
+    await expect(retireUnmatchedInvestecCardAuthorizations(sql, 'dep-1', CONNECTION, deps)).resolves.toBe(0)
   })
 })
 

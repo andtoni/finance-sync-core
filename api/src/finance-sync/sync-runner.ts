@@ -1,7 +1,7 @@
 /** Finance Sync durable runner: read-only provider ingestion, canonical persistence, bridge outbox projection. */
 import { createServer } from 'node:http'
 import { resolve } from 'node:path'
-import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
 import { runConfiguredSyncCycle } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
@@ -104,12 +104,15 @@ Provider credentials are resolved through scoped server-side Infisical machine i
     try {
       const connections = await deps.loadConnections(config.deploymentId)
       let swept = 0
+      let retired = 0
       for (const connection of connections) {
         if (connection.provider !== 'investec') continue
         swept += await reconcileInvestecCardLifecycles(sql, config.deploymentId, connection, deps)
+        retired += await retireUnmatchedInvestecCardAuthorizations(sql, config.deploymentId, connection, deps)
         const projection = await deps.projectPending(connection)
         if (projection.failed > 0) throw new Error('Investec lifecycle sweep projection is unresolved')
       }
+      if (retired > 0) console.log('FINANCE_SYNC_INVESTEC_CARD_AUTHORIZATION_RETIRED', JSON.stringify({ retirements: retired }))
       if (swept > 0) console.log('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_OK')
     } catch {
       cycleReady = false
