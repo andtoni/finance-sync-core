@@ -62,6 +62,27 @@ export class PostgresOnboardingRepository {
         AND pc.provider = ${provider} AND pc.state <> 'disabled'
         AND dpa.discovery_generation = pc.provider_generation
         AND paa.provider_account_id IS NULL
+        -- The same bank account can be visible to more than one Item of one
+        -- institution. Offering it again cannot succeed: the account already
+        -- exists in Wealthfolio, and a relink is only monotonic within the
+        -- Item that owns it. Hide offers whose mask is already connected
+        -- through a different Item so the panel stops proposing them.
+        AND NOT (
+          dpa.mask IS NOT NULL AND dpa.mask <> ''
+          AND EXISTS (
+            SELECT 1 FROM provider_account_admissions other
+            JOIN discovered_provider_accounts other_accounts
+              ON other_accounts.deployment_id = other.deployment_id
+              AND other_accounts.local_owner_id = other.local_owner_id
+              AND other_accounts.connection_id = other.connection_id
+              AND other_accounts.provider_account_id = other.provider_account_id
+            WHERE other.deployment_id = dpa.deployment_id
+              AND other.local_owner_id = dpa.local_owner_id
+              AND other.revoked_at IS NULL
+              AND other.connection_id <> dpa.connection_id
+              AND other_accounts.mask = dpa.mask
+          )
+        )
       ORDER BY dpa.provider_name, dpa.provider_account_id
     `
   }

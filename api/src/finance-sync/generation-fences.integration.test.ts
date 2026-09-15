@@ -246,4 +246,37 @@ suite('provider generation durable fences with PostgreSQL', () => {
   })
 })
 
+suite('already-connected provider accounts are not offered again', () => {
+  it('hides a pending account whose mask is already admitted through another Item', async () => {
+    sql = postgres(url!, { prepare: false })
+    await migrate(sql, resolve(import.meta.dirname, '../../finance-sync-migrations'))
+    const repository = new PostgresOnboardingRepository(sql, deploymentId)
+    const masked = { ...account, mask: '0029' }
+
+    // First Item: the account is discovered and admitted.
+    await repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: `item-a-${runId}`, secretReference: 'PLAID_SLOT_A', accounts: [masked],
+    })
+    const [first] = await repository.listPending(subject, 'plaid')
+    expect(first.mask).toBe('0029')
+    await repository.admit({
+      subject, provider: 'plaid', connectionId: first.connectionId, providerAccountId,
+      wealthfolioAccountId: `wealthfolio-account-mask-${runId}`, databaseStateDigest: digest,
+      providerGeneration: first.providerGeneration,
+      receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+    })
+
+    // Second Item from the same institution exposes the same bank account plus a
+    // genuinely new one. Only the new account may be offered: admitting the
+    // duplicate cannot succeed (it already exists in Wealthfolio, and a relink
+    // is only monotonic inside the Item that owns it).
+    await repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: `item-b-${runId}`, secretReference: 'PLAID_SLOT_B',
+      accounts: [masked, { ...masked, providerAccountId: 'provider-account-new', name: 'New account', mask: '0088' }],
+    })
+    const pending = await repository.listPending(subject, 'plaid')
+    expect(pending.map(entry => entry.mask)).toEqual(['0088'])
+  })
+})
+
 afterAll(async () => { await sql?.end() })
