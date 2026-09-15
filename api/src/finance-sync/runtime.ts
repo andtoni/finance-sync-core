@@ -194,19 +194,52 @@ function logPlaidItemObserved(run: ProviderRun): void {
 }
 
 /**
+ * Finance Sync's own fixed internal failure codes. These are compile-time
+ * constants, not provider text, and are the only messages ever emitted.
+ */
+const INTERNAL_FAILURE_CODES = new Set([
+  'INCOMPLETE_ACCOUNT_BALANCE',
+  'INCOMPLETE_ACCOUNT_BALANCE_CURRENCY',
+  'MISSING_CURSOR_AFTER_HAS_MORE',
+  'PAGE_BOUND_EXCEEDED',
+  'MUTATION_RESTART_EXHAUSTED',
+  'Plaid item has no admitted accounts',
+  'Plaid item authority generations are ambiguous',
+  'Plaid item providerConnectionId is required',
+  'Plaid item providerConnectionId mismatch',
+  'Plaid item secretReference mismatch',
+  'Plaid item clientId mismatch',
+  'Plaid item clientSecret mismatch',
+  'Plaid item accessToken mismatch',
+  'Plaid item deploymentId mismatch',
+  'Plaid item localOwnerId mismatch',
+  'Plaid item accountIds overlap',
+  'Plaid item account mapping is incomplete',
+  'Plaid item wealthfolioAccountIds conflict',
+  'Plaid item source resource mapping is incomplete',
+  'durable connection authority is stale',
+  'provider account is outside the admitted connection scope',
+  'provider account has no Wealthfolio mapping',
+])
+
+/**
  * Safe provider-failure diagnostic. Emits only a fixed stage, the JavaScript
- * error class, and an allowlisted Plaid error code — never provider text,
- * identifiers, or financial values.
+ * error class, an allowlisted Plaid error code, and — when the failure is one
+ * of Finance Sync's own fixed internal codes — that code. Provider text,
+ * identifiers, tokens, and financial values are never emitted.
  */
 function logPlaidItemFailure(stage: 'item_sync' | 'persist_or_project', error: unknown): void {
   const code = typeof error === 'object' && error !== null && 'code' in error
     && typeof (error as { code?: unknown }).code === 'string'
     ? (error as { code: string }).code
     : undefined
+  const message = error instanceof Error ? error.message : undefined
+  const detail = message !== undefined && INTERNAL_FAILURE_CODES.has(message) ? message : undefined
   console.error('FINANCE_SYNC_PLAID_ITEM_FAILED', JSON.stringify({
     stage,
     errorClass: error instanceof Error ? error.name : typeof error,
     ...(code === undefined ? {} : { code }),
+    ...(detail === undefined ? {} : { detail }),
   }))
 }
 

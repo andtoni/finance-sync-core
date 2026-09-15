@@ -241,6 +241,34 @@ describe('configured sync runtime', () => {
     }
   })
 
+  it('emits an internal failure detail only for Finance Sync fixed codes', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const failing = (message: string) => ({
+      loadConnections: async () => [plaidConnection('item-1', 'token')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      savePlaidItemCheckpoint: async () => {},
+      runProvider: async () => { throw new Error(message) },
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }) as SyncRuntimeDependencies
+
+    try {
+      await runConfiguredSyncCycle('d', failing('INCOMPLETE_ACCOUNT_BALANCE'))
+      const internal = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
+      expect(JSON.parse(String(internal![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', detail: 'INCOMPLETE_ACCOUNT_BALANCE' })
+
+      error.mockClear()
+      await runConfiguredSyncCycle('d', failing('provider payload sensitive-token'))
+      const provider = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
+      expect(JSON.parse(String(provider![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error' })
+      expect(JSON.stringify(error.mock.calls)).not.toMatch(/provider payload|sensitive-token/)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
   it('does not advance a cursor when projection fails', async () => {
     let checkpointed = false
     const deps: SyncRuntimeDependencies = {
