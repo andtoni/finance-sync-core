@@ -176,6 +176,20 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
  * Plaid error codes safe to emit in diagnostics: stable, documented,
  * operator-actionable identifiers that carry no account data or provider text.
  */
+const PLAID_DIAGNOSTIC_TYPES = new Set([
+  'ITEM_ERROR',
+  'INVALID_INPUT',
+  'INVALID_REQUEST',
+  'INVALID_RESULT',
+  'RATE_LIMIT_EXCEEDED',
+  'API_ERROR',
+  'INSTITUTION_ERROR',
+  'ASSET_REPORT_ERROR',
+  'RECAPTCHA_ERROR',
+  'OAUTH_ERROR',
+  'PAYMENT_ERROR',
+])
+
 const PLAID_DIAGNOSTIC_CODES = new Set([
   'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION',
   'ITEM_LOGIN_REQUIRED',
@@ -215,14 +229,17 @@ async function json(response: Response, provider: ProviderName): Promise<unknown
     throw new Error(`${provider} returned invalid JSON`)
   }
   if (!response.ok) {
-    const error = new Error(`${provider} request failed: HTTP ${response.status}`) as Error & { code?: string; status?: number }
+    const error = new Error(`${provider} request failed: HTTP ${response.status}`) as Error & { code?: string; status?: number; errorType?: string }
     error.status = response.status
     // Preserve only Plaid codes from a fixed diagnostic allowlist: the
     // documented Transactions Sync restart protocol plus operator-actionable
     // item states. Arbitrary provider text is never propagated or logged.
     if (provider === 'plaid') {
-      const code = (value as { error_code?: unknown } | null)?.error_code
+      const body = value as { error_code?: unknown; error_type?: unknown } | null
+      const code = body?.error_code
       if (typeof code === 'string' && PLAID_DIAGNOSTIC_CODES.has(code)) error.code = code
+      const type = body?.error_type
+      if (typeof type === 'string' && PLAID_DIAGNOSTIC_TYPES.has(type)) error.errorType = type
     }
     throw error
   }

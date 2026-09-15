@@ -218,6 +218,9 @@ const INTERNAL_FAILURE_CODES = new Set([
   'Plaid item wealthfolioAccountIds conflict',
   'Plaid item source resource mapping is incomplete',
   'durable connection authority is stale',
+  'durable connection identity is invalid',
+  'plaid item authority is stale',
+  'Plaid item provider connection identity is required',
   'provider account is outside the admitted connection scope',
   'provider account has no Wealthfolio mapping',
 ])
@@ -228,17 +231,38 @@ const INTERNAL_FAILURE_CODES = new Set([
  * of Finance Sync's own fixed internal codes — that code. Provider text,
  * identifiers, tokens, and financial values are never emitted.
  */
-function logPlaidItemFailure(stage: 'item_sync' | 'persist_or_project', error: unknown): void {
-  const code = typeof error === 'object' && error !== null && 'code' in error
-    && typeof (error as { code?: unknown }).code === 'string'
-    ? (error as { code: string }).code
+type PlaidFailureStage =
+  | 'item_checkpoint' | 'item_build' | 'item_sync' | 'item_cursor' | 'persist_or_project'
+
+/** Tags the failing phase without wrapping or mutating the underlying error. */
+class PlaidStageFailure extends Error {
+  constructor(readonly stage: PlaidFailureStage, readonly failure: unknown) { super(stage) }
+}
+
+function runPlaidStage<T>(stage: PlaidFailureStage, operation: () => T | Promise<T>): Promise<T> {
+  return Promise.resolve().then(operation).catch((error: unknown) => {
+    throw new PlaidStageFailure(stage, error)
+  })
+}
+
+function logPlaidItemFailure(stage: PlaidFailureStage, error: unknown): void {
+  const failure = error instanceof PlaidStageFailure ? error.failure : error
+  const resolvedStage = error instanceof PlaidStageFailure ? error.stage : stage
+  const code = typeof failure === 'object' && failure !== null && 'code' in failure
+    && typeof (failure as { code?: unknown }).code === 'string'
+    ? (failure as { code: string }).code
     : undefined
-  const message = error instanceof Error ? error.message : undefined
+  const errorType = typeof failure === 'object' && failure !== null && 'errorType' in failure
+    && typeof (failure as { errorType?: unknown }).errorType === 'string'
+    ? (failure as { errorType: string }).errorType
+    : undefined
+  const message = failure instanceof Error ? failure.message : undefined
   const detail = message !== undefined && INTERNAL_FAILURE_CODES.has(message) ? message : undefined
   console.error('FINANCE_SYNC_PLAID_ITEM_FAILED', JSON.stringify({
-    stage,
-    errorClass: error instanceof Error ? error.name : typeof error,
+    stage: resolvedStage,
+    errorClass: failure instanceof Error ? failure.name : typeof failure,
     ...(code === undefined ? {} : { code }),
+    ...(errorType === undefined ? {} : { errorType }),
     ...(detail === undefined ? {} : { detail }),
   }))
 }
@@ -287,9 +311,9 @@ export async function runConfiguredSyncCycle(
     for (const expected of plaidGroups.values()) {
       if (expected.length === 0) continue
       try {
-        const item = plaidItemConnection(expected)
-        const cursor = await deps.loadPlaidItemCheckpoint!(item)
-        const run = await deps.runProvider(item, cursor)
+        const item = await runPlaidStage('item_build', () => plaidItemConnection(expected))
+        const cursor = await runPlaidStage('item_checkpoint', () => deps.loadPlaidItemCheckpoint!(item))
+        const run = await runPlaidStage('item_sync', () => deps.runProvider(item, cursor))
         logPlaidItemObserved(run)
         const bySourceResource = new Map<string, ObservationOutput[]>()
         for (const observation of run.observations) {
@@ -302,9 +326,9 @@ export async function runConfiguredSyncCycle(
           const accountObservations = connection.accountIds.flatMap(accountId =>
             bySourceResource.get(connection.sourceResourceIncarnationIds?.[accountId] ?? connection.sourceResourceIncarnationId) ?? [])
           try {
-            observations += await deps.persistAndEnqueue(connection, accountObservations)
+            observations += await runPlaidStage('persist_or_project', () => deps.persistAndEnqueue(connection, accountObservations))
             if (!controls.projectionEnabled) continue
-            const projection = await deps.projectPending(connection)
+            const projection = await runPlaidStage('persist_or_project', () => deps.projectPending(connection))
             delivered += projection.delivered
             failures += projection.failed
             if (projection.failed > 0) itemFailed = true
@@ -319,7 +343,7 @@ export async function runConfiguredSyncCycle(
           failures += 1
           console.error('Finance Sync Plaid item cursor held')
         } else {
-          await deps.savePlaidItemCheckpoint!(item, run.nextCursor)
+          await runPlaidStage('item_cursor', () => deps.savePlaidItemCheckpoint!(item, run.nextCursor))
           console.log('FINANCE_SYNC_PLAID_ITEM_SYNC')
         }
       } catch (error) {
