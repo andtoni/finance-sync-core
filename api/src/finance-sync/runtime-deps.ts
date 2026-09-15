@@ -1766,7 +1766,10 @@ export function createRuntimeDependencies(
         // so retain the original full-stop behavior for that lane. An activity or
         // lifecycle dead letter is independent of a later account snapshot; let
         // the snapshot through while keeping activity delivery and the checkpoint
-        // fenced until the dead letter is explicitly resolved.
+        // fenced until the dead letter is explicitly resolved. Terminal dead
+        // letters are immutable and operator-recoverable through the authenticated
+        // recovery control, so they are not in-flight work and must not fail the
+        // connection cycle.
         if (currentStateDeadLetterCount > 0) return { delivered: 0, failed: deadLetterCount }
 
         let delivered = 0
@@ -1952,7 +1955,7 @@ export function createRuntimeDependencies(
           WHERE deployment_id = ${deploymentId}
             AND connection_id = ${connection.connectionId}
             AND provider_generation = ${connection.providerGeneration}
-            AND state IN ('pending', 'uncertain', 'dead_letter')
+            AND state IN ('pending', 'uncertain')
         `
         return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
       })

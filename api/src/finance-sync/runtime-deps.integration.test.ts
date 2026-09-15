@@ -504,7 +504,9 @@ suite('runtime dependencies with PostgreSQL', () => {
     }) as typeof fetch
     try {
       const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
-      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 1, failed: 2 })
+      // The fenced activity stays pending and unresolved, so the cycle still
+      // reports failure; the terminal activity dead letter itself no longer counts.
+      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 1, failed: 1 })
       expect(calls).toEqual(['CurrentStateUpsert'])
       const rows = await sql`
         SELECT idempotency_key, state, dead_letter_reason
@@ -519,6 +521,117 @@ suite('runtime dependencies with PostgreSQL', () => {
       await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
     }
   })
+  it('reports cycle success when only terminal dead letters remain unresolved', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    const activity = (suffix: string) => ({
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1,
+      kind: 'ActivityUpsert' as const, resourceId: `terminal-dead-letter-${suffix}`,
+      idempotencyKey: `integration-${runId}-dead-${suffix}`,
+      activity: {
+        accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE' as const, amount: '5', currency: 'USD',
+      },
+    })
+    for (const suffix of ['rejected-a', 'rejected-b']) {
+      const row = activity(suffix)
+      await sql`INSERT INTO projection_outbox
+        (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state,attempts,last_error,dead_lettered_at,dead_letter_reason)
+        VALUES (${deploymentId},${owner},${connection.connectionId},1,${row.idempotencyKey},${sql.json(row)},'dead_letter',3,'BRIDGE_HTTP_REJECTED',now(),'BRIDGE_HTTP_REJECTED')`
+    }
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error('terminal dead letters must not be dispatched') }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 0, failed: 0 })
+      const [counts] = await sql`SELECT
+        count(*) FILTER (WHERE state='dead_letter')::int dead_letters,
+        count(*) FILTER (WHERE state='delivered')::int delivered
+        FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      expect(counts).toEqual({ dead_letters: 2, delivered: 0 })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('reports in-flight pending and uncertain rows as a cycle failure', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    const activity = (suffix: string) => ({
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1,
+      kind: 'ActivityUpsert' as const, resourceId: `in-flight-${suffix}`,
+      idempotencyKey: `integration-${runId}-in-flight-${suffix}`,
+      activity: {
+        accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'PENDING',
+        activityDate: '2026-07-18T12:00:00.000Z', activityDatePrecision: 'INSTANT' as const,
+        amount: '2', currency: 'USD',
+      },
+    })
+    for (const state of ['pending', 'uncertain'] as const) {
+      const row = activity(state)
+      await sql`INSERT INTO projection_outbox
+        (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state)
+        VALUES (${deploymentId},${owner},${connection.connectionId},1,${row.idempotencyKey},${sql.json(row)},${state})`
+    }
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (_input, init) => {
+      if (init?.method === 'GET') return new Response(null, { status: 404 })
+      throw new Error('synthetic transport uncertainty')
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      const result = await deps.projectPending(connection)
+      expect(result.delivered).toBe(0)
+      expect(result.failed).toBe(2)
+      const [counts] = await sql`SELECT count(*) FILTER (WHERE state IN ('pending','uncertain'))::int in_flight
+        FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      expect(counts).toEqual({ in_flight: 2 })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('keeps a current-state dead letter as a full stop for the connection cycle', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    const state = {
+      accountId: 'wealthfolio-account', providerConnectionId: connection.connectionId,
+      providerIncarnationId: sourceId, providerGeneration: 1,
+      observedAt: '2026-07-18T12:00:00.000Z', revision: 1784376000000,
+      asOfDate: '2026-07-18', currency: 'USD', cashBalance: '100', liabilityBalance: '0', positions: [],
+    } as const
+    const currentState = currentStateToBridge(
+      { deploymentId, localOwnerId: owner, sourceResourceIncarnationId: sourceId },
+      state, currentStateSemanticHash(state), 1, connection.connectionId,
+    )
+    const activity = {
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1,
+      kind: 'ActivityUpsert' as const, resourceId: 'gated-activity',
+      idempotencyKey: `integration-${runId}-gated-activity`,
+      activity: {
+        accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'POSTED',
+        activityDate: '2026-07-18', activityDatePrecision: 'DATE' as const, amount: '5', currency: 'USD',
+      },
+    }
+    await sql`INSERT INTO projection_outbox
+      (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state,attempts,last_error,dead_lettered_at,dead_letter_reason)
+      VALUES (${deploymentId},${owner},${connection.connectionId},1,${currentState.idempotencyKey},${sql.json(currentState as never)},'dead_letter',3,'BRIDGE_HTTP_REJECTED',now(),'BRIDGE_HTTP_REJECTED')`
+    await sql`INSERT INTO projection_outbox
+      (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload)
+      VALUES (${deploymentId},${owner},${connection.connectionId},1,${activity.idempotencyKey},${sql.json(activity)})`
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => { throw new Error('current-state dead letter must stop the cycle before dispatch') }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 0, failed: 1 })
+      const [gate] = await sql`SELECT state FROM projection_outbox
+        WHERE deployment_id=${deploymentId} AND idempotency_key=${activity.idempotencyKey}`
+      expect(gate).toEqual({ state: 'pending' })
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
   it('encodes a real PostgreSQL bigint revision as numeric uncorrelated wire JSON without precision loss', async () => {
     const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
     const item = observation('numeric-wire', { transactionId: 'numeric-wire', accountId: 'provider-account', amount: '5', currency: 'USD', date: '2026-09-14', status: 'posted' })
