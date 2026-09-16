@@ -1,7 +1,7 @@
 /** Finance Sync durable runner: read-only provider ingestion, canonical persistence, bridge outbox projection. */
 import { createServer } from 'node:http'
 import { resolve } from 'node:path'
-import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, linkZelleTransferPairs, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
 import { runConfiguredSyncCycle } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
@@ -120,6 +120,18 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       console.error('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_FAILED')
     }
   }
+  const linkZelleTransfers = async () => {
+    if (!deps || !config.projectionEnabled) return
+    try {
+      const connections = await deps.loadConnections(config.deploymentId)
+      const linked = await linkZelleTransferPairs(sql, config.deploymentId, connections, deps)
+      if (linked > 0) console.log('FINANCE_SYNC_PLAID_ZELLE_PAIRS_LINKED', JSON.stringify({ pairs: linked }))
+    } catch {
+      cycleReady = false
+      cycleFailed = true
+      console.error('FINANCE_SYNC_PLAID_ZELLE_LINK_FAILED')
+    }
+  }
   const replay = async () => {
     try { await sql`SELECT 1`; databaseReady = true }
     catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
@@ -171,6 +183,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       }
     }
     await cycle()
+    await linkZelleTransfers()
     await reprojectRetainedCards()
     await replayQuarantinedCards()
     await sweepInvestecCardLifecycles()
@@ -198,7 +211,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       webhookDrainer = startInvestecCardDrainer(sql, config.deploymentId, deps, process.env)
       console.log(webhookDrainer ? 'FINANCE_SYNC_WEBHOOK_DRAINER_STARTED' : 'FINANCE_SYNC_WEBHOOK_DRAINER_DISABLED')
     }
-    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await reprojectRetainedCards(); await replayQuarantinedCards(); await sweepInvestecCardLifecycles(); if (!stopping) schedule() }, config.intervalMs) }
+    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await linkZelleTransfers(); await reprojectRetainedCards(); await replayQuarantinedCards(); await sweepInvestecCardLifecycles(); if (!stopping) schedule() }, config.intervalMs) }
     if (config.schedulesEnabled) schedule()
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); webhookDrainer?.stop(); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); webhookDrainer?.stop(); await webhookDrainer?.done; await sql.end() }

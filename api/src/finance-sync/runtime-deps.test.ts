@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { assertBridgeConfiguration, createRuntimeDependencies, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, linkZelleTransferPairs, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
 import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
 import { bridgeOperationToWire, currentStateToBridge, providerObservationToBridge, validateBridgeReceipt } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
@@ -1402,6 +1402,103 @@ describe('Investec card and poll lifecycle correlation', () => {
     expect(activityOperations).toHaveLength(1)
     expect(operation.activity?.needsReview).toBeUndefined()
     expect(operation.lifecycleSuccessorId).toBeUndefined()
+  })
+})
+
+const INVESTEC_CARD_CONNECTION_FOR_TEST: RuntimeConnection = {
+  ...CONNECTION, provider: 'investec' as const, connectionId: 'investec:x', apiKey: 'k',
+  eligibleProductNames: ['Private Bank Account'], fromDate: '2026-01-01', toDate: '2026-09-15',
+}
+
+describe('linkZelleTransferPairs', () => {
+  const checking: RuntimeConnection = {
+    ...CONNECTION, provider: 'plaid', connectionId: 'item:acc-checking', sourceResourceIncarnationId: '00000000-0000-0000-0000-0000000000aa',
+    accountIds: ['acc-checking'], wealthfolioAccountIds: { 'acc-checking': 'wf-checking' },
+  }
+  const bankb: RuntimeConnection = {
+    ...CONNECTION, provider: 'plaid', connectionId: 'item:acc-bankb', sourceResourceIncarnationId: '00000000-0000-0000-0000-0000000000bb',
+    accountIds: ['acc-bankb'], wealthfolioAccountIds: { 'acc-bankb': 'wf-bankb' },
+  }
+  const debit = {
+    transactionId: 'card-debit-1', accountId: 'acc-checking', amount: '180', currency: 'USD',
+    date: '2026-09-05', name: 'ALEXIS EXAMPLE',
+  }
+  const credit = {
+    transactionId: 'bankb-credit-1', accountId: 'acc-bankb', amount: '-180', currency: 'USD',
+    date: '2026-09-08', name: 'ZELLE FROM ALEXIS EXAMPLE ON 09/05 REF # REF000000001',
+  }
+
+  function deps() {
+    const persisted: Array<{ connection: RuntimeConnection; observations: readonly ObservationOutput[] }> = []
+    return {
+      persisted,
+      value: {
+        persistAndEnqueue: async (connection: RuntimeConnection, observations: readonly ObservationOutput[]) => {
+          persisted.push({ connection, observations }); return observations.length
+        },
+        projectPending: async () => ({ delivered: 1, failed: 0 }),
+      } as unknown as SyncRuntimeDependencies,
+    }
+  }
+
+  function sqlFor(payloads: readonly [RuntimeConnection, Record<string, unknown>][]) {
+    return (async () => payloads.map(([connection, payload]) => ({
+      payload, provider_version: `plaid:txn:${String(payload.transactionId)}`,
+      semantic_hash: String(payload.transactionId).padEnd(64, 'a').slice(0, 64),
+      hash_specification_version: 2, observed_at: '2026-09-08T00:00:00.000Z',
+      source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+    }))) as unknown as FinanceSyncSql
+  }
+
+  it('links a Zelle pair across accounts as TRANSFER_IN/TRANSFER_OUT sharing one group', async () => {
+    const { value, persisted } = deps()
+    const linked = await linkZelleTransferPairs(
+      sqlFor([[checking, debit], [bankb, credit]]), 'dep-1', [checking, bankb], value,
+    )
+    expect(linked).toBe(1)
+    expect(persisted).toHaveLength(2)
+    const incoming = persisted[0]!.observations[0]!.payload
+    const outgoing = persisted[1]!.observations[0]!.payload
+    expect(incoming.activityType).toBe('TRANSFER_IN')
+    expect(outgoing.activityType).toBe('TRANSFER_OUT')
+    expect(incoming.sourceGroupId).toBe(outgoing.sourceGroupId)
+    expect(String(incoming.sourceGroupId)).toMatch(/^zelle-pair:[0-9a-f]{32}$/)
+    const correlation = (incoming.metadata as Record<string, any>).providerOwned.financeSync.transferPair
+    expect(correlation).toMatchObject({ kind: 'zelle', counterparty: 'ALEXIS EXAMPLE' })
+    // The pair id is deterministic, so re-projection cannot churn the group.
+    const replay = deps()
+    await linkZelleTransferPairs(sqlFor([[checking, debit], [bankb, credit]]), 'dep-1', [checking, bankb], replay.value)
+    expect(replay.persisted[0]!.observations[0]!.payload.sourceGroupId).toBe(incoming.sourceGroupId)
+  })
+
+  it('leaves a non-Zelle credit alone: it can be genuine income', async () => {
+    const { value, persisted } = deps()
+    const payroll = { ...credit, name: 'ACME PAYROLL DIRECT DEP' }
+    await expect(linkZelleTransferPairs(sqlFor([[checking, debit], [bankb, payroll]]), 'dep-1', [checking, bankb], value)).resolves.toBe(0)
+    expect(persisted).toHaveLength(0)
+  })
+
+  it('does not link when an amount is ambiguous on either side', async () => {
+    const secondDebit = { ...debit, transactionId: 'card-debit-2' }
+    const { value, persisted } = deps()
+    await expect(linkZelleTransferPairs(
+      sqlFor([[checking, debit], [checking, secondDebit], [bankb, credit]]), 'dep-1', [checking, bankb], value,
+    )).resolves.toBe(0)
+    expect(persisted).toHaveLength(0)
+  })
+
+  it('does not link a Zelle credit without a counterpart', async () => {
+    const { value, persisted } = deps()
+    const other = { ...credit, amount: '-42' }
+    await expect(linkZelleTransferPairs(sqlFor([[checking, debit], [bankb, other]]), 'dep-1', [checking, bankb], value)).resolves.toBe(0)
+    expect(persisted).toHaveLength(0)
+  })
+
+  it('ignores connections from other providers', async () => {
+    const { value } = deps()
+    await expect(linkZelleTransferPairs(
+      sqlFor([[checking, debit], [bankb, credit]]), 'dep-1', [INVESTEC_CARD_CONNECTION_FOR_TEST], value,
+    )).resolves.toBe(0)
   })
 })
 

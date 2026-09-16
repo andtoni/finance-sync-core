@@ -1388,6 +1388,225 @@ export async function retireUnmatchedInvestecCardAuthorizations(
   return retirements.length
 }
 
+/**
+ * Provider description that names a person sending money by Zelle, e.g.
+ * "ZELLE FROM ALEXIS EXAMPLE ON 09/05 REF # REF...". The sending account's own
+ * leg carries only the counterparty name, so this side is what proves the rail.
+ */
+const ZELLE_INBOUND = /ZELLE\s+FROM\s+(.+?)(?:\s+ON\s+|\s+REF\s+|\s*$)/i
+
+function normalizedParty(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toUpperCase()
+}
+
+interface PlaidTransferLeg {
+  readonly connection: RuntimeConnection
+  readonly payload: Readonly<Record<string, unknown>>
+  readonly providerVersion: string
+  readonly semanticHash: string
+  readonly hashSpecificationVersion: number
+  readonly observedAt: string
+  readonly transactionId: string
+  readonly description: string
+  readonly direction: 'in' | 'out'
+  readonly magnitude: string
+  readonly date: string | undefined
+}
+
+/** Decimal magnitudes only need to compare equal, so normalize their text form. */
+function normalizedMagnitude(value: string): string {
+  const [whole = '0', fraction = ''] = value.replace(/^[+-]/, '').split('.')
+  const normalizedWhole = whole.replace(/^0+(?=\d)/, '')
+  const normalizedFraction = fraction.replace(/0+$/, '')
+  return normalizedFraction.length > 0 ? `${normalizedWhole}.${normalizedFraction}` : normalizedWhole
+}
+
+function plaidTransferLeg(connection: RuntimeConnection, row: {
+  payload: unknown; provider_version: string; semantic_hash: string;
+  hash_specification_version: number; observed_at: string;
+}): PlaidTransferLeg | undefined {
+  const payload = recordPayload(row.payload)
+  if (!payload) return undefined
+  const transactionId = transactionIdOf(payload)
+  const description = typeof payload.name === 'string'
+    ? payload.name
+    : typeof payload.description === 'string' ? payload.description : undefined
+  const amount = typeof payload.amount === 'string' ? payload.amount : undefined
+  const date = typeof payload.date === 'string' ? payload.date : undefined
+  if (!transactionId || !description || !amount) return undefined
+  const numeric = Number(amount)
+  if (!Number.isFinite(numeric) || numeric === 0) return undefined
+  return {
+    connection,
+    payload,
+    providerVersion: row.provider_version,
+    semanticHash: row.semantic_hash,
+    hashSpecificationVersion: row.hash_specification_version,
+    observedAt: row.observed_at,
+    transactionId,
+    description,
+    // Plaid signs depository amounts positively for money out.
+    direction: numeric > 0 ? 'out' : 'in',
+    magnitude: normalizedMagnitude(amount),
+    date,
+  }
+}
+
+function transactionIdOf(payload: Readonly<Record<string, unknown>>): string | undefined {
+  const value = payload.transactionId ?? payload.transaction_id ?? payload.sourceId
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function dayDifference(left: string | undefined, right: string | undefined): number | undefined {
+  if (!left || !right) return undefined
+  const leftMs = Date.parse(`${left}T00:00:00Z`)
+  const rightMs = Date.parse(`${right}T00:00:00Z`)
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) return undefined
+  return Math.abs(Math.round((rightMs - leftMs) / DAY_MS))
+}
+
+/**
+ * Link Zelle transfers between the subject's own accounts.
+ *
+ * A Zelle credit names the sender ("ZELLE FROM ALEXIS EXAMPLE ..."); the sending
+ * account's own leg carries only that person's name, so the two legs of one
+ * transfer are otherwise unrelated rows that read as income and spending. Pair
+ * them only on exact evidence — the recipient's name inside both descriptions,
+ * an identical magnitude, opposite directions, a bounded date window, and a
+ * one-to-one match in both directions — then re-project both legs as
+ * TRANSFER_IN/TRANSFER_OUT sharing one deterministic group id, which is what
+ * makes the pair neutral instead of income and spending.
+ *
+ * Anything ambiguous stays untouched and visible: an unmatched Zelle credit can
+ * be genuine income from a person.
+ */
+export async function linkZelleTransferPairs(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connections: readonly RuntimeConnection[],
+  deps: SyncRuntimeDependencies,
+  windowDays = INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS,
+): Promise<number> {
+  const plaid = connections.filter(connection => connection.provider === 'plaid')
+  if (plaid.length === 0) return 0
+  const owner = plaid[0].localOwnerId
+  const rows = await sql<Array<{
+    payload: unknown; provider_version: string; semantic_hash: string;
+    hash_specification_version: number; observed_at: string; source_resource_incarnation_id: string;
+  }>>`
+    WITH latest AS (
+      SELECT DISTINCT ON (source_resource_incarnation_id, payload->>'transactionId')
+        payload, provider_version, semantic_hash, hash_specification_version,
+        observed_at, source_resource_incarnation_id, deployment_id, local_owner_id,
+        recorded_at, observation_id
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND local_owner_id = ${owner}
+        AND provider_version LIKE 'plaid:txn:%'
+      ORDER BY source_resource_incarnation_id, payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, provider_version, semantic_hash, hash_specification_version,
+      observed_at, source_resource_incarnation_id::text
+    FROM latest
+    WHERE payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = latest.deployment_id
+          AND q.local_owner_id = latest.local_owner_id
+          AND q.source_resource_incarnation_id = latest.source_resource_incarnation_id
+          AND q.provider_version = latest.provider_version
+          AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  if (rows.length === 0) return 0
+  const legs: PlaidTransferLeg[] = []
+  for (const row of rows) {
+    const connection = plaid.find(candidate => candidate.sourceResourceIncarnationId === row.source_resource_incarnation_id)
+    if (!connection) continue
+    const leg = plaidTransferLeg(connection, row)
+    if (leg) legs.push(leg)
+  }
+  const inbound = legs.filter(leg => leg.direction === 'in' && ZELLE_INBOUND.test(leg.description))
+  if (inbound.length === 0) return 0
+
+  interface MatchedPair { readonly from: PlaidTransferLeg; readonly to: PlaidTransferLeg; readonly party: string }
+  const pairs: MatchedPair[] = []
+  for (const credit of inbound) {
+    const match = credit.description.match(ZELLE_INBOUND)
+    const party = match ? normalizedParty(match[1] ?? '') : ''
+    if (party.length < 3) continue
+    const candidates = legs.filter(leg => leg.direction === 'out'
+      && leg.transactionId !== credit.transactionId
+      && leg.magnitude === credit.magnitude
+      && normalizedParty(leg.description).includes(party)
+      && (dayDifference(leg.date, credit.date) ?? Number.POSITIVE_INFINITY) <= windowDays)
+    if (candidates.length !== 1) continue
+    const debit = candidates[0]!
+    // Reverse direction: the debit must name exactly this one credit, or the
+    // pair is ambiguous and stays untouched.
+    const reverse = inbound.filter(other => other.transactionId !== debit.transactionId
+      && other.magnitude === debit.magnitude
+      && (dayDifference(other.date, debit.date) ?? Number.POSITIVE_INFINITY) <= windowDays
+      && normalizedParty(debit.description).includes(normalizedParty((other.description.match(ZELLE_INBOUND)?.[1]) ?? '')))
+    if (reverse.length !== 1 || reverse[0]!.transactionId !== credit.transactionId) continue
+    pairs.push({ from: debit, to: credit, party })
+  }
+  if (pairs.length === 0) return 0
+
+  const batches = new Map<RuntimeConnection, ObservationOutput[]>()
+  for (const pair of pairs) {
+    const groupId = `zelle-pair:${createHash('sha256').update([
+      'plaid-zelle-transfer-pair-v1', pair.from.transactionId, pair.to.transactionId,
+    ].join('\x00'), 'utf8').digest('hex').slice(0, 32)}`
+    const correlation = {
+      kind: 'zelle',
+      counterparty: pair.party,
+      counterpartTransactionId: pair.to.transactionId,
+      pairedWith: pair.from.transactionId,
+    }
+    for (const [leg, activityType] of [[pair.to, 'TRANSFER_IN'], [pair.from, 'TRANSFER_OUT']] as const) {
+      const existingMetadata = recordPayload(leg.payload.metadata)
+      const existingProviderOwned = recordPayload(existingMetadata?.providerOwned)
+      const observation: ObservationOutput = {
+        deploymentId,
+        localOwnerId: leg.connection.localOwnerId,
+        sourceResourceIncarnationId: leg.connection.sourceResourceIncarnationId,
+        providerVersion: leg.providerVersion,
+        hashSpecificationVersion: leg.hashSpecificationVersion,
+        domain: 'cash_ledger',
+        observedAt: leg.observedAt,
+        semanticHash: createHash('sha256').update([
+          'plaid-zelle-transfer-pair-v1', pair.from.transactionId, pair.to.transactionId,
+        ].join('\x00'), 'utf8').digest('hex'),
+        payload: Object.freeze({
+          ...leg.payload,
+          activityType,
+          sourceGroupId: groupId,
+          metadata: {
+            ...(existingMetadata ?? {}),
+            providerOwned: {
+              ...(existingProviderOwned ?? {}),
+              financeSync: { transferPair: correlation },
+            },
+          },
+        }),
+      }
+      const batch = batches.get(leg.connection) ?? []
+      batch.push(observation)
+      batches.set(leg.connection, batch)
+    }
+  }
+  let linked = 0
+  for (const [connection, observations] of batches) {
+    await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
+    const projection = await deps.projectPending(connection)
+    if (projection.failed > 0) throw new Error('Zelle transfer pair projection is unresolved')
+    linked += observations.length / 2
+  }
+  return linked
+}
+
 export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {
   const allowedBridgeHosts = bridgeHosts(env)
   const allowedFixtureHosts = fixtureBridgeHosts(env)
