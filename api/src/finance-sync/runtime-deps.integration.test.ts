@@ -177,6 +177,37 @@ suite('runtime dependencies with PostgreSQL', () => {
     }
   })
 
+  it('delivers a backlog larger than one batch in a single pass and stops at the first failed delivery', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    for (let index = 0; index < 60; index++) {
+      const operation = { deploymentId, accountId: 'wealthfolio-account', idempotencyKey: `backlog-${runId}-${index}`, subject: owner, accessGeneration: 1, kind: 'ActivityDelete', resourceId: `resource-${index}` }
+      await sql`INSERT INTO projection_outbox (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload) VALUES (${deploymentId},${owner},${connection.connectionId},${connection.providerGeneration},${operation.idempotencyKey},${sql.json(operation)})`
+    }
+    const originalFetch = globalThis.fetch
+    let requests = 0
+    let failFrom = Infinity
+    globalThis.fetch = (async (_input, init) => {
+      requests += 1
+      if (requests >= failFrom) return new Response('', { status: 503 })
+      const wire = JSON.parse(String(init?.body)) as Record<string, unknown>
+      const operation = 'activity_delete'
+      const successor = null
+      const fields = [deploymentId, owner, String(wire.idempotency_key), '1', operation, String(wire.resource_id), 'wealthfolio-account', '0', '', 'accepted', '0', '']
+      return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner, idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation, resourceId: wire.resource_id, lifecycleSuccessorId: successor, outcome: 'Accepted', bindingVersion: 3, receiptBinding: binding(fields), semanticHash: null }), { status: 200 })
+    }) as typeof fetch
+    try {
+      const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+      failFrom = 31
+      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 30, failed: 30 })
+      // The failed row ends its batch's pass; nothing after that batch is attempted.
+      expect(requests).toBeLessThanOrEqual(50)
+      failFrom = Infinity
+      await expect(deps.projectPending(connection)).resolves.toEqual({ delivered: 30, failed: 0 })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('blocks a queued Investec predecessor after terminal lifecycle acceptance in real PostgreSQL', async () => {
     const investecConnection: RuntimeConnection = {
       ...connection, provider: 'investec', apiKey: 'test-api-key',

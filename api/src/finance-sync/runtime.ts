@@ -1,6 +1,7 @@
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import { getProviderEntry, type ProviderName } from './probes/provider-registry'
 import { PLAID_ITEM_ERROR_CODES } from './provider-runtime'
+import { logFailure } from './failure-reason'
 
 interface RuntimeConnectionBase {
   readonly provider: ProviderName
@@ -348,10 +349,10 @@ export async function runConfiguredSyncCycle(
       const cursor = await deps.loadCheckpoint(connection)
       const run = await deps.runProvider(connection, cursor)
       runs.push({ connection, cursor, run })
-    } catch {
+    } catch (error) {
       failures += 1
       // Provider errors can embed tokens, identifiers, request payloads, and financial data.
-      console.error('Finance Sync connection cycle failed')
+      logFailure('Finance Sync connection cycle failed', error, { stage: 'provider_run', provider: connection.provider })
     }
   }
   // Plaid Transactions Sync cursors are item-level. Keep the existing
@@ -485,9 +486,9 @@ export async function runConfiguredSyncCycle(
         connection: item.connection,
         observations: item.observations,
       })))
-    } catch {
+    } catch (error) {
       failures += 1
-      console.error('Finance Sync connection cycle failed')
+      logFailure('Finance Sync connection cycle failed', error, { stage: 'correlated_persist', provider: 'investec' })
       continue
     }
     for (const item of prepared) {
@@ -498,9 +499,9 @@ export async function runConfiguredSyncCycle(
           delivered += projection.delivered; failures += projection.failed
           if (projection.failed === 0) await deps.saveCheckpoint(item.connection, item.run.nextCursor)
         }
-      } catch {
+      } catch (error) {
         failures += 1
-        console.error('Finance Sync connection cycle failed')
+        logFailure('Finance Sync connection cycle failed', error, { stage: 'correlated_project', provider: item.connection.provider })
       }
     }
   }
@@ -513,9 +514,9 @@ export async function runConfiguredSyncCycle(
         delivered += projection.delivered; failures += projection.failed
         if (projection.failed === 0) await deps.saveCheckpoint(item.connection, item.run.nextCursor)
       }
-    } catch {
+    } catch (error) {
       failures += 1
-      console.error('Finance Sync connection cycle failed')
+      logFailure('Finance Sync connection cycle failed', error, { stage: 'persist_or_project', provider: item.connection.provider })
     }
   }
   return { connections: connections.length, observations, delivered, failures, plaidItemConditions }

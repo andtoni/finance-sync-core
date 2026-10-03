@@ -178,7 +178,7 @@ describe('configured sync runtime', () => {
     const result = await runConfiguredSyncCycle('d', deps)
 
     expect(result.failures).toBe(1)
-    expect(log).toHaveBeenCalledWith('Finance Sync connection cycle failed')
+    expect(log).toHaveBeenCalledWith('Finance Sync connection cycle failed', expect.stringContaining('"stage":"provider_run"'))
     expect(JSON.stringify(log.mock.calls)).not.toMatch(/sensitive-token|sensitive-account|sensitive-connection|provider payload/)
     log.mockRestore()
   })

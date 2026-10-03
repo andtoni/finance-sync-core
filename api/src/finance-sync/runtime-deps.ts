@@ -2004,6 +2004,253 @@ export function createRuntimeDependencies(
     },
   } : undefined
 
+  const projectPendingBatch = async (connection: RuntimeConnection) => {
+    if (!bridgeUrl || !bridgeToken) return { delivered: 0, failed: 0, deliveryFailures: 0, failureReasons: {} }
+    return sql.begin(async transaction => {
+    const tx = transaction as unknown as FinanceSyncSql
+    await assertDurableAuthority(tx, deploymentId, connection)
+    const deadLetters = await tx<{ kind: string | null; count: number }[]>`
+      SELECT payload->>'kind' AS kind, count(*)::integer AS count
+      FROM projection_outbox
+      WHERE deployment_id = ${deploymentId}
+        AND connection_id = ${connection.connectionId}
+        AND provider_generation = ${connection.providerGeneration}
+        AND state = 'dead_letter'
+      GROUP BY payload->>'kind'
+    `
+    const deadLetterCount = deadLetters.reduce((total, row) => total + row.count, 0)
+    const currentStateDeadLetterCount = deadLetters
+      .filter(row => row.kind === 'CurrentStateUpsert')
+      .reduce((total, row) => total + row.count, 0)
+    // A failed current-state write can make later snapshots unsafe to apply,
+    // so retain the original full-stop behavior for that lane. An activity or
+    // lifecycle dead letter is independent of a later account snapshot; let
+    // the snapshot through while keeping activity delivery and the checkpoint
+    // fenced until the dead letter is explicitly resolved. Terminal dead
+    // letters are immutable and operator-recoverable through the authenticated
+    // recovery control, so they are not in-flight work and must not fail the
+    // connection cycle.
+    if (currentStateDeadLetterCount > 0) {
+      return {
+        delivered: 0, failed: deadLetterCount, deliveryFailures: deadLetterCount,
+        failureReasons: { CURRENT_STATE_DEAD_LETTER: currentStateDeadLetterCount } as Record<string, number>,
+      }
+    }
+
+    let delivered = 0
+    let deliveryFailures = 0
+    // Count each unresolved delivery by its fixed reason so one line per
+    // pass says why a connection's projection did not complete.
+    const failureReasons: Record<string, number> = {}
+    const noteFailure = (reason: string) => {
+      deliveryFailures++
+      failureReasons[reason] = (failureReasons[reason] ?? 0) + 1
+    }
+    const rows = deadLetterCount > 0
+      ? await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
+        SELECT id, payload, attempts, state
+        FROM projection_outbox
+        WHERE deployment_id = ${deploymentId}
+          AND connection_id = ${connection.connectionId}
+          AND provider_generation = ${connection.providerGeneration}
+          AND state IN ('pending', 'uncertain')
+          AND payload->>'kind' = 'CurrentStateUpsert'
+        ORDER BY (payload->>'kind' = 'CurrentStateUpsert') DESC,
+          CASE WHEN payload->>'kind' = 'CurrentStateUpsert' THEN created_at END DESC,
+          created_at, (payload ? 'lifecycleSuccessorId'), id
+        LIMIT ${MAX_PROJECTION_BATCH}
+        FOR UPDATE SKIP LOCKED
+      `
+      : await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
+        SELECT id, payload, attempts, state
+        FROM projection_outbox
+        WHERE deployment_id = ${deploymentId}
+          AND connection_id = ${connection.connectionId}
+          AND provider_generation = ${connection.providerGeneration}
+          AND state IN ('pending', 'uncertain')
+        ORDER BY (payload->>'kind' = 'CurrentStateUpsert') DESC,
+          CASE WHEN payload->>'kind' = 'CurrentStateUpsert' THEN created_at END DESC,
+          created_at, (payload ? 'lifecycleSuccessorId'), id
+        LIMIT ${MAX_PROJECTION_BATCH}
+        FOR UPDATE SKIP LOCKED
+      `
+    for (const row of rows) {
+      const markDelivered = async () => {
+        await tx`
+          UPDATE projection_outbox
+          SET state = 'delivered', delivered_at = now(), attempts = attempts + 1,
+              last_error = NULL, dead_lettered_at = NULL, dead_letter_reason = NULL
+          WHERE id = ${row.id}::uuid
+            AND provider_generation = ${connection.providerGeneration}
+        `
+        delivered++
+      }
+      const recoverReceipt = async (markRecovered = true): Promise<boolean> => {
+        try {
+          const lookup = receiptLookup ?? (async (operation: BridgeDisclosureOperation): Promise<unknown | null> => {
+            if (!bridgeReceiptUrl || !bridgeToken) return null
+            const base = bridgeReceiptUrl.toString().replace(/\/+$/, '')
+            const response = await fetch(`${base}/${encodeURIComponent(operation.subject)}/${encodeURIComponent(operation.idempotencyKey)}`, {
+              method: 'GET', redirect: 'error', headers: { authorization: `Bearer ${bridgeToken}` },
+              signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
+            })
+            if (response.status === 404) return null
+            if (!response.ok) throw new Error('bridge receipt lookup failed')
+            return response.json()
+          })
+          const recovered = await lookup(row.payload)
+          if (recovered === null) return false
+          validateBridgeReceipt(row.payload, recovered)
+          if (markRecovered) await markDelivered()
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      const requireInvestecRecovery = async () => {
+        await tx`
+          UPDATE projection_outbox
+          SET state = 'uncertain', last_error = 'INVESTEC_LIFECYCLE_RECOVERY_REQUIRED'
+          WHERE id = ${row.id}::uuid
+            AND provider_generation = ${connection.providerGeneration}
+            AND state IN ('pending', 'uncertain')
+        `
+        noteFailure('INVESTEC_LIFECYCLE_RECOVERY_REQUIRED')
+      }
+
+      if (connection.provider === 'investec'
+        && row.payload.kind === 'ActivityUpsert'
+        && row.payload.activity?.status === 'PENDING'
+        && row.payload.lifecycleSuccessorId === undefined) {
+        const lifecycleDisposition = await investecLifecycleDisposition(tx, connection, row.payload)
+        if (lifecycleDisposition === 'delivered') {
+          if (row.state === 'uncertain') {
+            // An uncertain pending POST may already have committed after the
+            // terminal lifecycle. Never hide that possibility as suppressed.
+            await recoverReceipt(false)
+            await requireInvestecRecovery()
+          } else {
+            await tx`
+              UPDATE projection_outbox
+              SET state = 'suppressed', last_error = 'INVESTEC_LIFECYCLE_ALREADY_TERMINAL'
+              WHERE id = ${row.id}::uuid
+                AND provider_generation = ${connection.providerGeneration}
+                AND state = 'pending'
+            `
+          }
+          continue
+        }
+        if (lifecycleDisposition === 'uncertain') {
+          await requireInvestecRecovery()
+          continue
+        }
+      }
+
+      // Never replay an uncertain commit before attempting receipt recovery.
+      // An unresolved lifecycle is a fence: retrying its pending predecessor
+      // could resurrect the activity while the terminal receipt is unknown.
+      if (connection.provider === 'investec'
+        && row.state === 'uncertain' && row.payload.lifecycleSuccessorId !== undefined) {
+        // A lifecycle recovery attempt is authoritative for this pass. Do
+        // not issue a second lookup or replay the lifecycle after it.
+        await recoverReceipt()
+        continue
+      }
+      if (row.state === 'uncertain' && await recoverReceipt()) continue
+
+      let response: Response
+      try {
+        response = await fetch(bridgeUrl, {
+          method: 'POST',
+          redirect: 'error',
+          signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${bridgeToken}`,
+            'idempotency-key': row.payload.idempotencyKey,
+          },
+          body: JSON.stringify(bridgeOperationToWire(row.payload)),
+        })
+      } catch {
+        if (await recoverReceipt()) continue
+        // The commit may have landed: keep the row uncertain for the bound
+        // receipt lookup, but do not spend its terminal budget on an
+        // unreachable receiver.
+        await tx`
+          UPDATE projection_outbox
+          SET last_error = 'BRIDGE_RESPONSE_UNCERTAIN', state = 'uncertain'
+          WHERE id = ${row.id}::uuid
+            AND provider_generation = ${connection.providerGeneration}
+        `
+        noteFailure('BRIDGE_RESPONSE_UNCERTAIN')
+        continue
+      }
+
+      if (!response.ok) {
+        // 5xx and 429 mean the receiver could not serve the request right
+        // now (an unwritable database, a restart, a rate limit). That is
+        // transient, so the row stays queued and does not consume the
+        // terminal-attempt budget: a receiver outage must never turn into
+        // dead letters that an operator has to resolve by hand.
+        if (response.status >= 500 || response.status === 429) {
+          await tx`
+            UPDATE projection_outbox SET last_error = 'BRIDGE_UNAVAILABLE'
+            WHERE id = ${row.id}::uuid
+              AND provider_generation = ${connection.providerGeneration}
+          `
+          noteFailure(`BRIDGE_HTTP_${response.status}`)
+          continue
+        }
+        const nextAttempts = row.attempts + 1
+        if (nextAttempts >= MAX_PROJECTION_DELIVERY_ATTEMPTS) {
+          await tx`
+            UPDATE projection_outbox
+            SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED', state = 'dead_letter',
+                dead_lettered_at = now(), dead_letter_reason = 'BRIDGE_HTTP_REJECTED'
+            WHERE id = ${row.id}::uuid
+              AND provider_generation = ${connection.providerGeneration}
+          `
+        } else {
+          await tx`
+            UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED'
+            WHERE id = ${row.id}::uuid
+              AND provider_generation = ${connection.providerGeneration}
+          `
+        }
+        noteFailure(`BRIDGE_HTTP_${response.status}`)
+        continue
+      }
+
+      try {
+        validateBridgeReceipt(row.payload, await response.json())
+        await markDelivered()
+      } catch {
+        if (await recoverReceipt()) continue
+        // A successful HTTP commit with a lost/invalid receipt is uncertain,
+        // not terminal. It can only be resolved by a bound receipt lookup.
+        await tx`
+          UPDATE projection_outbox
+          SET attempts = attempts + 1, last_error = 'BRIDGE_RECEIPT_UNCERTAIN', state = 'uncertain'
+          WHERE id = ${row.id}::uuid
+            AND provider_generation = ${connection.providerGeneration}
+        `
+        noteFailure('BRIDGE_RECEIPT_UNCERTAIN')
+      }
+    }
+    const unresolvedAfter = await tx<{ count: number }[]>`
+      SELECT count(*)::integer AS count
+      FROM projection_outbox
+      WHERE deployment_id = ${deploymentId}
+        AND connection_id = ${connection.connectionId}
+        AND provider_generation = ${connection.providerGeneration}
+        AND state IN ('pending', 'uncertain')
+    `
+    const failed = Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0)
+    return { delivered, failed, deliveryFailures, failureReasons }
+    })
+  }
+
   return {
     terminalRevisionResolver,
     loadConnections: async () => {
@@ -2083,237 +2330,21 @@ export function createRuntimeDependencies(
       return inserted
     }),
     projectPending: async connection => {
-      if (!bridgeUrl || !bridgeToken) return { delivered: 0, failed: 0 }
-      return sql.begin(async transaction => {
-        const tx = transaction as unknown as FinanceSyncSql
-        await assertDurableAuthority(tx, deploymentId, connection)
-        const deadLetters = await tx<{ kind: string | null; count: number }[]>`
-          SELECT payload->>'kind' AS kind, count(*)::integer AS count
-          FROM projection_outbox
-          WHERE deployment_id = ${deploymentId}
-            AND connection_id = ${connection.connectionId}
-            AND provider_generation = ${connection.providerGeneration}
-            AND state = 'dead_letter'
-          GROUP BY payload->>'kind'
-        `
-        const deadLetterCount = deadLetters.reduce((total, row) => total + row.count, 0)
-        const currentStateDeadLetterCount = deadLetters
-          .filter(row => row.kind === 'CurrentStateUpsert')
-          .reduce((total, row) => total + row.count, 0)
-        // A failed current-state write can make later snapshots unsafe to apply,
-        // so retain the original full-stop behavior for that lane. An activity or
-        // lifecycle dead letter is independent of a later account snapshot; let
-        // the snapshot through while keeping activity delivery and the checkpoint
-        // fenced until the dead letter is explicitly resolved. Terminal dead
-        // letters are immutable and operator-recoverable through the authenticated
-        // recovery control, so they are not in-flight work and must not fail the
-        // connection cycle.
-        if (currentStateDeadLetterCount > 0) return { delivered: 0, failed: deadLetterCount }
-
-        let delivered = 0
-        let deliveryFailures = 0
-        const rows = deadLetterCount > 0
-          ? await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
-            SELECT id, payload, attempts, state
-            FROM projection_outbox
-            WHERE deployment_id = ${deploymentId}
-              AND connection_id = ${connection.connectionId}
-              AND provider_generation = ${connection.providerGeneration}
-              AND state IN ('pending', 'uncertain')
-              AND payload->>'kind' = 'CurrentStateUpsert'
-            ORDER BY (payload->>'kind' = 'CurrentStateUpsert') DESC,
-              CASE WHEN payload->>'kind' = 'CurrentStateUpsert' THEN created_at END DESC,
-              created_at, (payload ? 'lifecycleSuccessorId'), id
-            LIMIT ${MAX_PROJECTION_BATCH}
-            FOR UPDATE SKIP LOCKED
-          `
-          : await tx<{ id: string; payload: BridgeDisclosureOperation; attempts: number; state: 'pending' | 'uncertain' }[]>`
-            SELECT id, payload, attempts, state
-            FROM projection_outbox
-            WHERE deployment_id = ${deploymentId}
-              AND connection_id = ${connection.connectionId}
-              AND provider_generation = ${connection.providerGeneration}
-              AND state IN ('pending', 'uncertain')
-            ORDER BY (payload->>'kind' = 'CurrentStateUpsert') DESC,
-              CASE WHEN payload->>'kind' = 'CurrentStateUpsert' THEN created_at END DESC,
-              created_at, (payload ? 'lifecycleSuccessorId'), id
-            LIMIT ${MAX_PROJECTION_BATCH}
-            FOR UPDATE SKIP LOCKED
-          `
-        for (const row of rows) {
-          const markDelivered = async () => {
-            await tx`
-              UPDATE projection_outbox
-              SET state = 'delivered', delivered_at = now(), attempts = attempts + 1,
-                  last_error = NULL, dead_lettered_at = NULL, dead_letter_reason = NULL
-              WHERE id = ${row.id}::uuid
-                AND provider_generation = ${connection.providerGeneration}
-            `
-            delivered++
-          }
-          const recoverReceipt = async (markRecovered = true): Promise<boolean> => {
-            try {
-              const lookup = receiptLookup ?? (async (operation: BridgeDisclosureOperation): Promise<unknown | null> => {
-                if (!bridgeReceiptUrl || !bridgeToken) return null
-                const base = bridgeReceiptUrl.toString().replace(/\/+$/, '')
-                const response = await fetch(`${base}/${encodeURIComponent(operation.subject)}/${encodeURIComponent(operation.idempotencyKey)}`, {
-                  method: 'GET', redirect: 'error', headers: { authorization: `Bearer ${bridgeToken}` },
-                  signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
-                })
-                if (response.status === 404) return null
-                if (!response.ok) throw new Error('bridge receipt lookup failed')
-                return response.json()
-              })
-              const recovered = await lookup(row.payload)
-              if (recovered === null) return false
-              validateBridgeReceipt(row.payload, recovered)
-              if (markRecovered) await markDelivered()
-              return true
-            } catch {
-              return false
-            }
-          }
-
-          const requireInvestecRecovery = async () => {
-            await tx`
-              UPDATE projection_outbox
-              SET state = 'uncertain', last_error = 'INVESTEC_LIFECYCLE_RECOVERY_REQUIRED'
-              WHERE id = ${row.id}::uuid
-                AND provider_generation = ${connection.providerGeneration}
-                AND state IN ('pending', 'uncertain')
-            `
-            deliveryFailures++
-          }
-
-          if (connection.provider === 'investec'
-            && row.payload.kind === 'ActivityUpsert'
-            && row.payload.activity?.status === 'PENDING'
-            && row.payload.lifecycleSuccessorId === undefined) {
-            const lifecycleDisposition = await investecLifecycleDisposition(tx, connection, row.payload)
-            if (lifecycleDisposition === 'delivered') {
-              if (row.state === 'uncertain') {
-                // An uncertain pending POST may already have committed after the
-                // terminal lifecycle. Never hide that possibility as suppressed.
-                await recoverReceipt(false)
-                await requireInvestecRecovery()
-              } else {
-                await tx`
-                  UPDATE projection_outbox
-                  SET state = 'suppressed', last_error = 'INVESTEC_LIFECYCLE_ALREADY_TERMINAL'
-                  WHERE id = ${row.id}::uuid
-                    AND provider_generation = ${connection.providerGeneration}
-                    AND state = 'pending'
-                `
-              }
-              continue
-            }
-            if (lifecycleDisposition === 'uncertain') {
-              await requireInvestecRecovery()
-              continue
-            }
-          }
-
-          // Never replay an uncertain commit before attempting receipt recovery.
-          // An unresolved lifecycle is a fence: retrying its pending predecessor
-          // could resurrect the activity while the terminal receipt is unknown.
-          if (connection.provider === 'investec'
-            && row.state === 'uncertain' && row.payload.lifecycleSuccessorId !== undefined) {
-            // A lifecycle recovery attempt is authoritative for this pass. Do
-            // not issue a second lookup or replay the lifecycle after it.
-            await recoverReceipt()
-            continue
-          }
-          if (row.state === 'uncertain' && await recoverReceipt()) continue
-
-          let response: Response
-          try {
-            response = await fetch(bridgeUrl, {
-              method: 'POST',
-              redirect: 'error',
-              signal: AbortSignal.timeout(BRIDGE_REQUEST_TIMEOUT_MS),
-              headers: {
-                'content-type': 'application/json',
-                authorization: `Bearer ${bridgeToken}`,
-                'idempotency-key': row.payload.idempotencyKey,
-              },
-              body: JSON.stringify(bridgeOperationToWire(row.payload)),
-            })
-          } catch {
-            if (await recoverReceipt()) continue
-            // The commit may have landed: keep the row uncertain for the bound
-            // receipt lookup, but do not spend its terminal budget on an
-            // unreachable receiver.
-            await tx`
-              UPDATE projection_outbox
-              SET last_error = 'BRIDGE_RESPONSE_UNCERTAIN', state = 'uncertain'
-              WHERE id = ${row.id}::uuid
-                AND provider_generation = ${connection.providerGeneration}
-            `
-            deliveryFailures++
-            continue
-          }
-
-          if (!response.ok) {
-            // 5xx and 429 mean the receiver could not serve the request right
-            // now (an unwritable database, a restart, a rate limit). That is
-            // transient, so the row stays queued and does not consume the
-            // terminal-attempt budget: a receiver outage must never turn into
-            // dead letters that an operator has to resolve by hand.
-            if (response.status >= 500 || response.status === 429) {
-              await tx`
-                UPDATE projection_outbox SET last_error = 'BRIDGE_UNAVAILABLE'
-                WHERE id = ${row.id}::uuid
-                  AND provider_generation = ${connection.providerGeneration}
-              `
-              deliveryFailures++
-              continue
-            }
-            const nextAttempts = row.attempts + 1
-            if (nextAttempts >= MAX_PROJECTION_DELIVERY_ATTEMPTS) {
-              await tx`
-                UPDATE projection_outbox
-                SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED', state = 'dead_letter',
-                    dead_lettered_at = now(), dead_letter_reason = 'BRIDGE_HTTP_REJECTED'
-                WHERE id = ${row.id}::uuid
-                  AND provider_generation = ${connection.providerGeneration}
-              `
-            } else {
-              await tx`
-                UPDATE projection_outbox SET attempts = ${nextAttempts}, last_error = 'BRIDGE_HTTP_REJECTED'
-                WHERE id = ${row.id}::uuid
-                  AND provider_generation = ${connection.providerGeneration}
-              `
-            }
-            deliveryFailures++
-            continue
-          }
-
-          try {
-            validateBridgeReceipt(row.payload, await response.json())
-            await markDelivered()
-          } catch {
-            if (await recoverReceipt()) continue
-            // A successful HTTP commit with a lost/invalid receipt is uncertain,
-            // not terminal. It can only be resolved by a bound receipt lookup.
-            await tx`
-              UPDATE projection_outbox
-              SET attempts = attempts + 1, last_error = 'BRIDGE_RECEIPT_UNCERTAIN', state = 'uncertain'
-              WHERE id = ${row.id}::uuid
-                AND provider_generation = ${connection.providerGeneration}
-            `
-            deliveryFailures++
-          }
+      // Deliver batch after batch until the connection's queue is empty. A
+      // backlog that is still being delivered is not a failure: stop only when
+      // a delivery fails or a pass makes no progress, and report what is left.
+      let delivered = 0
+      for (;;) {
+        const batch = await projectPendingBatch(connection)
+        delivered += batch.delivered
+        if (batch.failed === 0) return { delivered, failed: 0 }
+        if (batch.deliveryFailures > 0 || batch.delivered === 0) {
+          console.error('FINANCE_SYNC_PROJECTION_UNRESOLVED', JSON.stringify({
+            provider: connection.provider, unresolved: batch.failed, reasons: batch.failureReasons,
+          }))
+          return { delivered, failed: batch.failed }
         }
-        const unresolvedAfter = await tx<{ count: number }[]>`
-          SELECT count(*)::integer AS count
-          FROM projection_outbox
-          WHERE deployment_id = ${deploymentId}
-            AND connection_id = ${connection.connectionId}
-            AND provider_generation = ${connection.providerGeneration}
-            AND state IN ('pending', 'uncertain')
-        `
-        return { delivered, failed: Math.max(deliveryFailures, unresolvedAfter[0]?.count ?? 0) }
-      })
+      }
     },
     savePlaidItemCheckpoint: async (connection, cursor) => {
       const providerConnectionId = connection.providerConnectionId

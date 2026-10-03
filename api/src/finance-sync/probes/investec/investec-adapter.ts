@@ -423,6 +423,12 @@ type CardRecoveryDiagnostic = {
   readonly status: 'failed' | 'invalid'
   readonly errorClass: string
   readonly mappingStage?: 'account_id' | 'account_number' | 'card_identity'
+  readonly httpStatus?: number
+}
+
+function safeHttpStatus(error: unknown): { httpStatus?: number } {
+  const status = (error as { status?: unknown } | null)?.status
+  return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? { httpStatus: status } : {}
 }
 
 function safeErrorClass(error: unknown): string {
@@ -465,7 +471,7 @@ async function collectInvestecCardExecutions(
   } catch (error) {
     // Card execution recovery is additive evidence. A provider-side outage or
     // unsupported Card API must not block the ordinary PB ledger cycle.
-    logCardRecoveryDiagnostic({ stage: 'card_list', status: 'failed', errorClass: safeErrorClass(error) })
+    logCardRecoveryDiagnostic({ stage: 'card_list', status: 'failed', errorClass: safeErrorClass(error), ...safeHttpStatus(error) })
     return
   }
   const uniqueAccounts = (rows: readonly { accountId: string; accountNumber?: string }[]) =>
@@ -512,7 +518,7 @@ async function collectInvestecCardExecutions(
     try {
       executions = await transport.listCardExecutions(cardKey)
     } catch (error) {
-      logCardRecoveryDiagnostic({ stage: 'execution_list', status: 'failed', errorClass: safeErrorClass(error) })
+      logCardRecoveryDiagnostic({ stage: 'execution_list', status: 'failed', errorClass: safeErrorClass(error), ...safeHttpStatus(error) })
       continue
     }
     for (const execution of executions) {

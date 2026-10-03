@@ -7,6 +7,7 @@ import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
 import { parseServiceConfig } from './service-config'
 import { financeSyncHealthResponse, syncCycleOutcome } from './health'
+import { logFailure } from './failure-reason'
 import {
   createPlaidConnectTransport,
   createSnapTradeConnectTransport,
@@ -68,11 +69,11 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       cycleFailed = outcome.cycleFailed
       if (outcome.event === 'FINANCE_SYNC_CYCLE_FAILED') console.error(outcome.event)
       else console.log(outcome.event)
-    } catch {
+    } catch (error) {
       cycleReady = false
       cycleFailed = true
-      // Never print provider/transport errors: SDK errors can contain secrets or financial payloads.
-      console.error('FINANCE_SYNC_CYCLE_FAILED')
+      // Never print provider/transport errors whole: SDK errors can contain secrets or financial payloads.
+      logFailure('FINANCE_SYNC_CYCLE_FAILED', error)
     }
   }
   const reprojectRetainedCards = async () => {
@@ -85,10 +86,10 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       const reprojectedCards = await reprojectRetainedInvestecCards(sql, config.deploymentId, deps)
       retainedCardReplayNeeded = false
       if (reprojectedCards > 0) console.log('FINANCE_SYNC_RETAINED_CARD_REPROJECTION_OK')
-    } catch {
+    } catch (error) {
       // Keep the health server and normal retry loop available when the bridge
       // is transiently unavailable or another outbox row is unresolved.
-      console.error('FINANCE_SYNC_RETAINED_CARD_REPROJECTION_FAILED')
+      logFailure('FINANCE_SYNC_RETAINED_CARD_REPROJECTION_FAILED', error)
     }
   }
   const replayQuarantinedCards = async () => {
@@ -101,8 +102,8 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       const replayedCards = await replayQuarantinedInvestecCards(sql, config.deploymentId, deps)
       quarantinedCardReplayNeeded = false
       if (replayedCards > 0) console.log('FINANCE_SYNC_CARD_QUARANTINE_REPLAY_OK')
-    } catch {
-      console.error('FINANCE_SYNC_CARD_QUARANTINE_REPLAY_FAILED')
+    } catch (error) {
+      logFailure('FINANCE_SYNC_CARD_QUARANTINE_REPLAY_FAILED', error)
     }
   }
   const sweepInvestecCardLifecycles = async () => {
@@ -120,10 +121,10 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       }
       if (retired > 0) console.log('FINANCE_SYNC_INVESTEC_CARD_AUTHORIZATION_RETIRED', JSON.stringify({ retirements: retired }))
       if (swept > 0) console.log('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_OK')
-    } catch {
+    } catch (error) {
       cycleReady = false
       cycleFailed = true
-      console.error('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_FAILED')
+      logFailure('FINANCE_SYNC_INVESTEC_CARD_LIFECYCLE_SWEEP_FAILED', error)
     }
   }
   const linkZelleTransfers = async () => {
@@ -132,10 +133,10 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       const connections = await deps.loadConnections(config.deploymentId)
       const linked = await linkZelleTransferPairs(sql, config.deploymentId, connections, deps)
       if (linked > 0) console.log('FINANCE_SYNC_PLAID_ZELLE_PAIRS_LINKED', JSON.stringify({ pairs: linked }))
-    } catch {
+    } catch (error) {
       cycleReady = false
       cycleFailed = true
-      console.error('FINANCE_SYNC_PLAID_ZELLE_LINK_FAILED')
+      logFailure('FINANCE_SYNC_PLAID_ZELLE_LINK_FAILED', error)
     }
   }
   const replay = async () => {
