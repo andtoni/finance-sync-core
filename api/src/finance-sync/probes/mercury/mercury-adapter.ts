@@ -196,11 +196,33 @@ export async function runMercurySync(
       const txns = page.transactions ?? []
 
       for (const txn of txns) {
+        if (txn.status === 'cancelled' || txn.status === 'failed') {
+          // The payment never moved money. Record it as a removal instead of
+          // failing the account: left quarantined, one cancelled transaction
+          // stopped every later sync of the account. Removals are kept as
+          // evidence and follow the same projection policy as other providers.
+          transactionsObserved++
+          observations.push({
+            deploymentId: config.deploymentId,
+            localOwnerId: config.localOwnerId,
+            sourceResourceIncarnationId: config.sourceResourceIncarnationId,
+            providerVersion: `mercury:txn:${txn.id}`,
+            semanticHash: sha256([
+              config.deploymentId, config.localOwnerId, config.sourceResourceIncarnationId, txn.id, 'removed',
+            ].join('\x00')),
+            hashSpecificationVersion: HASH_SPEC_VERSION,
+            domain: mercuryResourceKind(account.type),
+            payload: Object.freeze({ transactionId: txn.id, accountId: txn.accountId, isRemoved: true }),
+            rawPayload: txn,
+            observedAt: snapshotObservedAt,
+          })
+          continue
+        }
         const status = ledgerStatus(txn.status)
         if (status === null) {
-          // Cancellation/reversal and unknown lifecycle states cannot be safely
-          // represented as a posted ledger fact. Quarantine the row and fail the
-          // snapshot closed so its checkpoint is never promoted.
+          // An unknown lifecycle state cannot be safely represented as a ledger
+          // fact. Quarantine the row and fail the snapshot closed so its
+          // checkpoint is never promoted.
           transactionsObserved++
           quarantinedTransactions++
           paginationComplete = false

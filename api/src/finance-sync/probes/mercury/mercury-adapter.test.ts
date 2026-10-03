@@ -170,7 +170,7 @@ describe('Mercury provider adapter G6', () => {
     expect(result.paginationComplete).toBe(false)
   })
 
-  it('drops cancelled/failed transactions from observations', async () => {
+  it('retracts cancelled and failed transactions without failing the account', async () => {
     const transport = mockTransport({
       fetchTransactions: async () => ({
         transactions: [
@@ -189,13 +189,24 @@ describe('Mercury provider adapter G6', () => {
       sourceResourceIncarnationId: 'mercury:org-1',
     }, transport)
 
-    expect(result.observations.length).toBe(3)
     expect(result.transactionsObserved).toBe(4)
+    expect(result.quarantinedTransactions).toBe(0)
+    expect(result.paginationComplete).toBe(true)
+    const transactions = result.observations.filter(o => o.providerVersion.startsWith('mercury:txn:'))
+    expect(transactions.map(o => [o.payload.transactionId, o.payload.isRemoved === true])).toEqual([
+      ['txn-1', false], ['txn-2', true], ['txn-3', true], ['txn-4', false],
+    ])
+    // A tombstone carries only the identity needed to retract the activity.
+    expect(transactions[1].payload).toEqual({ transactionId: 'txn-2', accountId: transactions[0].payload.accountId, isRemoved: true })
+  })
 
-    const observedIds = result.observations
-      .filter(o => o.providerVersion.startsWith('mercury:txn:'))
-      .map(o => o.payload.transactionId)
-    expect(observedIds).toEqual(['txn-1', 'txn-4'])
+  it('still fails closed on a transaction status it does not know', async () => {
+    const result = await runMercurySync({ deploymentId: 'g6-test', localOwnerId: 'alexis', sourceResourceIncarnationId: 'mercury:org-1' }, mockTransport({
+      fetchTransactions: async () => ({ transactions: [mockTransaction({ id: 'txn-9', status: 'reversed' })], total: 1 }),
+    }))
+    expect(result.quarantinedTransactions).toBe(1)
+    expect(result.paginationComplete).toBe(false)
+    expect(result.observations.some(o => o.providerVersion === 'mercury:txn:txn-9')).toBe(false)
   })
 
   it('handles pagination across multiple pages', async () => {
