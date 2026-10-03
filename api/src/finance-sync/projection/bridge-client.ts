@@ -229,6 +229,21 @@ export function idempotencyKey(
   return createHash('sha256').update(framed, 'utf8').digest('hex').slice(0, 40)
 }
 
+/**
+ * Bind an activity operation to the revision assigned to its projected payload.
+ * An unchanged revision returns the operation, and so its idempotency key,
+ * untouched. A changed revision derives a new deterministic key from the
+ * original one, so the outbox and receiver see new work exactly once.
+ */
+export function withProjectedRevision(operation: BridgeDisclosureOperation, revision: number): BridgeDisclosureOperation {
+  if (operation.observationRevision === revision) return operation
+  return {
+    ...operation,
+    observationRevision: revision,
+    idempotencyKey: idempotencyKey(operation.deploymentId, operation.idempotencyKey, ['projected-revision-v1', String(revision)]),
+  }
+}
+
 interface DecimalParts {
   readonly magnitude: string
   readonly negative: boolean

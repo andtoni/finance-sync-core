@@ -2,6 +2,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { discoverMigrations, migrate } from "./migrate";
 import { resolve } from "node:path";
+import { assignProjectedRevision } from "../projection/projected-revision";
+import type { BridgeDisclosureOperation } from "../projection/bridge-client";
+import type { FinanceSyncSql } from "./pg";
 
 const url = process.env.FINANCE_SYNC_TEST_DATABASE_URL;
 const suite = url ? describe : describe.skip;
@@ -160,6 +163,90 @@ suite("PostgreSQL migrations (integration)", () => {
     });
   });
 
+  it("seeds projected activity revisions from enqueued work so the first projection after upgrade stays ordered", async () => {
+    const schemaName = `finance_sync_projected_revision_${process.pid}_${Date.now()}`;
+    await withSchema(schemaName, async tx => {
+      const migrations = await applyThroughEight(tx, schemaName);
+      for (const migration of migrations.filter(candidate => candidate.version > 8 && candidate.version <= 22)) {
+        await tx.unsafe(migration.sql);
+      }
+      const deploymentId = 'projected-revision-upgrade';
+      const owner = 'urn:wealthfolio:test#projected-owner';
+      const resource = (id: string) => `${deploymentId}:60000000-0000-4000-8000-000000000001:${id}`;
+      const activity = (notes: string) => ({
+        accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'POSTED', activityDate: '2026-09-14',
+        activityDatePrecision: 'DATE' as const, amount: '12', currency: 'ZAR', notes,
+        metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } },
+      });
+      const operation = (key: string, resourceId: string, notes: string, extra: Partial<BridgeDisclosureOperation> = {}): BridgeDisclosureOperation => ({
+        deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1, kind: 'ActivityUpsert',
+        idempotencyKey: key, resourceId, activity: activity(notes), ...extra,
+      });
+      const enqueue = async (payload: BridgeDisclosureOperation, state: string) => (await tx<{ id: string }[]>`
+        INSERT INTO projection_outbox (deployment_id,local_owner_id,connection_id,provider_generation,idempotency_key,payload,state)
+        VALUES (${deploymentId},${owner},'legacy-connection',1,${payload.idempotencyKey},${tx.json(payload as never)},${state})
+        RETURNING id`)[0].id;
+      // One payload at two revisions, then a settlement delivered on its own and
+      // a dead-lettered correlation of it at the same revision.
+      await enqueue(operation('plain-41', resource('plain'), 'plain', { observationRevision: 41 }), 'delivered');
+      await enqueue(operation('plain-44', resource('plain'), 'plain', { observationRevision: 44 }), 'delivered');
+      await enqueue(operation('settled-alone', resource('posted'), 'settlement', { observationRevision: 47 }), 'delivered');
+      const deadLetter = await enqueue(operation('correlated', resource('card'), 'correlated', {
+        observationRevision: 47, lifecycleSuccessorId: resource('posted'),
+      }), 'dead_letter');
+      await enqueue(operation('unrevisioned', resource('unrevisioned'), 'legacy'), 'delivered');
+      await enqueue({ ...operation('removed', resource('removed'), 'removed', { observationRevision: 48 }), kind: 'ActivityDelete', activity: undefined }, 'delivered');
+      await tx`INSERT INTO investec_terminal_revision_recovery_intents
+        (deployment_id,local_owner_id,outbox_id,expected_payload_hash,reason,actor_subject,mode,state,ordinary_operation)
+        VALUES (${deploymentId},${owner},${deadLetter}::uuid,${'a'.repeat(64)},'recovered','operator','apply','suppressed',
+          ${tx.json(operation('recovered', resource('recovered'), 'recovered', { observationRevision: 49 }) as never)})`;
+      // Fresh ordinals come from the sequence that issued the legacy revisions.
+      await tx`SELECT setval('finance_sync_observation_revision_seq', 60)`;
+
+      await tx.unsafe(migrations.find(migration => migration.version === 23)!.sql);
+
+      const digest = async (notes: string) => (await tx<{ digest: string }[]>`
+        SELECT encode(sha256(convert_to((${tx.json(activity(notes))}::jsonb)::text, 'UTF8')), 'hex') AS digest`)[0].digest;
+      const seeded = await tx<{ resource_id: string; observation_revision: string; payload_digest: string | null }[]>`
+        SELECT resource_id, observation_revision, payload_digest FROM projected_activity_revision_ledger
+        WHERE deployment_id=${deploymentId} ORDER BY observation_revision, resource_id`;
+      expect(seeded).toEqual([
+        { resource_id: resource('plain'), observation_revision: '41', payload_digest: await digest('plain') },
+        { resource_id: resource('plain'), observation_revision: '44', payload_digest: await digest('plain') },
+        { resource_id: resource('posted'), observation_revision: '47', payload_digest: null },
+        { resource_id: resource('recovered'), observation_revision: '49', payload_digest: await digest('recovered') },
+      ]);
+      const [untouched] = await tx<{ rows: number; states: string[] }[]>`
+        SELECT count(*)::int AS rows, array_agg(DISTINCT state ORDER BY state) AS states
+        FROM projection_outbox WHERE deployment_id=${deploymentId}`;
+      expect(untouched).toEqual({ rows: 6, states: ['dead_letter', 'delivered'] });
+
+      const assign = (candidate: BridgeDisclosureOperation) => assignProjectedRevision(tx as unknown as FinanceSyncSql, candidate);
+      // The payload last delivered keeps its revision and key, even from an older ordinal.
+      const replayed = operation('plain-44', resource('plain'), 'plain', { observationRevision: 44 });
+      expect(await assign(replayed)).toBe(replayed);
+      expect((await assign(operation('plain-41', resource('plain'), 'plain', { observationRevision: 41 }))).observationRevision).toBe(44);
+      // A different payload at the delivered revision takes a fresh ordinal.
+      const changed = await assign(operation('plain-44', resource('plain'), 'changed', { observationRevision: 44 }));
+      expect(changed.observationRevision).toBe(61);
+      expect(changed.idempotencyKey).not.toBe('plain-44');
+      // Neither payload of the conflicting legacy revision may reuse it.
+      const settled = await assign(operation('settled-alone', resource('posted'), 'settlement', { observationRevision: 47 }));
+      expect(settled.observationRevision).toBe(62);
+      const correlated = await assign(operation('correlated', resource('card'), 'correlated', {
+        observationRevision: 47, lifecycleSuccessorId: resource('posted'),
+      }));
+      expect(correlated.observationRevision).toBe(63);
+      expect(correlated.idempotencyKey).not.toBe('correlated');
+      // A genuinely newer observation ordinal is kept as is.
+      const newer = operation('recovered-next', resource('recovered'), 'revised', { observationRevision: 55 });
+      expect(await assign(newer)).toBe(newer);
+      // The lifecycle predecessor is not a written activity, so it has no history.
+      const predecessor = operation('card-pending', resource('card'), 'authorization', { observationRevision: 40 });
+      expect(await assign(predecessor)).toBe(predecessor);
+    });
+  });
+
   it("fails closed when a legacy runtime row has no matching provider connection", async () => {
     const schemaName = `finance_sync_unmatched_${process.pid}_${Date.now()}`;
     await expect(withSchema(schemaName, async tx => {
@@ -175,7 +262,7 @@ suite("PostgreSQL migrations (integration)", () => {
     await migrate(sql!, directory);
     await migrate(sql!, directory);
     const rows = await sql!`select version from finance_sync_schema_migrations order by version`;
-    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+    expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
     const revisionLedger = await sql!`
       select table_name from information_schema.tables
       where table_name = 'observation_revision_ledger'

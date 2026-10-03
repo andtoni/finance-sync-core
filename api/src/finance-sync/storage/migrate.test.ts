@@ -8,7 +8,7 @@ const root = resolve(import.meta.dirname, "../../../finance-sync-migrations");
 describe("finance-sync migrations", () => {
   it("discovers migrations in numeric order with sha256 checksums", async () => {
     const migrations = await discoverMigrations(root);
-    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
+    expect(migrations.map((m) => m.version)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]);
     expect(migrations.every((m) => /^[a-f0-9]{64}$/.test(m.checksum))).toBe(true);
   });
 
@@ -108,6 +108,21 @@ describe("finance-sync migrations", () => {
     expect(sql).toMatch(/GRANT SELECT, INSERT ON observation_revision_ledger TO finance_sync_runtime/i);
     expect(sql).toMatch(/GRANT USAGE, SELECT ON SEQUENCE finance_sync_observation_revision_seq TO finance_sync_runtime/i);
     expect(sql).toMatch(/REVOKE UPDATE, DELETE ON observation_revision_ledger FROM finance_sync_runtime/i);
+  });
+
+  it("defines the append-only projected activity revision ledger seeded from enqueued work", () => {
+    const sql = readFileSync(resolve(root, "0023_projected_activity_revision.sql"), "utf8");
+    expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS projected_activity_revision_ledger/i);
+    expect(sql).toMatch(/PRIMARY KEY \(deployment_id, local_owner_id, resource_id, observation_revision\)/i);
+    expect(sql).toMatch(/COALESCE\(operation->>'lifecycleSuccessorId', operation->>'resourceId'\)/i);
+    expect(sql).toMatch(/FROM projection_outbox[\s\S]*UNION ALL[\s\S]*FROM investec_terminal_revision_recovery_intents/i);
+    expect(sql).toMatch(/count\(DISTINCT activity\) = 1/i);
+    expect(sql).toMatch(/ON CONFLICT DO NOTHING/i);
+    expect(sql).not.toMatch(/UPDATE projection_outbox/i);
+    expect(sql).not.toMatch(/nextval|setval/i);
+    expect(sql).toMatch(/projected activity revisions are append-only/i);
+    expect(sql).toMatch(/GRANT SELECT, INSERT ON projected_activity_revision_ledger TO finance_sync_runtime/i);
+    expect(sql).toMatch(/REVOKE UPDATE, DELETE ON projected_activity_revision_ledger FROM finance_sync_runtime/i);
   });
 
   it("indexes exact delivered and uncertain Investec lifecycle identities", () => {

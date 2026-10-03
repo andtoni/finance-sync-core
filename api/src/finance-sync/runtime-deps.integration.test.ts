@@ -5,9 +5,11 @@ import { createRuntimeDependencies } from './runtime-deps'
 import { migrate } from './storage/migrate'
 import { bridgeOperationToWire, currentStateToBridge } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
+import { assignProjectedRevision } from './projection/projected-revision'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
 import type { RuntimeConnection } from './runtime'
+import type { FinanceSyncSql } from './storage/pg'
 
 const url = process.env.FINANCE_SYNC_TEST_DATABASE_URL
 const suite = url ? describe : describe.skip
@@ -53,6 +55,36 @@ function balanceObservation(): ObservationOutput {
 function binding(fields: readonly string[]): string {
   const encoder = new TextEncoder()
   return `v3;${fields.map(value => `${encoder.encode(value).byteLength}:${value}`).join('')}`
+}
+
+/**
+ * Stand-in for the receiver's provider-write ordering: per written activity (a
+ * lifecycle writes its successor) an unchanged revision must carry an unchanged
+ * payload, a greater revision overwrites, and an older one is a no-op.
+ */
+function revisionCheckingBridge() {
+  const held = new Map<string, { revision: number; activity: string }>()
+  const rejected: string[] = []
+  const handler = (async (_input, init) => {
+    if (init?.method === 'GET') return new Response(null, { status: 404 })
+    const wire = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
+    const successor = typeof wire.lifecycle_successor_id === 'string' ? wire.lifecycle_successor_id : null
+    const written = successor ?? String(wire.resource_id)
+    const revision = Number(wire.observation_revision)
+    const activity = JSON.stringify(wire.activity)
+    const prior = held.get(written)
+    if (prior && prior.revision === revision && prior.activity !== activity) {
+      rejected.push(written)
+      return new Response(null, { status: 400 })
+    }
+    if (!prior || revision > prior.revision) held.set(written, { revision, activity })
+    const fields = [deploymentId, owner, String(wire.idempotency_key), '1', 'activity_upsert', String(wire.resource_id), 'wealthfolio-account', successor === null ? '0' : '1', successor ?? '', 'accepted', '0', '']
+    return new Response(JSON.stringify({ deploymentId, accountId: 'wealthfolio-account', subject: owner,
+      idempotencyKey: wire.idempotency_key, accessGeneration: 1, operation: 'activity_upsert',
+      resourceId: wire.resource_id, lifecycleSuccessorId: successor, outcome: 'Accepted', bindingVersion: 3,
+      receiptBinding: binding(fields), semanticHash: null }), { status: 200 })
+  }) as typeof fetch
+  return { handler, held, rejected }
 }
 
 suite('runtime dependencies with PostgreSQL', () => {
@@ -646,6 +678,164 @@ suite('runtime dependencies with PostgreSQL', () => {
     await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
   })
 
+  it('gives a settlement correlated after its own delivery a strictly greater revision', async () => {
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    // The authorization is observed first, so it holds the older ordinal. The
+    // settled amount differs, so the two facts do not pair on their own.
+    const card = { ...observation('late-link-card', {
+      transactionId: 'late-link-card', accountId: 'provider-account', amount: '-10', currency: 'ZAR',
+      transactionDate: '2026-07-17', originalAmount: '10', originalCurrency: 'ZAR', date: '2026-07-17',
+      authorizationDateTime: '2026-07-17T10:00:00.000Z', description: 'SYNTHETIC LATE LINK MERCHANT',
+      reference: 'late-link-ref', type: 'DEBIT', transactionType: 'CARD', cardNumber: 'TEST-CARD-0011',
+      metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } },
+      direction: 'DEBIT', status: 'pending',
+    }), providerVersion: 'investec:card:late-link-card' }
+    const posted = { ...observation('late-link-posted', {
+      transactionId: 'late-link-posted', accountId: 'provider-account', amount: '-12', currency: 'ZAR',
+      transactionDate: '2026-07-17', date: '2026-07-17', postingDate: '2026-07-17', settlementDate: '2026-07-17',
+      description: 'SYNTHETIC LATE LINK MERCHANT', reference: 'late-link-ref', type: 'DEBIT',
+      transactionType: 'CARDPURCHASES', direction: 'DEBIT', status: 'posted',
+    }), providerVersion: 'investec:txn:late-link-posted' }
+    const cardResource = `${deploymentId}:${sourceId}:late-link-card`
+    const postedResource = `${deploymentId}:${sourceId}:late-link-posted`
+    const written = () => sql<{ id: string; state: string; payload: BridgeDisclosureOperation }[]>`
+      SELECT id, state, payload FROM projection_outbox
+      WHERE deployment_id=${deploymentId}
+        AND COALESCE(payload->>'lifecycleSuccessorId', payload->>'resourceId') IN (${cardResource}, ${postedResource})
+      ORDER BY (payload->>'observationRevision')::bigint, (payload ? 'lifecycleSuccessorId'), payload->>'idempotencyKey'`
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    const bridge = revisionCheckingBridge()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = bridge.handler
+    try {
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+      await deps.persistAndEnqueue(investecConnection, [card], { skipCurrentState: true })
+      await deps.persistAndEnqueue(investecConnection, [posted], { skipCurrentState: true })
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 2, failed: 0 })
+      const [pendingCard, settledAlone] = await written()
+      expect(pendingCard.payload.resourceId).toBe(cardResource)
+      expect(settledAlone.payload.resourceId).toBe(postedResource)
+      expect(settledAlone.payload.lifecycleSuccessorId).toBeUndefined()
+      const deliveredRevision = settledAlone.payload.observationRevision!
+      expect(pendingCard.payload.observationRevision!).toBeLessThan(deliveredRevision)
+
+      // An operator link correlates the delivered settlement with the older
+      // authorization. No provider fact changed, so no ledger ordinal did either.
+      await sql`INSERT INTO investec_card_lifecycle_overrides
+        (deployment_id, local_owner_id, source_resource_incarnation_id, pending_transaction_id, posted_transaction_id, actor_subject, reason)
+        VALUES (${deploymentId}, ${owner}, ${sourceId}::uuid, 'late-link-card', 'late-link-posted', ${owner}, 'integration test')`
+      await expect(deps.persistAndEnqueue(investecConnection, [posted], { skipCurrentState: true })).resolves.toBe(0)
+      const correlatedRows = await written()
+      const lifecycle = correlatedRows.find(row => row.payload.lifecycleSuccessorId === postedResource)!
+      expect(lifecycle.payload.resourceId).toBe(cardResource)
+      expect(lifecycle.payload.activity?.sourceType).toBe('CARD')
+      expect(lifecycle.payload.activity).not.toEqual(settledAlone.payload.activity)
+      expect(lifecycle.payload.observationRevision!).toBeGreaterThan(deliveredRevision)
+      expect(Number.isSafeInteger(lifecycle.payload.observationRevision)).toBe(true)
+      expect(lifecycle.payload.idempotencyKey).not.toBe(settledAlone.payload.idempotencyKey)
+      const [{ ledger_max: ledgerMax }] = await sql<{ ledger_max: string }[]>`
+        SELECT max(observation_revision) AS ledger_max FROM observation_revision_ledger WHERE deployment_id=${deploymentId}`
+      expect(lifecycle.payload.observationRevision!).toBeGreaterThan(Number(ledgerMax))
+
+      // Projecting the same correlated payload again is idempotent.
+      await expect(deps.persistAndEnqueue(investecConnection, [posted], { skipCurrentState: true })).resolves.toBe(0)
+      expect(await written()).toEqual(correlatedRows)
+
+      const delivery = await deps.projectPending(investecConnection)
+      expect(bridge.rejected).toEqual([])
+      expect(delivery.failed).toBe(0)
+      expect(bridge.held.get(postedResource)?.revision).toBe(lifecycle.payload.observationRevision)
+
+      // After the lifecycle is terminal the same payload is an ordinary upsert
+      // of the successor: a new operation at the unchanged revision.
+      await deps.persistAndEnqueue(investecConnection, [posted], { skipCurrentState: true })
+      const ordinary = (await written()).find(row => row.payload.resourceId === postedResource && row.state === 'pending')!
+      expect(ordinary.payload.lifecycleSuccessorId).toBeUndefined()
+      expect(ordinary.payload.activity).toEqual(lifecycle.payload.activity)
+      expect(ordinary.payload.observationRevision).toBe(lifecycle.payload.observationRevision)
+      await expect(deps.projectPending(investecConnection)).resolves.toEqual({ delivered: 1, failed: 0 })
+      expect(bridge.rejected).toEqual([])
+    } finally {
+      globalThis.fetch = originalFetch
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('gives a changed derived payload of an unchanged observation a strictly greater revision', async () => {
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    const resourceId = `${deploymentId}:${sourceId}:derived-change`
+    const item = observation('derived-change', {
+      transactionId: 'derived-change', accountId: 'provider-account', amount: '5', currency: 'USD',
+      date: '2026-09-14', status: 'posted', name: 'FIRST DERIVATION',
+    })
+    // Same observation identity, so the same raw row and ledger ordinal; only
+    // the activity derived from it differs, as after a projection change.
+    const rederived = { ...item, payload: { ...item.payload, name: 'SECOND DERIVATION' } }
+    const rows = () => sql<{ payload: BridgeDisclosureOperation }[]>`
+      SELECT payload FROM projection_outbox
+      WHERE deployment_id=${deploymentId} AND payload->>'resourceId'=${resourceId}
+      ORDER BY (payload->>'observationRevision')::bigint`
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    try {
+      await deps.persistAndEnqueue(connection, [item], { skipCurrentState: true })
+      const [first] = await rows()
+      const ledger = await sql<{ observation_revision: string }[]>`
+        SELECT observation_revision FROM observation_revision_ledger
+        WHERE deployment_id=${deploymentId} AND provider_version=${item.providerVersion}`
+      expect(ledger).toHaveLength(1)
+      expect(first.payload.observationRevision).toBe(Number(ledger[0].observation_revision))
+
+      await expect(deps.persistAndEnqueue(connection, [rederived], { skipCurrentState: true })).resolves.toBe(0)
+      const afterChange = await rows()
+      expect(afterChange).toHaveLength(2)
+      const second = afterChange[1]
+      expect(second.payload.activity?.notes).toBe('SECOND DERIVATION')
+      expect(second.payload.observationRevision!).toBeGreaterThan(first.payload.observationRevision!)
+      expect(second.payload.idempotencyKey).not.toBe(first.payload.idempotencyKey)
+      expect(await sql`SELECT 1 FROM observation_revision_ledger
+        WHERE deployment_id=${deploymentId} AND provider_version=${item.providerVersion}`).toHaveLength(1)
+
+      // The same derived payload again keeps its revision and key.
+      await deps.persistAndEnqueue(connection, [rederived], { skipCurrentState: true })
+      expect(await rows()).toEqual(afterChange)
+
+      // Returning to the earlier payload is a change again, never a stale replay.
+      await deps.persistAndEnqueue(connection, [item], { skipCurrentState: true })
+      const afterReturn = await rows()
+      expect(afterReturn).toHaveLength(3)
+      expect(afterReturn[2].payload.activity).toEqual(first.payload.activity)
+      expect(afterReturn[2].payload.observationRevision!).toBeGreaterThan(second.payload.observationRevision!)
+      expect(new Set(afterReturn.map(row => row.payload.idempotencyKey)).size).toBe(3)
+      await deps.persistAndEnqueue(connection, [item], { skipCurrentState: true })
+      expect(await rows()).toEqual(afterReturn)
+    } finally {
+      await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    }
+  })
+
+  it('serializes concurrent projections of one activity into distinct ordered revisions', async () => {
+    const operation = (notes: string): BridgeDisclosureOperation => ({
+      deploymentId, accountId: 'wealthfolio-account', subject: owner, accessGeneration: 1, kind: 'ActivityUpsert',
+      resourceId: `${deploymentId}:${sourceId}:concurrent-projection`, idempotencyKey: `concurrent-${notes}`, observationRevision: 1,
+      activity: { accountId: 'wealthfolio-account', activityType: 'WITHDRAWAL', status: 'POSTED', activityDate: '2026-09-14',
+        activityDatePrecision: 'DATE', amount: '5', currency: 'USD', notes },
+    })
+    // Both carry the same incoming ordinal and neither sees a prior payload.
+    const assigned = await Promise.all(['left', 'right'].map(notes => sql.begin(async transaction => {
+      const result = await assignProjectedRevision(transaction as unknown as FinanceSyncSql, operation(notes))
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 50))
+      return result
+    })))
+    const [kept, raised] = assigned.slice().sort((a, b) => a.observationRevision! - b.observationRevision!)
+    expect(kept.observationRevision).toBe(1)
+    expect(kept.idempotencyKey).toMatch(/^concurrent-(left|right)$/)
+    expect(raised.observationRevision!).toBeGreaterThan(1)
+    expect(raised.idempotencyKey).not.toMatch(/^concurrent-/)
+    expect(raised.activity?.notes).not.toBe(kept.activity?.notes)
+  })
 
 })
 

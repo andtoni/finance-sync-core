@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { BridgeDisclosureOperation, BridgeReceipt } from './projection/bridge-client'
 import { validateBridgeReceipt } from './projection/bridge-client'
+import { assignProjectedRevision } from './projection/projected-revision'
 import type { FinanceSyncSql } from './storage/pg'
 
 export interface TerminalRevisionRecoveryRequest {
@@ -169,10 +170,13 @@ export function createInvestecTerminalRevisionRecoveryControl(
           ? { ordinaryOperation: claim.operation, lifecycleOperation: claim.lifecycleOperation, boundReceipt: claim.receipt }
           : await resolver.resolve(claim.row!.payload)
         const receipt = await validateResolution(claim.row!, resolved)
-        const operation = resolved.ordinaryOperation
+        let operation = resolved.ordinaryOperation
         await sql.begin(async transaction => {
           const tx = transaction as unknown as FinanceSyncSql
           await assertClaim(tx)
+          // The resolver derives S read-only. Assign its revision where it first
+          // becomes durable; a saved operation is replayed exactly as saved.
+          if (!claim.operation) operation = await assignProjectedRevision(tx, operation)
           await tx`UPDATE investec_terminal_revision_recovery_intents
             SET ordinary_operation=${tx.json(operation as never)}, bound_lifecycle_operation=${tx.json(resolved.lifecycleOperation as never)}, bound_lifecycle_receipt=${tx.json(receipt as never)}
             WHERE intent_id=${intentId}::uuid AND state='claimed' AND claim_owner=${claimOwner}::uuid`

@@ -17,6 +17,7 @@ import {
   validateBridgeReceipt,
   type BridgeDisclosureOperation,
 } from './projection/bridge-client'
+import { assignProjectedRevision } from './projection/projected-revision'
 import type { PersistEnqueueOptions, RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import { readExclusiveInput } from './secret-input'
 import { loadDurableRuntimeConnections, type ProviderSecretResolver } from './durable-connections'
@@ -1875,15 +1876,20 @@ export function createRuntimeDependencies(
           )
           return operation ? [operation] : []
         })()
-      for (const operation of operations) await tx`
-        INSERT INTO projection_outbox (
-          deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
-        ) VALUES (
-          ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
-          ${operation.idempotencyKey}, ${tx.json(operation as never)}
-        )
-        ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
-      `
+      for (const projected of operations) {
+        // Every activity producer enqueues here, so this is where a changed
+        // derived payload is guaranteed a strictly greater revision.
+        const operation = await assignProjectedRevision(tx, projected)
+        await tx`
+          INSERT INTO projection_outbox (
+            deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload
+          ) VALUES (
+            ${deploymentId}, ${connection.localOwnerId}, ${connection.connectionId}, ${connection.providerGeneration},
+            ${operation.idempotencyKey}, ${tx.json(operation as never)}
+          )
+          ON CONFLICT (deployment_id, connection_id, provider_generation, idempotency_key) DO NOTHING
+        `
+      }
     }
     for (const current of currentStates) {
       const operation = currentStateToBridge({

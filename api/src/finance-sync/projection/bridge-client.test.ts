@@ -7,6 +7,7 @@ import {
   bridgeOperationToWire,
   currentStateToBridge,
   providerObservationToBridge,
+  withProjectedRevision,
   type BridgeTransport,
   type BridgeDisclosureOperation,
   type BridgeReceipt,
@@ -93,6 +94,21 @@ describe('Bridge client', () => {
     expect(idempotencyKey('dep-1', 'hash-a')).toBe(idempotencyKey('dep-1', 'hash-a'))
     expect(idempotencyKey('dep-1', 'hash-a')).not.toBe(idempotencyKey('dep-2', 'hash-a'))
     expect(idempotencyKey('dep-1', 'hash-a')).toHaveLength(40)
+  })
+
+  it('keeps the idempotency key for an unchanged projected revision and derives a new one when it changes', () => {
+    const operation = baseOperation({ observationRevision: 7 })
+    expect(withProjectedRevision(operation, 7)).toBe(operation)
+    const raised = withProjectedRevision(operation, 9)
+    expect(raised).toEqual({ ...operation, observationRevision: 9, idempotencyKey: raised.idempotencyKey })
+    expect(raised.idempotencyKey).toMatch(/^[a-f0-9]{40}$/)
+    expect(raised.idempotencyKey).not.toBe(operation.idempotencyKey)
+    expect(withProjectedRevision(operation, 9).idempotencyKey).toBe(raised.idempotencyKey)
+    expect(withProjectedRevision(operation, 10).idempotencyKey).not.toBe(raised.idempotencyKey)
+    expect(withProjectedRevision(baseOperation({ observationRevision: 7, idempotencyKey: 'other-key' }), 9).idempotencyKey).not.toBe(raised.idempotencyKey)
+    const { observationRevision: _revision, ...unrevisioned } = operation
+    expect(withProjectedRevision(unrevisioned, 9).observationRevision).toBe(9)
+    expect(bridgeOperationToWire(raised).observation_revision).toBe(9)
   })
 
   it('marks date-only provider facts as DATE and real authorizations as INSTANT', () => {

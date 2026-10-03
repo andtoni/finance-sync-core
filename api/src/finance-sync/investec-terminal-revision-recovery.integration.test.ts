@@ -153,6 +153,32 @@ suite('Investec terminal revision recovery against PostgreSQL', () => {
     expect((await sql`SELECT reason FROM investec_terminal_revision_recovery_audit WHERE outbox_id=${seeded.id}::uuid`)[0].reason).toBe('lost response')
   })
 
+  it('gives a recovered successor payload a strictly greater revision than a different payload already projected at its revision', async () => {
+    const op = lifecycle('revision-conflict')
+    const seeded = await seed(op)
+    const ordinary = ordinaryOperation(op)
+    // The successor was last projected at this very revision with another payload.
+    await sql`INSERT INTO projected_activity_revision_ledger (deployment_id,local_owner_id,resource_id,observation_revision,payload_digest)
+      VALUES (${deploymentId},${subject},${ordinary.resourceId},${ordinary.observationRevision!},${'0'.repeat(64)})`
+    const delivered: BridgeDisclosureOperation[] = []
+    const control = createInvestecTerminalRevisionRecoveryControl(sql, deploymentId, {
+      resolve: async () => ({ lifecycleOperation: priorLifecycle(op), ordinaryOperation: ordinary, boundReceipt: receipt(priorLifecycle(op)) }),
+      deliver: async candidate => { delivered.push(candidate); return receipt(candidate) },
+    })
+    const applied = await control.recover(subject, requestFor(seeded))
+    expect(applied.state).toBe('suppressed')
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0].activity).toEqual(ordinary.activity)
+    expect(delivered[0].observationRevision!).toBeGreaterThan(ordinary.observationRevision!)
+    expect(delivered[0].idempotencyKey).not.toBe(ordinary.idempotencyKey)
+    const [intent] = await sql`SELECT ordinary_operation,new_operation_idempotency_key FROM investec_terminal_revision_recovery_intents WHERE outbox_id=${seeded.id}::uuid`
+    expect(intent.ordinary_operation).toEqual(delivered[0])
+    expect(intent.new_operation_idempotency_key).toBe(delivered[0].idempotencyKey)
+    const [head] = await sql`SELECT observation_revision FROM projected_activity_revision_ledger
+      WHERE deployment_id=${deploymentId} AND resource_id=${ordinary.resourceId} ORDER BY observation_revision DESC LIMIT 1`
+    expect(Number(head.observation_revision)).toBe(delivered[0].observationRevision)
+  })
+
   it('rejects concurrent duplicate claims and preserves a payload CAS race', async () => {
     const op = lifecycle('concurrent')
     const seeded = await seed(op)
@@ -523,6 +549,12 @@ suite('Investec terminal revision recovery against PostgreSQL', () => {
     expect(revision.observation_revision).toBeTruthy()
     await expect(sql`UPDATE observation_revision_ledger SET provider_version='tampered' WHERE observation_revision=${revision.observation_revision}`).rejects.toThrow(/append-only/)
     await expect(sql`DELETE FROM observation_revision_ledger WHERE observation_revision=${revision.observation_revision}`).rejects.toThrow(/append-only/)
+    await expect(runtimeSql`UPDATE projected_activity_revision_ledger SET payload_digest=NULL WHERE false`).rejects.toThrow(/permission denied/)
+    await expect(runtimeSql`DELETE FROM projected_activity_revision_ledger WHERE false`).rejects.toThrow(/permission denied/)
+    const successor = op.lifecycleSuccessorId!
+    expect(await sql`SELECT 1 FROM projected_activity_revision_ledger WHERE deployment_id=${deploymentId} AND resource_id=${successor}`).toHaveLength(1)
+    await expect(sql`UPDATE projected_activity_revision_ledger SET payload_digest=NULL WHERE deployment_id=${deploymentId} AND resource_id=${successor}`).rejects.toThrow(/append-only/)
+    await expect(sql`DELETE FROM projected_activity_revision_ledger WHERE deployment_id=${deploymentId} AND resource_id=${successor}`).rejects.toThrow(/append-only/)
     await expect(sql`UPDATE investec_terminal_revision_recovery_audit SET reason='tampered' WHERE intent_id=${applied.intentId}::uuid`).rejects.toThrow(/append-only/)
     await expect(sql`DELETE FROM investec_terminal_revision_recovery_audit WHERE intent_id=${applied.intentId}::uuid`).rejects.toThrow(/append-only/)
     await expect(sql`DELETE FROM projection_outbox WHERE id=${seeded.id}::uuid`).rejects.toThrow(/foreign key/)
