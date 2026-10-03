@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { runConfiguredSyncCycle, type SyncRuntimeDependencies } from './runtime'
+import { financeSyncHealthResponse, syncCycleOutcome } from './health'
+import { PLAID_ITEM_ERROR_CODES } from './provider-runtime'
 import type { ObservationOutput } from './probes/investec/investec-adapter'
 
 const plaidConnection = (connectionId: string, accessToken: string, accountId = 'a') => ({
@@ -122,7 +124,7 @@ describe('configured sync runtime', () => {
       saveCheckpoint: async (_connection, cursor) => { calls.push(`checkpoint:${cursor}`) },
     }
     const result = await runConfiguredSyncCycle('d', deps)
-    expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0 })
+    expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0, plaidItemConditions: [] })
     expect(calls).toEqual(['persist+enqueue:1', 'project', 'checkpoint:cursor-1'])
   })
 
@@ -140,7 +142,7 @@ describe('configured sync runtime', () => {
     }
 
     await expect(runConfiguredSyncCycle('d', deps, { providersEnabled: false, projectionEnabled: false }))
-      .resolves.toEqual({ connections: 0, observations: 0, delivered: 0, failures: 0 })
+      .resolves.toEqual({ connections: 0, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] })
     expect(loadConnections).not.toHaveBeenCalled()
     expect(runProvider).not.toHaveBeenCalled()
     expect(projectPending).not.toHaveBeenCalled()
@@ -158,7 +160,7 @@ describe('configured sync runtime', () => {
     }
 
     await expect(runConfiguredSyncCycle('d', deps, { providersEnabled: true, projectionEnabled: false }))
-      .resolves.toEqual({ connections: 1, observations: 0, delivered: 0, failures: 0 })
+      .resolves.toEqual({ connections: 1, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] })
     expect(calls).toEqual(['persist+enqueue', 'checkpoint'])
   })
 
@@ -193,7 +195,7 @@ describe('configured sync runtime', () => {
         observations: [],
         plaidSync: {
           added: 2, modified: 1, removed: 0,
-          skippedUnadmittedAccount: 3, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0,
+          skippedUnadmittedAccount: 3, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0, skippedMissingBalance: 0, skippedAccountNotReturned: 0,
         },
       }),
       persistAndEnqueue: async () => 0,
@@ -207,7 +209,7 @@ describe('configured sync runtime', () => {
       expect(observed).toBeDefined()
       expect(JSON.parse(String(observed![1]))).toEqual({
         added: 2, modified: 1, removed: 0,
-        skippedUnadmittedAccount: 3, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0,
+        skippedUnadmittedAccount: 3, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0, skippedMissingBalance: 0, skippedAccountNotReturned: 0,
       })
     } finally {
       log.mockRestore()
@@ -222,7 +224,7 @@ describe('configured sync runtime', () => {
       loadPlaidItemCheckpoint: async () => null,
       savePlaidItemCheckpoint: async () => {},
       runProvider: async () => {
-        throw Object.assign(new Error('plaid request failed: HTTP 400 item-1 secret-account'), { code: 'ITEM_LOGIN_REQUIRED' })
+        throw Object.assign(new Error('plaid request failed: HTTP 400 item-1 secret-account'), { code: 'INSTITUTION_DOWN', errorType: 'INSTITUTION_ERROR' })
       },
       persistAndEnqueue: async () => 0,
       projectPending: async () => ({ delivered: 0, failed: 0 }),
@@ -232,10 +234,315 @@ describe('configured sync runtime', () => {
     try {
       const result = await runConfiguredSyncCycle('d', deps)
       expect(result.failures).toBe(1)
+      expect(result.plaidItemConditions).toEqual([])
       const diagnostic = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
       expect(diagnostic).toBeDefined()
-      expect(JSON.parse(String(diagnostic![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', code: 'ITEM_LOGIN_REQUIRED' })
+      expect(JSON.parse(String(diagnostic![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', code: 'INSTITUTION_DOWN', errorType: 'INSTITUTION_ERROR' })
       expect(JSON.stringify(error.mock.calls)).not.toMatch(/secret-account|item-1|plaid request failed/)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('persists a balance-less Plaid account without a snapshot while its siblings keep theirs', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const item = 'plaid-item-1'
+    const sourceIds = { 'acc-checking': 'source-checking', 'acc-credit': 'source-credit' }
+    const account = (accountId: keyof typeof sourceIds) => ({
+      ...plaidConnection(`${item}:${accountId}`, 'token', accountId), providerConnectionId: item,
+      sourceResourceIncarnationId: sourceIds[accountId], sourceResourceIncarnationIds: sourceIds,
+      wealthfolioAccountIds: { [accountId]: `wf-${accountId}` },
+    })
+    const transaction = (accountId: keyof typeof sourceIds): ObservationOutput => ({
+      deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: sourceIds[accountId], providerVersion: `plaid:txn:${accountId}`,
+      semanticHash: 'a'.repeat(64), hashSpecificationVersion: 2, domain: 'cash_ledger', observedAt: '2026-07-10T00:00:00.000Z',
+      payload: { accountId, transactionId: `txn-${accountId}`, amount: '1', currency: 'USD', date: '2026-07-10' },
+    })
+    const persistAndEnqueue = vi.fn(async (_connection: unknown, rows: readonly ObservationOutput[]) => rows.length)
+    const savePlaidItemCheckpoint = vi.fn(async () => {})
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [account('acc-checking'), account('acc-credit')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      savePlaidItemCheckpoint,
+      runProvider: async () => ({
+        nextCursor: 'cursor-1',
+        observations: [transaction('acc-checking'), transaction('acc-credit')],
+        currentStateUnavailableAccountIds: ['acc-checking'],
+        plaidSync: {
+          added: 2, modified: 0, removed: 0,
+          skippedUnadmittedAccount: 0, skippedMissingAccountMetadata: 0, skippedMissingCurrency: 0, skippedMissingBalance: 1, skippedAccountNotReturned: 0,
+        },
+      }),
+      persistAndEnqueue,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }
+
+    try {
+      const result = await runConfiguredSyncCycle('d', deps)
+      expect(result).toEqual({ connections: 2, observations: 2, delivered: 0, failures: 0, plaidItemConditions: [] })
+      expect(persistAndEnqueue.mock.calls).toEqual([
+        [expect.objectContaining({ accountIds: ['acc-checking'] }), [transaction('acc-checking')], { skipCurrentState: true }],
+        [expect.objectContaining({ accountIds: ['acc-credit'] }), [transaction('acc-credit')]],
+      ])
+      expect(savePlaidItemCheckpoint).toHaveBeenCalledWith(expect.objectContaining({ providerConnectionId: item }), 'cursor-1')
+      const observed = log.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_OBSERVED')
+      expect(JSON.parse(String(observed![1]))).toMatchObject({ added: 2, skippedMissingBalance: 1 })
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(/acc-checking|acc-credit|plaid-item-1/)
+    } finally {
+      log.mockRestore()
+    }
+  })
+
+  it('reports an Item-level Plaid error as an Item condition without failing the cycle or health', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const calls: string[] = []
+    let loginRequired = true
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [plaidConnection('item-login', 'token-login'), plaidConnection('item-healthy', 'token-healthy', 'b')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      savePlaidItemCheckpoint: async connection => { calls.push(`checkpoint:${connection.providerConnectionId}`) },
+      runProvider: async connection => {
+        if (connection.providerConnectionId === 'item-login' && loginRequired) {
+          throw Object.assign(new Error('plaid request failed: HTTP 400 item-login secret-account'), { code: 'ITEM_LOGIN_REQUIRED', errorType: 'ITEM_ERROR' })
+        }
+        return { nextCursor: 'cursor-1', observations: [] }
+      },
+      persistAndEnqueue: async connection => { calls.push(`persist:${connection.providerConnectionId}`); return 0 },
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }
+
+    try {
+      const result = await runConfiguredSyncCycle('d', deps)
+      expect(result).toEqual({
+        connections: 2, observations: 0, delivered: 0, failures: 0,
+        plaidItemConditions: [{ providerConnectionId: 'item-login', reason: 'ITEM_LOGIN_REQUIRED' }],
+      })
+      // Nothing is ingested or checkpointed for the Item awaiting its owner; the healthy Item is unaffected.
+      expect(calls).toEqual(['persist:item-healthy', 'checkpoint:item-healthy'])
+      // A cycle whose only problems are Item conditions is a healthy cycle.
+      const outcome = syncCycleOutcome(result)
+      expect(outcome).toEqual({ cycleReady: true, cycleFailed: false, event: 'FINANCE_SYNC_CYCLE_OK' })
+      expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed))
+        .toMatchObject({ status: 200, body: { ok: true, providerReady: true } })
+      const diagnostic = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
+      expect(JSON.parse(String(diagnostic![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', code: 'ITEM_LOGIN_REQUIRED', errorType: 'ITEM_ERROR' })
+      const attention = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_NEEDS_ATTENTION')
+      expect(JSON.parse(String(attention![1]))).toEqual({ reason: 'ITEM_LOGIN_REQUIRED' })
+      expect(error.mock.calls.some(call => call[0] === 'Finance Sync connection cycle failed')).toBe(false)
+      expect(JSON.stringify(error.mock.calls)).not.toMatch(/secret-account|item-login|plaid request failed/)
+
+      // A later successful sync clears the condition.
+      loginRequired = false
+      calls.length = 0
+      const recovered = await runConfiguredSyncCycle('d', deps)
+      expect(recovered).toEqual({ connections: 2, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] })
+      expect(calls).toContain('checkpoint:item-login')
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  const plaidItemCycle = (failure: unknown, persistFailure?: unknown) => runConfiguredSyncCycle('d', {
+    loadConnections: async () => [plaidConnection('item-1', 'token')],
+    loadCheckpoint: async () => null,
+    loadPlaidItemCheckpoint: async () => null,
+    savePlaidItemCheckpoint: async () => {},
+    runProvider: async () => {
+      if (failure !== undefined) throw failure
+      return { nextCursor: 'cursor-1', observations: [] }
+    },
+    persistAndEnqueue: async () => {
+      if (persistFailure !== undefined) throw persistFailure
+      return 0
+    },
+    projectPending: async () => ({ delivered: 0, failed: 0 }),
+    saveCheckpoint: async () => {},
+  })
+  const plaidFailure = (fields: Record<string, string>) => Object.assign(new Error('plaid request failed: HTTP 400 secret-account'), fields)
+
+  it('treats every documented ITEM_ERROR answer to the Item request as an Item condition with its fixed reason', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const reasons = [...PLAID_ITEM_ERROR_CODES].filter(code => code !== 'PRODUCT_NOT_READY')
+      expect(reasons).toHaveLength(26)
+      for (const code of reasons) {
+        const result = await plaidItemCycle(plaidFailure({ code, errorType: 'ITEM_ERROR' }))
+        expect(result.failures).toBe(0)
+        expect(result.plaidItemConditions).toEqual([{ providerConnectionId: 'item-1', reason: code }])
+        expect(syncCycleOutcome(result).event).toBe('FINANCE_SYNC_CYCLE_OK')
+      }
+      // Plaid sent no code, or one outside the fixed list: still this Item's condition, with no reason to show.
+      for (const fields of [{ errorType: 'ITEM_ERROR' }, { code: 'INSTITUTION_DOWN', errorType: 'ITEM_ERROR' }] as Record<string, string>[]) {
+        const result = await plaidItemCycle(plaidFailure(fields))
+        expect(result.failures).toBe(0)
+        expect(result.plaidItemConditions).toEqual([{ providerConnectionId: 'item-1' }])
+      }
+      expect(JSON.stringify(error.mock.calls)).not.toMatch(/secret-account|item-1|plaid request failed/)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('still fails the cycle and health for every failure that is not an Item condition', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      for (const fields of [
+        { code: 'INTERNAL_SERVER_ERROR', errorType: 'API_ERROR' },
+        { code: 'RATE_LIMIT_EXCEEDED', errorType: 'RATE_LIMIT_EXCEEDED' },
+        { code: 'INSTITUTION_DOWN', errorType: 'INSTITUTION_ERROR' },
+        { code: 'INVALID_ACCESS_TOKEN', errorType: 'INVALID_INPUT' },
+        { code: 'INVALID_REQUEST', errorType: 'INVALID_REQUEST' },
+        // A documented Item code without Plaid's ITEM_ERROR type is unclassified.
+        { code: 'ITEM_LOGIN_REQUIRED' },
+        { code: 'ITEM_LOGIN_REQUIRED', errorType: 'API_ERROR' },
+        // Plaid is still preparing data: transient, nothing for the owner to do.
+        { code: 'PRODUCT_NOT_READY', errorType: 'ITEM_ERROR' },
+        {},
+      ] as Record<string, string>[]) {
+        const result = await plaidItemCycle(plaidFailure(fields))
+        expect(result.failures).toBe(1)
+        expect(result.plaidItemConditions).toEqual([])
+        const outcome = syncCycleOutcome(result)
+        expect(outcome.event).toBe('FINANCE_SYNC_CYCLE_FAILED')
+        expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed).status).toBe(503)
+      }
+      for (const failure of [new Error('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY'), new TypeError('fetch failed'), 'not an error']) {
+        const result = await plaidItemCycle(failure)
+        expect(result.failures).toBe(1)
+        expect(result.plaidItemConditions).toEqual([])
+      }
+
+      // The same error outside the Item's provider request is not an Item condition.
+      const persisted = await plaidItemCycle(undefined, plaidFailure({ code: 'ITEM_LOGIN_REQUIRED', errorType: 'ITEM_ERROR' }))
+      expect(persisted.failures).toBeGreaterThan(0)
+      expect(persisted.plaidItemConditions).toEqual([])
+      expect(error.mock.calls.some(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_NEEDS_ATTENTION')).toBe(false)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('fails the cycle when one Item has an Item condition and another has a service failure', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [plaidConnection('item-owner', 'token-owner'), plaidConnection('item-outage', 'token-outage', 'b')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => null,
+      savePlaidItemCheckpoint: async () => {},
+      runProvider: async connection => {
+        throw connection.providerConnectionId === 'item-owner'
+          ? plaidFailure({ code: 'NO_ACCOUNTS', errorType: 'ITEM_ERROR' })
+          : plaidFailure({ code: 'INTERNAL_SERVER_ERROR', errorType: 'API_ERROR' })
+      },
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => {},
+    }
+
+    try {
+      const result = await runConfiguredSyncCycle('d', deps)
+      expect(result).toEqual({
+        connections: 2, observations: 0, delivered: 0, failures: 1,
+        plaidItemConditions: [{ providerConnectionId: 'item-owner', reason: 'NO_ACCOUNTS' }],
+      })
+      const outcome = syncCycleOutcome(result)
+      expect(outcome).toEqual({ cycleReady: false, cycleFailed: true, event: 'FINANCE_SYNC_CYCLE_FAILED' })
+      expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed))
+        .toMatchObject({ status: 503, body: { ok: false, providerReady: false } })
+      expect(error.mock.calls.filter(call => call[0] === 'Finance Sync connection cycle failed')).toHaveLength(1)
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('writes nothing for an account Plaid did not return, keeps its siblings syncing, and holds the Item cursor', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const item = 'plaid-item-1'
+    const sourceIds = { 'acc-checking': 'source-checking', 'acc-credit': 'source-credit' }
+    const account = (accountId: keyof typeof sourceIds) => ({
+      ...plaidConnection(`${item}:${accountId}`, 'token', accountId), providerConnectionId: item,
+      sourceResourceIncarnationId: sourceIds[accountId], sourceResourceIncarnationIds: sourceIds,
+      wealthfolioAccountIds: { [accountId]: `wf-${accountId}` },
+    })
+    const observation = (accountId: keyof typeof sourceIds, providerVersion: string): ObservationOutput => ({
+      deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: sourceIds[accountId], providerVersion,
+      semanticHash: 'a'.repeat(64), hashSpecificationVersion: 2, domain: 'cash_ledger', observedAt: '2026-07-10T00:00:00.000Z',
+      payload: providerVersion.startsWith('plaid:removed:') ? { transactionId: 'removed-1', isRemoved: true } : { accountId, transactionId: `txn-${accountId}`, amount: '1', currency: 'USD', date: '2026-07-10' },
+    })
+    let missing = true
+    const persistAndEnqueue = vi.fn(async (_connection: unknown, rows: readonly ObservationOutput[]) => rows.length)
+    const projectPending = vi.fn(async () => ({ delivered: 0, failed: 0 }))
+    const savePlaidItemCheckpoint = vi.fn(async () => {})
+    const deps: SyncRuntimeDependencies = {
+      loadConnections: async () => [account('acc-checking'), account('acc-credit')],
+      loadCheckpoint: async () => null,
+      loadPlaidItemCheckpoint: async () => 'cursor-0',
+      savePlaidItemCheckpoint,
+      runProvider: async () => ({
+        nextCursor: missing ? 'cursor-0' : 'cursor-1',
+        // A removal tombstone is staged for every admitted resource, including the missing account's.
+        observations: [observation('acc-checking', 'plaid:removed:removed-1'), observation('acc-credit', 'plaid:txn:acc-credit'),
+          ...(missing ? [] : [observation('acc-checking', 'plaid:txn:acc-checking')])],
+        accountsNotReturned: missing ? ['acc-checking'] : [],
+      }),
+      persistAndEnqueue,
+      projectPending,
+      saveCheckpoint: async () => {},
+    }
+
+    try {
+      const result = await runConfiguredSyncCycle('d', deps)
+      expect(result).toEqual({
+        connections: 2, observations: 1, delivered: 0, failures: 0,
+        plaidItemConditions: [{ providerConnectionId: item, reason: 'ACCOUNT_NOT_RETURNED' }],
+      })
+      expect(persistAndEnqueue.mock.calls).toEqual([
+        [expect.objectContaining({ accountIds: ['acc-credit'] }), [observation('acc-credit', 'plaid:txn:acc-credit')]],
+      ])
+      expect(projectPending.mock.calls).toEqual([[expect.objectContaining({ accountIds: ['acc-credit'] })]])
+      expect(savePlaidItemCheckpoint).not.toHaveBeenCalled()
+      expect(syncCycleOutcome(result).event).toBe('FINANCE_SYNC_CYCLE_OK')
+      const attention = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_NEEDS_ATTENTION')
+      expect(JSON.parse(String(attention![1]))).toEqual({ reason: 'ACCOUNT_NOT_RETURNED' })
+      expect(error.mock.calls.some(call => call[0] === 'Finance Sync connection cycle failed' || call[0] === 'Finance Sync Plaid item cursor held')).toBe(false)
+      expect(JSON.stringify([...error.mock.calls, ...log.mock.calls])).not.toMatch(/acc-checking|acc-credit|plaid-item-1/)
+
+      // Once Plaid returns the account, the held cursor's stream is ingested for it and the cursor moves.
+      missing = false
+      persistAndEnqueue.mockClear()
+      const recovered = await runConfiguredSyncCycle('d', deps)
+      expect(recovered).toEqual({ connections: 2, observations: 3, delivered: 0, failures: 0, plaidItemConditions: [] })
+      expect(persistAndEnqueue.mock.calls.map(call => (call[0] as { accountIds: string[] }).accountIds[0])).toEqual(['acc-checking', 'acc-credit'])
+      expect(savePlaidItemCheckpoint).toHaveBeenCalledWith(expect.objectContaining({ providerConnectionId: item }), 'cursor-1')
+    } finally {
+      error.mockRestore()
+      log.mockRestore()
+    }
+  })
+
+  it('still counts a failure when a sibling of a missing account cannot be persisted', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const item = 'plaid-item-1'
+    const account = (accountId: string) => ({ ...plaidConnection(`${item}:${accountId}`, 'token', accountId), providerConnectionId: item })
+    try {
+      const result = await runConfiguredSyncCycle('d', {
+        loadConnections: async () => [account('acc-checking'), account('acc-credit')],
+        loadCheckpoint: async () => null,
+        loadPlaidItemCheckpoint: async () => null,
+        savePlaidItemCheckpoint: async () => { throw new Error('the cursor must stay held') },
+        runProvider: async () => ({ nextCursor: null, observations: [], accountsNotReturned: ['acc-checking'] }),
+        persistAndEnqueue: async () => { throw new Error('incomplete current-state snapshot: balance for acc-credit') },
+        projectPending: async () => ({ delivered: 0, failed: 0 }),
+        saveCheckpoint: async () => {},
+      })
+      expect(result.failures).toBe(2)
+      expect(result.plaidItemConditions).toEqual([{ providerConnectionId: item, reason: 'ACCOUNT_NOT_RETURNED' }])
+      expect(syncCycleOutcome(result).event).toBe('FINANCE_SYNC_CYCLE_FAILED')
     } finally {
       error.mockRestore()
     }
@@ -255,9 +562,9 @@ describe('configured sync runtime', () => {
     }) as SyncRuntimeDependencies
 
     try {
-      await runConfiguredSyncCycle('d', failing('INCOMPLETE_ACCOUNT_BALANCE'))
+      await runConfiguredSyncCycle('d', failing('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY'))
       const internal = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
-      expect(JSON.parse(String(internal![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', detail: 'INCOMPLETE_ACCOUNT_BALANCE' })
+      expect(JSON.parse(String(internal![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', detail: 'INCOMPLETE_ACCOUNT_BALANCE_CURRENCY' })
 
       error.mockClear()
       await runConfiguredSyncCycle('d', failing('provider payload sensitive-token'))

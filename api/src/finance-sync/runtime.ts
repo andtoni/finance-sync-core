@@ -1,5 +1,6 @@
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import { getProviderEntry, type ProviderName } from './probes/provider-registry'
+import { PLAID_ITEM_ERROR_CODES } from './provider-runtime'
 
 interface RuntimeConnectionBase {
   readonly provider: ProviderName
@@ -76,6 +77,10 @@ export interface ProviderRun {
   readonly transferAccounts?: Readonly<Record<string, string>>
   /** Bounded Plaid ingestion counters. Counts only — never provider text or values. */
   readonly plaidSync?: PlaidSyncDiagnostics
+  /** Provider accounts for which this run carries no balance fact. Never logged. */
+  readonly currentStateUnavailableAccountIds?: readonly string[]
+  /** Admitted provider accounts the provider did not return; the run carries nothing for them. Never logged. */
+  readonly accountsNotReturned?: readonly string[]
 }
 
 /**
@@ -89,6 +94,10 @@ export interface PlaidSyncDiagnostics {
   readonly skippedUnadmittedAccount: number
   readonly skippedMissingAccountMetadata: number
   readonly skippedMissingCurrency: number
+  /** Accounts whose current-state snapshot was skipped for lack of a provider balance. */
+  readonly skippedMissingBalance: number
+  /** Admitted accounts the provider did not return; nothing was ingested for them. */
+  readonly skippedAccountNotReturned: number
 }
 export interface PersistEnqueueOptions { readonly skipCurrentState?: boolean }
 export interface TerminalRevisionResolver {
@@ -115,7 +124,21 @@ export interface SyncRuntimeDependencies {
   saveCheckpoint(connection: RuntimeConnection, cursor: string | null): Promise<void>
   savePlaidItemCheckpoint?(connection: Extract<RuntimeConnection, { provider: 'plaid' }>, cursor: string | null): Promise<void>
 }
-export interface SyncCycleResult { readonly connections: number; readonly observations: number; readonly delivered: number; readonly failures: number }
+/**
+ * A condition of one Plaid Item that only its owner can resolve. It is reported
+ * per Item and is never a service failure. `reason` is a documented Plaid
+ * ITEM_ERROR code or the fixed internal code ACCOUNT_NOT_RETURNED; never
+ * provider text. It is absent when Plaid sent no code or an undocumented one.
+ */
+export interface PlaidItemCondition {
+  readonly providerConnectionId: string
+  readonly reason?: string
+}
+export interface SyncCycleResult {
+  readonly connections: number; readonly observations: number; readonly delivered: number; readonly failures: number
+  /** Plaid Items that need their owner's attention this cycle; they do not count as failures. */
+  readonly plaidItemConditions: readonly PlaidItemCondition[]
+}
 export interface SyncCycleControls { readonly providersEnabled: boolean; readonly projectionEnabled: boolean }
 
 const enabledByDefault: SyncCycleControls = Object.freeze({ providersEnabled: true, projectionEnabled: true })
@@ -189,6 +212,7 @@ function logPlaidItemObserved(run: ProviderRun): void {
   if (!counts) return
   const total = counts.added + counts.modified + counts.removed
     + counts.skippedUnadmittedAccount + counts.skippedMissingAccountMetadata + counts.skippedMissingCurrency
+    + counts.skippedMissingBalance + counts.skippedAccountNotReturned
   if (total === 0) return
   console.log('FINANCE_SYNC_PLAID_ITEM_OBSERVED', JSON.stringify(counts))
 }
@@ -198,7 +222,6 @@ function logPlaidItemObserved(run: ProviderRun): void {
  * constants, not provider text, and are the only messages ever emitted.
  */
 const INTERNAL_FAILURE_CODES = new Set([
-  'INCOMPLETE_ACCOUNT_BALANCE',
   'INCOMPLETE_ACCOUNT_BALANCE_CURRENCY',
   'MISSING_CURSOR_AFTER_HAS_MORE',
   'PAGE_BOUND_EXCEEDED',
@@ -245,6 +268,33 @@ function runPlaidStage<T>(stage: PlaidFailureStage, operation: () => T | Promise
   })
 }
 
+/**
+ * ITEM_ERROR codes that are not a condition of the Item's ownership or access:
+ * PRODUCT_NOT_READY means Plaid is still preparing data and clears by itself,
+ * so asking the owner to reconnect would be wrong. It stays a cycle failure.
+ */
+const PLAID_TRANSIENT_ITEM_ERROR_CODES = new Set(['PRODUCT_NOT_READY'])
+
+/**
+ * An ITEM_ERROR answer to the Item's own provider request is a condition of
+ * that one Item, not of the service. Every other error type, every other
+ * stage, and anything unclassified stays a cycle failure.
+ */
+function plaidItemCondition(error: unknown): { readonly reason?: string } | undefined {
+  if (!(error instanceof PlaidStageFailure) || error.stage !== 'item_sync') return undefined
+  const failure = error.failure
+  if (typeof failure !== 'object' || failure === null) return undefined
+  const { code, errorType } = failure as { code?: unknown; errorType?: unknown }
+  if (errorType !== 'ITEM_ERROR') return undefined
+  if (typeof code !== 'string' || !PLAID_ITEM_ERROR_CODES.has(code)) return {}
+  return PLAID_TRANSIENT_ITEM_ERROR_CODES.has(code) ? undefined : { reason: code }
+}
+
+/** The fixed reason code only; no identifier of the Item or its accounts. */
+function logPlaidItemNeedsAttention(reason: string | undefined): void {
+  console.error('FINANCE_SYNC_PLAID_ITEM_NEEDS_ATTENTION', JSON.stringify(reason === undefined ? {} : { reason }))
+}
+
 function logPlaidItemFailure(stage: PlaidFailureStage, error: unknown): void {
   const failure = error instanceof PlaidStageFailure ? error.failure : error
   const resolvedStage = error instanceof PlaidStageFailure ? error.stage : stage
@@ -273,9 +323,10 @@ export async function runConfiguredSyncCycle(
   deps: SyncRuntimeDependencies,
   controls: SyncCycleControls = enabledByDefault,
 ): Promise<SyncCycleResult> {
-  if (!controls.providersEnabled) return { connections: 0, observations: 0, delivered: 0, failures: 0 }
+  if (!controls.providersEnabled) return { connections: 0, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] }
   const connections = await deps.loadConnections(deploymentId)
   let observations = 0; let delivered = 0; let failures = 0
+  const plaidItemConditions: PlaidItemCondition[] = []
   const runs: Array<{ connection: RuntimeConnection; cursor: string | null; run: ProviderRun }> = []
   const plaidGroups = new Map<string, PlaidRuntimeConnection[]>()
   for (const connection of connections) {
@@ -322,11 +373,21 @@ export async function runConfiguredSyncCycle(
           bySourceResource.set(observation.sourceResourceIncarnationId, rows)
         }
         let itemFailed = false
+        const withoutBalance = new Set(run.currentStateUnavailableAccountIds ?? [])
+        const notReturned = new Set(run.accountsNotReturned ?? [])
         for (const connection of expected) {
+          // Nothing is written for an account the provider did not return.
+          if (connection.accountIds.some(accountId => notReturned.has(accountId))) continue
           const accountObservations = connection.accountIds.flatMap(accountId =>
             bySourceResource.get(connection.sourceResourceIncarnationIds?.[accountId] ?? connection.sourceResourceIncarnationId) ?? [])
+          // Without a provider balance no snapshot is assembled for this
+          // connection at all, so the complete-snapshot rule is never asked to
+          // accept a partial one and the receiver keeps its last full snapshot.
+          const skipCurrentState = connection.accountIds.some(accountId => withoutBalance.has(accountId))
           try {
-            observations += await runPlaidStage('persist_or_project', () => deps.persistAndEnqueue(connection, accountObservations))
+            observations += await runPlaidStage('persist_or_project', () => skipCurrentState
+              ? deps.persistAndEnqueue(connection, accountObservations, { skipCurrentState: true })
+              : deps.persistAndEnqueue(connection, accountObservations))
             if (!controls.projectionEnabled) continue
             const projection = await runPlaidStage('persist_or_project', () => deps.projectPending(connection))
             delivered += projection.delivered
@@ -339,16 +400,33 @@ export async function runConfiguredSyncCycle(
             console.error('Finance Sync connection cycle failed')
           }
         }
+        if (notReturned.size > 0) {
+          plaidItemConditions.push({ providerConnectionId: connectionGroupId(item), reason: 'ACCOUNT_NOT_RETURNED' })
+          logPlaidItemNeedsAttention('ACCOUNT_NOT_RETURNED')
+        }
         if (itemFailed) {
           failures += 1
           console.error('Finance Sync Plaid item cursor held')
-        } else {
+        } else if (notReturned.size === 0) {
+          // With an account missing the item-level cursor stays where it is:
+          // advancing it would drop whatever the stream holds for that account.
+          // The returned accounts are re-read from the same cursor and converge
+          // idempotently.
           await runPlaidStage('item_cursor', () => deps.savePlaidItemCheckpoint!(item, run.nextCursor))
           console.log('FINANCE_SYNC_PLAID_ITEM_SYNC')
         }
       } catch (error) {
-        failures += 1
         logPlaidItemFailure('item_sync', error)
+        const providerConnectionId = expected[0]?.providerConnectionId
+        const condition = plaidItemCondition(error)
+        if (providerConnectionId && condition) {
+          // Nothing was ingested and the cursor is untouched; only the owner can
+          // restore this Item, so it must not hold the service unhealthy.
+          plaidItemConditions.push({ providerConnectionId, ...condition })
+          logPlaidItemNeedsAttention(condition.reason)
+          continue
+        }
+        failures += 1
         console.error('Finance Sync connection cycle failed')
       }
     }
@@ -440,5 +518,5 @@ export async function runConfiguredSyncCycle(
       console.error('Finance Sync connection cycle failed')
     }
   }
-  return { connections: connections.length, observations, delivered, failures }
+  return { connections: connections.length, observations, delivered, failures, plaidItemConditions }
 }

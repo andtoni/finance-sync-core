@@ -218,6 +218,104 @@ describe('Finance Sync Connect control plane', () => {
     await expect(new FinanceSyncConnectControl(dependencies({ connections: [first, second] })).startPlaidUpdate(subjectA)).rejects.toMatchObject({ status: 409 })
   })
 
+  it('lists each Plaid Item with the exact update selection id, a safe label, and its condition', async () => {
+    const first = connection('plaid') as Extract<RuntimeConnection, { provider: 'plaid' }>
+    const sibling = { ...first, connectionId: 'plaid-connection-1b', accountIds: ['account-2'], wealthfolioAccountIds: { 'account-2': 'wealthfolio-account-2' } }
+    const second = { ...first, connectionId: 'plaid-connection-2', providerConnectionId: 'item-2', accessToken: 'access-token-2', secretReference: 'TEST_SLOT_2' }
+    const foreign = { ...first, connectionId: 'plaid-connection-3', providerConnectionId: 'item-3', localOwnerId: subjectB }
+    const listConnectedAccounts = vi.fn(async () => [
+      { providerConnectionId: 'item-1', name: 'Checking', mask: '1111' },
+      { providerConnectionId: 'item-1', name: 'Savings', mask: null },
+      { providerConnectionId: 'item-2', name: 'Rewards Card', mask: '2222' },
+    ])
+    const deps = dependencies({
+      connections: [first, sibling, second, foreign],
+      plaidItemConditions: new Map([['item-2', 'NO_ACCOUNTS'], ['item-3', 'ITEM_LOGIN_REQUIRED']]),
+      onboarding: {
+        listPending: vi.fn(async () => []), admit: vi.fn(), revoke: vi.fn(async () => true), reconciliationStatus: vi.fn(async () => null),
+        listConnectedAccounts,
+      },
+    })
+    const control = new FinanceSyncConnectControl(deps)
+    const listed = await control.list(subjectA)
+    expect(listed.find(status => status.provider === 'plaid')).toEqual({
+      provider: 'plaid', status: 'configured', message: 'Provider is configured.',
+      connections: [
+        { connectionId: 'item-1', label: 'Checking •••• 1111, Savings', needsReauth: false },
+        { connectionId: 'item-2', label: 'Rewards Card •••• 2222', needsReauth: true, reason: 'NO_ACCOUNTS' },
+      ],
+    })
+    expect('reason' in listed.find(status => status.provider === 'plaid')!.connections![0]!).toBe(false)
+    expect(listConnectedAccounts).toHaveBeenCalledWith(subjectA, 'plaid')
+    // Only Plaid carries the list, another subject's Item is never disclosed, and no credential leaves the control.
+    expect(listed.filter(status => status.provider !== 'plaid').every(status => !('connections' in status))).toBe(true)
+    expect(JSON.stringify(listed)).not.toMatch(/item-3|access-token|client|secret|TEST_SLOT/)
+    // Every listed id is exactly what the update route accepts.
+    await expect(control.startPlaidUpdate(subjectA, 'item-2')).resolves.toMatchObject({ status: 'link_ready' })
+    expect(deps.plaid?.createUpdateLinkToken).toHaveBeenCalledWith(subjectA, expect.objectContaining({ providerConnectionId: 'item-2', accessToken: 'access-token-2' }))
+  })
+
+  it('labels a Plaid Item generically when no account names are available and omits the list without Items', async () => {
+    const withItem = new FinanceSyncConnectControl(dependencies({ connections: [connection('plaid')] }))
+    expect((await withItem.list(subjectA)).find(status => status.provider === 'plaid')).toMatchObject({
+      connections: [{ connectionId: 'item-1', label: 'Plaid connection', needsReauth: false }],
+    })
+    // A condition Plaid gave no documented code for still needs the owner, with no reason to show.
+    const unexplained = new FinanceSyncConnectControl(dependencies({
+      connections: [connection('plaid')], plaidItemConditions: new Map([['item-1', undefined]]),
+    }))
+    const [summary] = (await unexplained.list(subjectA)).find(status => status.provider === 'plaid')!.connections!
+    expect(summary).toEqual({ connectionId: 'item-1', label: 'Plaid connection', needsReauth: true })
+    expect('reason' in summary!).toBe(false)
+    // Provider text cannot break the receiver's bounded, control-free label check.
+    const hostile = new FinanceSyncConnectControl(dependencies({
+      connections: [connection('plaid')],
+      onboarding: {
+        listPending: vi.fn(async () => []), admit: vi.fn(), revoke: vi.fn(async () => true), reconciliationStatus: vi.fn(async () => null),
+        listConnectedAccounts: vi.fn(async () => [
+          { providerConnectionId: 'item-1', name: 'Line\nbreak\u0000\u0085', mask: '1111' },
+          { providerConnectionId: 'item-1', name: '😀'.repeat(300), mask: null },
+        ]),
+      },
+    }))
+    const hostileLabel = (await hostile.list(subjectA)).find(status => status.provider === 'plaid')!.connections![0]!.label
+    expect(hostileLabel.startsWith('Line break •••• 1111, 😀')).toBe(true)
+    expect(/[\u0000-\u001f\u007f-\u009f]/.test(hostileLabel)).toBe(false)
+    expect([...hostileLabel]).toHaveLength(200)
+    expect(() => encodeURIComponent(hostileLabel)).not.toThrow() // no split surrogate pair
+    expect(Buffer.byteLength(hostileLabel, 'utf8')).toBeLessThanOrEqual(1024)
+    const withoutItem = new FinanceSyncConnectControl(dependencies({ connections: [connection('investec')] }))
+    expect((await withoutItem.list(subjectA)).find(status => status.provider === 'plaid')).toEqual({
+      provider: 'plaid', status: 'available', message: 'Provider is available to connect.',
+    })
+  })
+
+  it('clears the Item condition only when the Plaid update completes', async () => {
+    const plaidItemConditions = new Map([['item-1', 'ITEM_LOGIN_REQUIRED'], ['item-other', 'ACCOUNT_NOT_RETURNED']])
+    const sessionStore = {
+      create: vi.fn(async () => 'continuation-token'),
+      consume: vi.fn(async () => session('TEST_SLOT', 'update', 'item-1', 1)),
+      release: vi.fn(async () => undefined),
+    }
+    const failing = new FinanceSyncConnectControl(dependencies({
+      connections: [connection('plaid')], sessionStore, plaidItemConditions,
+      onPlaidAccountsUpdated: vi.fn(async () => { throw new Error('rediscovery failed') }),
+    }))
+    await expect(failing.completePlaidUpdate(subjectA, 'continuation-token')).rejects.toThrow('rediscovery failed')
+    expect([...plaidItemConditions.keys()].sort()).toEqual(['item-1', 'item-other'])
+
+    const control = new FinanceSyncConnectControl(dependencies({
+      connections: [connection('plaid')], sessionStore, plaidItemConditions,
+      onPlaidAccountsUpdated: vi.fn(async () => undefined),
+    }))
+    expect((await control.list(subjectA)).find(status => status.provider === 'plaid')?.connections?.[0]).toMatchObject({ needsReauth: true, reason: 'ITEM_LOGIN_REQUIRED' })
+    await expect(control.completePlaidUpdate(subjectA, 'continuation-token')).resolves.toMatchObject({ status: 'pending' })
+    expect([...plaidItemConditions]).toEqual([['item-other', 'ACCOUNT_NOT_RETURNED']])
+    const cleared = (await control.list(subjectA)).find(status => status.provider === 'plaid')!.connections![0]!
+    expect(cleared.needsReauth).toBe(false)
+    expect('reason' in cleared).toBe(false)
+  })
+
   it('releases the DB reservation when generated placeholder creation fails', async () => {
     const release = vi.fn(async () => undefined)
     const create = vi.fn(async () => 'continuation-token')

@@ -279,4 +279,62 @@ suite('already-connected provider accounts are not offered again', () => {
   })
 })
 
+suite('connected Plaid Items are labelled by their admitted accounts only', () => {
+  it('lists the names and masks the runtime syncs, scoped to the subject and the active generation', async () => {
+    sql ??= postgres(url!, { prepare: false })
+    await migrate(sql, resolve(import.meta.dirname, '../../finance-sync-migrations'))
+    const labelDeployment = `${deploymentId}-labels`
+    const repository = new PostgresOnboardingRepository(sql, labelDeployment)
+    const itemA = `label-item-a-${runId}`
+    const itemB = `label-item-b-${runId}`
+    const admitAll = async (wealthfolioPrefix: string) => {
+      for (const entry of await repository.listPending(subject, 'plaid')) {
+        if (entry.providerAccountId === 'provider-account-unadmitted') continue
+        await repository.admit({
+          subject, provider: 'plaid', connectionId: entry.connectionId, providerAccountId: entry.providerAccountId,
+          wealthfolioAccountId: `${wealthfolioPrefix}-${entry.providerAccountId}`, databaseStateDigest: digest,
+          providerGeneration: entry.providerGeneration, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+        })
+      }
+    }
+
+    await repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: itemA, secretReference: 'PLAID_LABEL_SLOT_A',
+      accounts: [
+        { ...account, providerAccountId: 'provider-account-checking', name: 'Checking', mask: '1111' },
+        { ...account, providerAccountId: 'provider-account-savings', name: 'Savings' },
+        { ...account, providerAccountId: 'provider-account-unadmitted', name: 'Never admitted', mask: '9999' },
+      ],
+    })
+    await repository.recordConnection({
+      subject, provider: 'plaid', providerConnectionId: itemB, secretReference: 'PLAID_LABEL_SLOT_B',
+      accounts: [{ ...account, providerAccountId: 'provider-account-card', name: 'Rewards Card', mask: '2222' }],
+    })
+    await admitAll('wealthfolio-label')
+
+    const listed = await repository.listConnectedAccounts(subject, 'plaid')
+    expect(listed).toEqual([
+      { providerConnectionId: itemA, name: 'Checking', mask: '1111' },
+      { providerConnectionId: itemA, name: 'Savings', mask: null },
+      { providerConnectionId: itemB, name: 'Rewards Card', mask: '2222' },
+    ])
+    // Exactly the Items the durable runtime (and therefore the update route) can target.
+    const runtime = await loadDurableRuntimeConnections(sql, labelDeployment, {
+      resolve: async () => ({ clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test-token' }),
+    })
+    expect([...new Set(runtime.map(connection => connection.providerConnectionId))].sort())
+      .toEqual([...new Set(listed.map(entry => entry.providerConnectionId))].sort())
+    await expect(repository.listConnectedAccounts('urn:wealthfolio:test#another-owner', 'plaid')).resolves.toEqual([])
+    await expect(repository.listConnectedAccounts(subject, 'snaptrade')).resolves.toEqual([])
+
+    // A disconnected Item is no longer listed.
+    const [connection] = await sql<{ connection_id: string }[]>`
+      SELECT connection_id::text FROM provider_connections
+      WHERE deployment_id = ${labelDeployment} AND provider_connection_id = ${itemB}`
+    await expect(repository.revoke(subject, 'plaid', connection.connection_id)).resolves.toBe(true)
+    expect((await repository.listConnectedAccounts(subject, 'plaid')).map(entry => entry.providerConnectionId))
+      .toEqual([itemA, itemA])
+  })
+})
+
 afterAll(async () => { await sql?.end() })

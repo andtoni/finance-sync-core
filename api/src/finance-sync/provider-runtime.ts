@@ -190,20 +190,50 @@ const PLAID_DIAGNOSTIC_TYPES = new Set([
   'PAYMENT_ERROR',
 ])
 
+/**
+ * Every documented ITEM_ERROR code (plaid.com/docs/errors/item). An Item
+ * failing with a code missing from the earlier hand-picked allowlist logged
+ * only its error type. These are also the only Plaid codes ever reported to
+ * the owner as the reason an Item needs attention.
+ */
+export const PLAID_ITEM_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ACCESS_NOT_GRANTED',
+  'INSTANT_MATCH_FAILED',
+  'INSUFFICIENT_CREDENTIALS',
+  'INVALID_CREDENTIALS',
+  'INVALID_MFA',
+  'INVALID_OTP',
+  'INVALID_PHONE_NUMBER',
+  'INVALID_SEND_METHOD',
+  'INVALID_UPDATED_USERNAME',
+  'ITEM_CONCURRENTLY_DELETED',
+  'ITEM_LOCKED',
+  'ITEM_LOGIN_REQUIRED',
+  'ITEM_NOT_FOUND',
+  'ITEM_NOT_SUPPORTED',
+  'MANUAL_VERIFICATION_REQUIRED',
+  'MFA_NOT_SUPPORTED',
+  'NO_ACCOUNTS',
+  'NO_AUTH_ACCOUNTS',
+  'NO_ELIGIBLE_ITEMS',
+  'NO_INVESTMENT_ACCOUNTS',
+  'NO_LIABILITY_ACCOUNTS',
+  'PASSWORD_RESET_REQUIRED',
+  'PRODUCT_NOT_ENABLED',
+  'PRODUCT_NOT_READY',
+  'PRODUCTS_NOT_SUPPORTED',
+  'USER_INPUT_TIMEOUT',
+  'USER_SETUP_REQUIRED',
+])
+
 const PLAID_DIAGNOSTIC_CODES = new Set([
   'TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION',
-  'ITEM_LOGIN_REQUIRED',
   'INVALID_ACCESS_TOKEN',
-  'INVALID_CREDENTIALS',
   'INVALID_API_KEYS',
   'INVALID_INPUT',
   'INVALID_REQUEST',
-  'ITEM_NOT_FOUND',
   'ITEM_ACCOUNT_NOT_FOUND',
-  'ITEM_LOCKED',
   'ITEM_PRODUCT_NOT_READY',
-  'PRODUCT_NOT_READY',
-  'PRODUCT_NOT_ENABLED',
   'PRODUCT_NOT_SUPPORTED',
   'ADDITIONAL_CONSENT_REQUIRED',
   'PENDING_EXPIRATION',
@@ -213,6 +243,7 @@ const PLAID_DIAGNOSTIC_CODES = new Set([
   'INSTITUTION_DOWN',
   'INSTITUTION_NOT_RESPONDING',
   'INSTITUTION_NOT_AVAILABLE',
+  ...PLAID_ITEM_ERROR_CODES,
 ])
 
 function endpoint(raw: string | undefined, fallback: string, provider: ProviderName): URL {
@@ -497,6 +528,8 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
       return {
         observations: run.observations,
         nextCursor: run.nextCursor,
+        currentStateUnavailableAccountIds: run.accountsWithoutBalance,
+        accountsNotReturned: run.accountsNotReturned,
         plaidSync: {
           added: run.counts.added,
           modified: run.counts.modified,
@@ -504,6 +537,8 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
           skippedUnadmittedAccount: run.counts.skipped.unadmittedAccount,
           skippedMissingAccountMetadata: run.counts.skipped.missingAccountMetadata,
           skippedMissingCurrency: run.counts.skipped.missingCurrency,
+          skippedMissingBalance: run.counts.skipped.missingBalance,
+          skippedAccountNotReturned: run.counts.skipped.accountNotReturned,
         },
       }
     }

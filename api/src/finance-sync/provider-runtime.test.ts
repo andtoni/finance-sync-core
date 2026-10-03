@@ -230,6 +230,35 @@ describe('four-provider runtime configuration', () => {
     }
   })
 
+  it('keeps a documented Plaid Item error code and drops unknown codes and provider text', async () => {
+    const originalFetch = globalThis.fetch
+    const failWith = (body: Record<string, unknown>) => {
+      globalThis.fetch = (async () => new Response(JSON.stringify(body), { status: 400 })) as unknown as typeof fetch
+    }
+    try {
+      const [connection] = parseRuntimeConnections(runtimeEnv([configurations[0]]), 'dep-1')
+      if (connection.provider !== 'plaid') throw new Error('expected Plaid fixture')
+      const transport = createProviderTransportFactories({ FINANCE_SYNC_PLAID_URL: 'https://sandbox.plaid.com' }).plaid(connection)
+
+      // Outside the earlier hand-picked allowlist, so production logged only the error type.
+      for (const code of ['NO_ACCOUNTS', 'ACCESS_NOT_GRANTED', 'NO_LIABILITY_ACCOUNTS', 'PRODUCTS_NOT_SUPPORTED']) {
+        failWith({ error_type: 'ITEM_ERROR', error_code: code, error_message: 'provider text account-1 server-token', request_id: 'request-1' })
+        const failure = await transport.syncTransactions(connection.accessToken).catch((error: unknown) => error) as Error & { code?: string; errorType?: string }
+        expect(failure.code).toBe(code)
+        expect(failure.errorType).toBe('ITEM_ERROR')
+        expect(failure.message).toBe('plaid request failed: HTTP 400')
+      }
+
+      failWith({ error_type: 'ITEM_ERROR', error_code: 'account-1 server-token', error_message: 'provider text' })
+      const unknown = await transport.syncTransactions(connection.accessToken).catch((error: unknown) => error) as Error & { code?: string; errorType?: string }
+      expect(unknown.code).toBeUndefined()
+      expect(unknown.errorType).toBe('ITEM_ERROR')
+      expect(JSON.stringify({ ...unknown, message: unknown.message })).not.toMatch(/account-1|server-token|provider text/)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('advances the Investec transaction upper bound to the poll date', async () => {
     const connection = parseRuntimeConnections(runtimeEnv(), 'dep-1').find(item => item.provider === 'investec')
     if (!connection || connection.provider !== 'investec') throw new Error('missing Investec fixture')

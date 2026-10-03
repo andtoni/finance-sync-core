@@ -12,8 +12,10 @@ let quarantined: Record<string, unknown>[]
 let corrected: Record<string, unknown>[]
 let linked: Record<string, unknown>[]
 let recovered: Record<string, unknown>[]
+let plaidItemConditions: Map<string, string | undefined>
 
 beforeEach(async () => {
+  plaidItemConditions = new Map([['item-1', 'ACCOUNT_NOT_RETURNED']])
   admitted = []
   quarantined = []
   corrected = []
@@ -56,9 +58,12 @@ beforeEach(async () => {
       revoke: async (boundSubject, provider, connectionId) => boundSubject === subject && provider === 'plaid' && connectionId === 'connection-1',
       reconciliationStatus: async () => ({ wealthfolioAccountId: 'wf-1', providerGeneration: 3,
         receiverAccessGeneration: 7, baselineStatus: 'verified', baselineDigest: 'sha256:baseline', assetMappingDigest: 'sha256:empty' }),
+      listConnectedAccounts: async boundSubject => boundSubject === subject
+        ? [{ providerConnectionId: 'item-1', name: 'Checking', mask: '1234' }] : [],
     },
     onPlaidConnected: async () => undefined,
     onPlaidAccountsUpdated: async () => undefined,
+    plaidItemConditions,
   })
   const handler = createFinanceSyncHttpHandler({
     controlToken, providersEnabled: true, connect,
@@ -245,6 +250,34 @@ describe('Finance Sync internal Connect HTTP routes', () => {
       body: JSON.stringify({ ...request, reason: 'same order\nforged audit line' }),
     })
     expect(forgedReason.status).toBe(400)
+  })
+
+  it('lists the Plaid Item that needs its owner with a fixed reason and clears it once the update completes', async () => {
+    const plaid = async () => {
+      const listed = await fetch(`${base}/control/v1/provider-connections`, { headers: headers() })
+      expect(listed.status).toBe(200)
+      const statuses = await listed.json() as { provider: string }[]
+      expect(JSON.stringify(statuses)).not.toMatch(/durable-secret|client-secret|PLAID_SLOT/)
+      return statuses.find(status => status.provider === 'plaid')
+    }
+    expect(await plaid()).toEqual({
+      provider: 'plaid', status: 'configured', message: 'Provider is configured.',
+      connections: [{ connectionId: 'item-1', label: 'Checking •••• 1234', needsReauth: true, reason: 'ACCOUNT_NOT_RETURNED' }],
+    })
+
+    const update = await fetch(`${base}/control/v1/provider-connections/plaid/update`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ connectionId: 'item-1' }),
+    })
+    expect(update.status).toBe(200)
+    const { continuationToken } = await update.json() as { continuationToken: string }
+    const complete = await fetch(`${base}/control/v1/provider-connections/plaid/update/complete`, {
+      method: 'POST', headers: headers({ 'content-type': 'application/json' }), body: JSON.stringify({ continuationToken }),
+    })
+    expect(complete.status).toBe(200)
+    expect(await plaid()).toEqual({
+      provider: 'plaid', status: 'configured', message: 'Provider is configured.',
+      connections: [{ connectionId: 'item-1', label: 'Checking •••• 1234', needsReauth: false }],
+    })
   })
 
   it('targets one exact Plaid Item for re-authentication and fails closed on an unknown selection', async () => {

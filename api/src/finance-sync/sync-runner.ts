@@ -6,7 +6,7 @@ import { runConfiguredSyncCycle } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
 import { parseServiceConfig } from './service-config'
-import { financeSyncHealth } from './health'
+import { financeSyncHealthResponse, syncCycleOutcome } from './health'
 import {
   createPlaidConnectTransport,
   createSnapTradeConnectTransport,
@@ -40,6 +40,10 @@ Provider credentials are resolved through scoped server-side Infisical machine i
   let connect: FinanceSyncConnectControl | undefined
   let webhookDrainer: DrainerHandle | undefined
   let databaseReady = false; let cycleReady = false; let cycleFailed = false; let connectionCount = 0; let stopping = false; let timer: ReturnType<typeof setTimeout> | undefined
+  // Plaid Items whose last completed cycle needed their owner, with the fixed
+  // reason code. Derived from the provider on every cycle, so nothing durable
+  // has to remember it.
+  const plaidItemConditions = new Map<string, string | undefined>()
   let retainedCardReplayNeeded = true
   let quarantinedCardReplayNeeded = true
   const cycle = async () => {
@@ -57,11 +61,13 @@ Provider credentials are resolved through scoped server-side Infisical machine i
         projectionEnabled: config.projectionEnabled,
       })
       connectionCount = result.connections
-      cycleReady = result.connections > 0 && result.failures === 0
-      cycleFailed = result.failures > 0
-      if (result.connections === 0 && result.failures === 0) console.log('FINANCE_SYNC_DISABLED')
-      else if (cycleReady) console.log('FINANCE_SYNC_CYCLE_OK')
-      else console.error('FINANCE_SYNC_CYCLE_FAILED')
+      plaidItemConditions.clear()
+      for (const condition of result.plaidItemConditions) plaidItemConditions.set(condition.providerConnectionId, condition.reason)
+      const outcome = syncCycleOutcome(result)
+      cycleReady = outcome.cycleReady
+      cycleFailed = outcome.cycleFailed
+      if (outcome.event === 'FINANCE_SYNC_CYCLE_FAILED') console.error(outcome.event)
+      else console.log(outcome.event)
     } catch {
       cycleReady = false
       cycleFailed = true
@@ -179,6 +185,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
             secretReference: input.secretReference, recovery: input.recovery, accounts: input.accounts,
           }),
           onPlaidAccountsUpdated: input => onboarding.updateConnectionAccounts(input),
+          plaidItemConditions,
         })
       }
     }
@@ -202,7 +209,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       investecTerminalRevisionRecovery: terminalRecoveryEnabled && deps?.terminalRevisionResolver
         ? createInvestecTerminalRevisionRecoveryControl(sql, config.deploymentId, deps.terminalRevisionResolver)
         : undefined,
-      health: () => { const body = financeSyncHealth(databaseReady, cycleReady, connectionCount, cycleFailed); return { status: body.ok ? 200 : 503, body } },
+      health: () => financeSyncHealthResponse(databaseReady, cycleReady, connectionCount, cycleFailed),
     })
     const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })

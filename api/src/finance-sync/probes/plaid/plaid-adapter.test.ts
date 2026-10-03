@@ -154,6 +154,72 @@ describe('Plaid adapter G4', () => {
     }, transport)).rejects.toThrow('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY')
   })
 
+  it('skips only the balance facts of an account without a current balance and keeps its transactions', async () => {
+    const balances = (current: number | null) => ({ current, iso_currency_code: 'USD' })
+    const transport = mockTransport({
+      syncTransactions: async () => ({
+        added: [
+          { transaction_id: 'txn-checking', account_id: 'acc-checking', amount: 10, date: '2026-07-10', name: 'CHECK' },
+          { transaction_id: 'txn-credit', account_id: 'acc-credit', amount: 20, date: '2026-07-10', name: 'CREDIT' },
+          { transaction_id: 'txn-savings', account_id: 'acc-savings', amount: 30, date: '2026-07-10', name: 'SAVE' },
+        ],
+        modified: [], removed: [],
+        accounts: [
+          { account_id: 'acc-checking', name: 'Checking', type: 'depository', subtype: 'checking', balances: balances(null) },
+          { account_id: 'acc-credit', name: 'Credit Card', type: 'credit', subtype: 'credit card', balances: balances(Number.NaN) },
+          { account_id: 'acc-savings', name: 'Savings', type: 'depository', subtype: 'savings', balances: balances(1000) },
+        ],
+        next_cursor: 'cursor-1', has_more: false,
+      }),
+      getLiabilities: async () => ({ credit: [{ account_id: 'acc-credit' }] }),
+    })
+    const result = await runPlaidSync({
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-checking', 'acc-credit', 'acc-savings'],
+    }, transport)
+
+    expect(result.nextCursor).toBe('cursor-1')
+    expect(transactionObservations(result).map(observation => observation.payload.accountId).sort())
+      .toEqual(['acc-checking', 'acc-credit', 'acc-savings'])
+    // Only the account with a real balance gets a balance fact; nothing is invented for the others.
+    const stateFacts = result.observations.filter(observation => !observation.providerVersion.startsWith('plaid:txn:'))
+    expect(stateFacts.map(observation => observation.providerVersion)).toEqual(['plaid:balance:acc-savings'])
+    expect(stateFacts[0].payload.currentBalance).toBe('1000')
+    expect(result.observations.filter(observation => 'currentBalance' in observation.payload)
+      .map(observation => observation.payload.accountId)).toEqual(['acc-savings'])
+    expect(result.accountsWithoutBalance).toEqual(['acc-checking', 'acc-credit'])
+    expect(result.counts.skipped.missingBalance).toBe(2)
+  })
+
+  it('emits nothing for an admitted account Plaid did not return and holds the cursor', async () => {
+    const transport = mockTransport({
+      syncTransactions: async () => ({
+        added: [
+          { transaction_id: 'txn-present', account_id: 'acc-present', amount: 10, date: '2026-07-10', name: 'PRESENT', iso_currency_code: 'USD' },
+          { transaction_id: 'txn-absent', account_id: 'acc-absent', amount: 20, date: '2026-07-10', name: 'ABSENT', iso_currency_code: 'USD' },
+        ],
+        modified: [{ transaction_id: 'txn-absent-modified', account_id: 'acc-absent', amount: 30, date: '2026-07-10', name: 'ABSENT', iso_currency_code: 'USD' }],
+        removed: [],
+        accounts: [{ account_id: 'acc-present', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 1000, iso_currency_code: 'USD' } }],
+        next_cursor: 'cursor-1', has_more: false,
+      }),
+    })
+    const config = {
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-present', 'acc-absent'],
+    }
+    const result = await runPlaidSync({ ...config, initialCursor: 'cursor-0' }, transport)
+
+    expect(result.accountsNotReturned).toEqual(['acc-absent'])
+    // The account's type is unknown, so none of its rows are classified or emitted, and no balance is invented.
+    expect(result.observations.map(observation => observation.providerVersion)).toEqual(['plaid:txn:txn-present', 'plaid:balance:acc-present'])
+    expect(result.observations.some(observation => observation.payload.accountId === 'acc-absent')).toBe(false)
+    expect(result.counts).toMatchObject({ added: 1, modified: 0, skipped: { accountNotReturned: 1, missingBalance: 0 } })
+    // The cursor does not move past rows that were not ingested.
+    expect(result.nextCursor).toBe('cursor-0')
+    await expect(runPlaidSync(config, transport)).resolves.toMatchObject({ nextCursor: null, accountsNotReturned: ['acc-absent'] })
+  })
+
   it('uses per-account sourceResourceIncarnationIds for checking and credit accounts', async () => {
     const transport = mockTransport({
       syncTransactions: async () => ({

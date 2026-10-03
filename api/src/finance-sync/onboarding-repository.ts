@@ -87,6 +87,32 @@ export class PostgresOnboardingRepository {
     `
   }
 
+  /**
+   * Names and masks of the accounts the runtime actually syncs: the same
+   * active, current-generation, baseline-verified predicate as the durable
+   * runtime loader. Used only to label a connection for the owner.
+   */
+  async listConnectedAccounts(subject: string, provider: string): Promise<readonly {
+    readonly providerConnectionId: string; readonly name: string; readonly mask: string | null
+  }[]> {
+    return await this.sql<{ providerConnectionId: string; name: string; mask: string | null }[]>`
+      SELECT pc.provider_connection_id AS "providerConnectionId", dpa.provider_name AS name, dpa.mask
+      FROM provider_connections pc
+      JOIN discovered_provider_accounts dpa
+        ON dpa.deployment_id = pc.deployment_id AND dpa.local_owner_id = pc.local_owner_id
+        AND dpa.connection_id = pc.connection_id
+      JOIN provider_account_admissions paa
+        ON paa.deployment_id = dpa.deployment_id AND paa.local_owner_id = dpa.local_owner_id
+        AND paa.connection_id = dpa.connection_id AND paa.provider_account_id = dpa.provider_account_id
+      WHERE pc.deployment_id = ${this.deploymentId} AND pc.local_owner_id = ${subject}
+        AND pc.provider = ${provider} AND pc.state = 'active' AND pc.disabled_at IS NULL
+        AND dpa.discovery_generation = pc.provider_generation
+        AND paa.provider_generation = pc.provider_generation
+        AND paa.revoked_at IS NULL AND paa.baseline_state = 'verified'
+      ORDER BY pc.provider_connection_id, dpa.provider_name, dpa.provider_account_id
+    `
+  }
+
   async admit(input: {
     readonly subject: string; readonly provider: string; readonly connectionId: string
     readonly providerAccountId: string; readonly wealthfolioAccountId: string

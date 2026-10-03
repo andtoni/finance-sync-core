@@ -97,6 +97,10 @@ export interface PlaidSyncSkippedCounts {
   readonly unadmittedAccount: number
   readonly missingAccountMetadata: number
   readonly missingCurrency: number
+  /** Admitted accounts whose current-state facts were skipped: Plaid reported no usable current balance. */
+  readonly missingBalance: number
+  /** Admitted accounts Plaid did not return; nothing is emitted for them. */
+  readonly accountNotReturned: number
 }
 
 export interface PlaidSyncCounts {
@@ -110,14 +114,22 @@ export interface PlaidSyncResult {
   readonly nextCursor: string | null
   readonly accounts: readonly PlaidAccount[]
   readonly observations: readonly ObservationOutput[]
+  /** Admitted accounts with no balance or liability observation in this run. */
+  readonly accountsWithoutBalance: readonly string[]
+  /**
+   * Admitted accounts Plaid did not return. The result holds no observation
+   * for them and `nextCursor` is the cursor the run started from, so a caller
+   * that saves it cannot move past data that was not ingested.
+   */
+  readonly accountsNotReturned: readonly string[]
   readonly pagesStaged: number
   readonly mutationRestarts: number
   /** Bounded ingestion counters. Counts only — never provider text or values. */
   readonly counts: PlaidSyncCounts
 }
 
-function emptyCounts(): { added: number; modified: number; removed: number; skipped: { unadmittedAccount: number; missingAccountMetadata: number; missingCurrency: number } } {
-  return { added: 0, modified: 0, removed: 0, skipped: { unadmittedAccount: 0, missingAccountMetadata: 0, missingCurrency: 0 } }
+function emptyCounts(): { added: number; modified: number; removed: number; skipped: { unadmittedAccount: number; missingAccountMetadata: number; missingCurrency: number; missingBalance: number; accountNotReturned: number } } {
+  return { added: 0, modified: 0, removed: 0, skipped: { unadmittedAccount: 0, missingAccountMetadata: 0, missingCurrency: 0, missingBalance: 0, accountNotReturned: 0 } }
 }
 
 function sha256(input: string): string {
@@ -141,6 +153,8 @@ export async function runPlaidSync(
   let mutationRestarts = 0
   let pagesStaged = 0
   let counts = emptyCounts()
+  let accountsWithoutBalance: string[] = []
+  let accountsNotReturned: string[] = []
   const sourceFor = (accountId: string): string =>
     config.sourceResourceIncarnationIds?.[accountId] ?? config.sourceResourceIncarnationId
   const removedSourceIds = (): readonly string[] => {
@@ -153,6 +167,8 @@ export async function runPlaidSync(
     pagesStaged = 0
     observations = []
     counts = emptyCounts()
+    accountsWithoutBalance = []
+    accountsNotReturned = []
     accountMap.clear()
 
     try {
@@ -316,7 +332,23 @@ export async function runPlaidSync(
           const liabilityRows = [...(liabilities.credit ?? []), ...(liabilities.loan ?? []), ...(liabilities.student ?? []), ...(liabilities.mortgage ?? [])]
           for (const accountId of config.accountIds) {
             const account = accountMap.get(accountId)
-            if (!account || account.balances.current === null || !Number.isFinite(account.balances.current)) throw new Error('INCOMPLETE_ACCOUNT_BALANCE')
+            // Plaid did not return this admitted account. Its type is unknown,
+            // so nothing can be classified or emitted for it; the Item's other
+            // accounts proceed and the cursor is held below.
+            if (!account) {
+              counts.skipped.accountNotReturned++
+              accountsNotReturned.push(accountId)
+              continue
+            }
+            // Plaid can return an account with no current balance. Only that
+            // account's balance and liability facts are skipped and counted; a
+            // balance is never invented or carried forward, and the account's
+            // transactions and every other account proceed.
+            if (account.balances.current === null || !Number.isFinite(account.balances.current)) {
+              counts.skipped.missingBalance++
+              accountsWithoutBalance.push(accountId)
+              continue
+            }
             const accountCurrency = account.balances.iso_currency_code
             if (!accountCurrency) throw new Error('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY')
             const sourceResourceIncarnationId = sourceFor(accountId)
@@ -362,10 +394,22 @@ export async function runPlaidSync(
             && typeof observation.payload.transactionId === 'string'
             && supersededPendingIds.has(observation.payload.transactionId)
           ))
+          if (accountsNotReturned.length > 0) {
+            observations = observations.filter(observation => {
+              const accountId = observation.payload.accountId
+              if (typeof accountId !== 'string' || !accountsNotReturned.includes(accountId)) return true
+              // Keep the counters equal to what is emitted.
+              if (observation.payload.isModified === true) counts.modified--
+              else counts.added--
+              return false
+            })
+          }
           return {
-            nextCursor: page.next_cursor,
+            nextCursor: accountsNotReturned.length > 0 ? config.initialCursor ?? null : page.next_cursor,
             accounts: [...accountMap.values()],
             observations,
+            accountsWithoutBalance,
+            accountsNotReturned,
             pagesStaged,
             mutationRestarts,
             counts,

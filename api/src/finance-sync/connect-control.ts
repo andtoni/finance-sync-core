@@ -117,7 +117,17 @@ export interface ConnectControlDependencies {
     }): Promise<AdmissionMetadata>
     revoke(subject: string, provider: string, connectionId: string): Promise<boolean>
     reconciliationStatus(subject: string, provider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata | null>
+    /** Names and masks of the subject's admitted accounts, used only to label a connection. */
+    listConnectedAccounts?(subject: string, provider: string): Promise<readonly {
+      readonly providerConnectionId: string; readonly name: string; readonly mask?: string | null
+    }[]>
   }
+  /**
+   * Plaid Item ids whose last sync needed their owner, with the fixed reason
+   * code when one is known. Owned and replaced by the sync runner each cycle;
+   * a completed update clears its Item.
+   */
+  readonly plaidItemConditions?: Map<string, string | undefined>
   readonly onPlaidConnected?: (input: {
     readonly subject: string; readonly itemId: string; readonly secretReference: string
     readonly accounts: Awaited<ReturnType<PlaidConnectTransport['listAccounts']>>
@@ -133,10 +143,34 @@ export interface ConnectControlDependencies {
   }) => Promise<void>
 }
 
+export interface ProviderConnectionSummary {
+  /** Exact value the Plaid update route accepts as its connectionId selection. */
+  readonly connectionId: string
+  /** Account names and masks only; never a credential, token, or balance. */
+  readonly label: string
+  /** The Item needs its owner; Link update mode with account selection is the remedy. */
+  readonly needsReauth: boolean
+  /** A documented Plaid ITEM_ERROR code or ACCOUNT_NOT_RETURNED; never provider text. */
+  readonly reason?: string
+}
+
 export interface ProviderConnectStatus {
   readonly provider: ConnectProvider
   readonly status: 'available' | 'configured' | 'not_configured'
   readonly message: string
+  /** Plaid only, present when the subject has at least one connected Item. */
+  readonly connections?: readonly ProviderConnectionSummary[]
+}
+
+const MAX_CONNECTION_LABEL_LENGTH = 200
+
+function connectionLabel(accounts: readonly { readonly name: string; readonly mask?: string | null }[]): string {
+  // Provider names are display text only: control characters are dropped and
+  // the length is bounded by code point so the receiver's strict check holds.
+  const label = [...accounts.map(account => account.mask ? `${account.name} •••• ${account.mask}` : account.name).join(', ')
+    .replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ').trim()]
+  if (label.length === 0) return 'Plaid connection'
+  return label.length > MAX_CONNECTION_LABEL_LENGTH ? `${label.slice(0, MAX_CONNECTION_LABEL_LENGTH - 1).join('')}…` : label.join('')
 }
 
 export class ConnectControlError extends Error {
@@ -216,7 +250,27 @@ export class FinanceSyncConnectControl {
 
   async list(rawSubject: string): Promise<readonly ProviderConnectStatus[]> {
     const connections = await this.subjectConnections(rawSubject)
-    return CONNECT_PROVIDERS.map(name => this.providerStatus(name, connections))
+    const plaidConnections = await this.plaidConnectionSummaries(rawSubject, connections)
+    return CONNECT_PROVIDERS.map(name => name === 'plaid' && plaidConnections.length > 0
+      ? { ...this.providerStatus(name, connections), connections: plaidConnections }
+      : this.providerStatus(name, connections))
+  }
+
+  /** One entry per Item the update route can target, so a caller can re-authenticate exactly that Item. */
+  private async plaidConnectionSummaries(rawSubject: string, connections: readonly RuntimeConnection[]): Promise<readonly ProviderConnectionSummary[]> {
+    const itemIds = [...new Set(connections.flatMap(connection =>
+      connection.provider === 'plaid' && connection.providerConnectionId ? [connection.providerConnectionId] : []))].sort()
+    if (itemIds.length === 0) return []
+    const accounts = await this.deps.onboarding?.listConnectedAccounts?.(subject(rawSubject), 'plaid') ?? []
+    return itemIds.map(connectionId => {
+      const reason = this.deps.plaidItemConditions?.get(connectionId)
+      return {
+        connectionId,
+        label: connectionLabel(accounts.filter(account => account.providerConnectionId === connectionId)),
+        needsReauth: this.deps.plaidItemConditions?.has(connectionId) ?? false,
+        ...(reason === undefined ? {} : { reason }),
+      }
+    })
   }
 
   async status(rawSubject: string, rawProvider: string): Promise<ProviderConnectStatus> {
@@ -445,6 +499,9 @@ export class FinanceSyncConnectControl {
         accounts,
       })
       await release()
+      // The Item just answered with its accounts under the same access token;
+      // the next sync confirms whether its condition is resolved.
+      this.deps.plaidItemConditions?.delete(session.providerConnectionId)
       return { provider: 'plaid', status: 'pending', message: 'Choose the Plaid accounts to add.' }
     } catch (error) {
       await release()

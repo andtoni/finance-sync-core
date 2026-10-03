@@ -8,7 +8,10 @@ import { currentStateSemanticHash } from './projection/current-state'
 import { assignProjectedRevision } from './projection/projected-revision'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
 import type { BridgeDisclosureOperation } from './projection/bridge-client'
-import type { RuntimeConnection } from './runtime'
+import { runConfiguredSyncCycle, type RuntimeConnection } from './runtime'
+import { PostgresOnboardingRepository } from './onboarding-repository'
+import type { PlaidAccount } from './probes/plaid/plaid-adapter'
+import type { ProviderTransportFactories } from './provider-runtime'
 import type { FinanceSyncSql } from './storage/pg'
 
 const url = process.env.FINANCE_SYNC_TEST_DATABASE_URL
@@ -837,6 +840,176 @@ suite('runtime dependencies with PostgreSQL', () => {
     expect(raised.activity?.notes).not.toBe(kept.activity?.notes)
   })
 
+})
+
+suite('Plaid Item with an account lacking a balance or not returned (PostgreSQL)', () => {
+  it('ingests its transactions, emits no snapshot for it, and resumes a real snapshot once Plaid reports a balance', async () => {
+    const itemDeployment = `${deploymentId}-null-balance`
+    const itemId = `null-balance-item-${runId}`
+    const digest = `sha256:${'a'.repeat(64)}`
+    const repository = new PostgresOnboardingRepository(sql, itemDeployment)
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: itemId, secretReference: 'PLAID_NULL_BALANCE_SLOT',
+      accounts: [
+        { providerAccountId: 'acc-checking', name: 'Checking', type: 'checking', currency: 'USD', mask: '1111', assets: [] },
+        { providerAccountId: 'acc-card', name: 'Card', type: 'credit card', currency: 'USD', mask: '2222', assets: [] },
+      ],
+    })
+    for (const pending of await repository.listPending(owner, 'plaid')) {
+      await repository.admit({
+        subject: owner, provider: 'plaid', connectionId: pending.connectionId, providerAccountId: pending.providerAccountId,
+        wealthfolioAccountId: `wf-${pending.providerAccountId}`, databaseStateDigest: digest,
+        providerGeneration: pending.providerGeneration, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+      })
+    }
+
+    let checkingBalance: number | null = null
+    let poll = 0
+    const unexpected = () => { throw new Error('unexpected provider use') }
+    const factories: ProviderTransportFactories = {
+      investec: unexpected, mercury: unexpected, snaptrade: unexpected,
+      plaid: () => ({
+        getAccounts: async (): Promise<readonly PlaidAccount[]> => [
+          { account_id: 'acc-checking', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: checkingBalance, iso_currency_code: 'USD' } },
+          { account_id: 'acc-card', name: 'Card', type: 'credit', subtype: 'credit card', balances: { current: 200, iso_currency_code: 'USD' } },
+        ],
+        syncTransactions: async () => {
+          poll += 1
+          return {
+            added: [
+              { transaction_id: `checking-${poll}`, account_id: 'acc-checking', amount: 12.5, date: '2026-07-17', name: 'COFFEE' },
+              { transaction_id: `card-${poll}`, account_id: 'acc-card', amount: 40, date: '2026-07-17', name: 'GROCER' },
+            ],
+            modified: [], removed: [], next_cursor: `cursor-${poll}`, has_more: false,
+          }
+        },
+        getLiabilities: async () => ({ credit: [{ account_id: 'acc-card' }] }),
+      }),
+    }
+    const deps = createRuntimeDependencies(sql, itemDeployment, {
+      FINANCE_SYNC_BRIDGE_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_URL, FINANCE_SYNC_BRIDGE_RECEIPT_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_RECEIPT_URL,
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: runtimeEnv.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS, FINANCE_SYNC_BRIDGE_TOKEN: runtimeEnv.FINANCE_SYNC_BRIDGE_TOKEN,
+    }, factories, undefined, { resolve: async () => ({ clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test-token' }) })
+    const outbox = async () => await sql<{ account: string; kind: string; count: number }[]>`
+      SELECT payload->>'accountId' AS account, payload->>'kind' AS kind, count(*)::int AS count
+      FROM projection_outbox WHERE deployment_id = ${itemDeployment}
+      GROUP BY 1, 2 ORDER BY 1, 2`
+    const cursor = async () => (await sql<{ cursor: string | null }[]>`
+      SELECT cursor FROM plaid_item_checkpoints WHERE deployment_id = ${itemDeployment} AND provider_connection_id = ${itemId}`)[0]?.cursor
+
+    // Persist and enqueue only: bridge delivery is covered by the suite above.
+    const controls = { providersEnabled: true, projectionEnabled: false }
+    await expect(runConfiguredSyncCycle(itemDeployment, deps, controls)).resolves.toMatchObject({ connections: 2, failures: 0 })
+    expect(await outbox()).toEqual([
+      { account: 'wf-acc-card', kind: 'ActivityUpsert', count: 1 },
+      { account: 'wf-acc-card', kind: 'CurrentStateUpsert', count: 1 },
+      { account: 'wf-acc-checking', kind: 'ActivityUpsert', count: 1 },
+    ])
+    // No balance fact of any kind was stored for the account Plaid gave no balance for.
+    const [stored] = await sql<{ transactions: number; balances: number }[]>`
+      SELECT count(*) FILTER (WHERE provider_version LIKE 'plaid:txn:%')::int AS transactions,
+        count(*) FILTER (WHERE payload ? 'currentBalance')::int AS balances
+      FROM raw_observations WHERE deployment_id = ${itemDeployment} AND payload->>'accountId' = 'acc-checking'`
+    expect(stored).toEqual({ transactions: 1, balances: 0 })
+    expect(await cursor()).toBe('cursor-1')
+
+    checkingBalance = 1000
+    await expect(runConfiguredSyncCycle(itemDeployment, deps, controls)).resolves.toMatchObject({ connections: 2, failures: 0 })
+    const [snapshot] = await sql<{ cash: string }[]>`
+      SELECT payload->'currentState'->>'cashBalance' AS cash FROM projection_outbox
+      WHERE deployment_id = ${itemDeployment} AND payload->>'accountId' = 'wf-acc-checking' AND payload->>'kind' = 'CurrentStateUpsert'`
+    expect(snapshot).toEqual({ cash: '1000' })
+    expect(await cursor()).toBe('cursor-2')
+  })
+
+  it('writes nothing for an account Plaid stops returning, keeps its sibling syncing on a held cursor, and catches up when it returns', async () => {
+    const itemDeployment = `${deploymentId}-not-returned`
+    const itemId = `not-returned-item-${runId}`
+    const digest = `sha256:${'a'.repeat(64)}`
+    const repository = new PostgresOnboardingRepository(sql, itemDeployment)
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: itemId, secretReference: 'PLAID_NOT_RETURNED_SLOT',
+      accounts: [
+        { providerAccountId: 'acc-checking', name: 'Checking', type: 'checking', currency: 'USD', mask: '1111', assets: [] },
+        { providerAccountId: 'acc-card', name: 'Card', type: 'credit card', currency: 'USD', mask: '2222', assets: [] },
+      ],
+    })
+    for (const pending of await repository.listPending(owner, 'plaid')) {
+      await repository.admit({
+        subject: owner, provider: 'plaid', connectionId: pending.connectionId, providerAccountId: pending.providerAccountId,
+        wealthfolioAccountId: `wf-${pending.providerAccountId}`, databaseStateDigest: digest,
+        providerGeneration: pending.providerGeneration, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+      })
+    }
+
+    let checkingReturned = false
+    const requestedCursors: (string | undefined)[] = []
+    const unexpected = () => { throw new Error('unexpected provider use') }
+    const factories: ProviderTransportFactories = {
+      investec: unexpected, mercury: unexpected, snaptrade: unexpected,
+      plaid: () => ({
+        getAccounts: async (): Promise<readonly PlaidAccount[]> => [
+          ...(checkingReturned ? [{ account_id: 'acc-checking', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 1000, iso_currency_code: 'USD' } }] : []),
+          { account_id: 'acc-card', name: 'Card', type: 'credit', subtype: 'credit card', balances: { current: 200, iso_currency_code: 'USD' } },
+        ],
+        // The stream is a pure function of the cursor, as Plaid's is: a held cursor replays the same rows.
+        syncTransactions: async (_accessToken, cursor) => {
+          requestedCursors.push(cursor)
+          return {
+            added: cursor ? [] : [
+              { transaction_id: 'checking-1', account_id: 'acc-checking', amount: 12.5, date: '2026-07-17', name: 'COFFEE', iso_currency_code: 'USD' },
+              { transaction_id: 'card-1', account_id: 'acc-card', amount: 40, date: '2026-07-17', name: 'GROCER', iso_currency_code: 'USD' },
+            ],
+            modified: [], removed: [], next_cursor: 'cursor-1', has_more: false,
+          }
+        },
+        getLiabilities: async () => ({ credit: [{ account_id: 'acc-card' }] }),
+      }),
+    }
+    const deps = createRuntimeDependencies(sql, itemDeployment, {
+      FINANCE_SYNC_BRIDGE_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_URL, FINANCE_SYNC_BRIDGE_RECEIPT_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_RECEIPT_URL,
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: runtimeEnv.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS, FINANCE_SYNC_BRIDGE_TOKEN: runtimeEnv.FINANCE_SYNC_BRIDGE_TOKEN,
+    }, factories, undefined, { resolve: async () => ({ clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test-token' }) })
+    const stored = async () => (await sql<{ checking_rows: number; card_transactions: number; card_activities: number; checking_outbox: number; cursors: number }[]>`
+      SELECT
+        (SELECT count(*)::int FROM raw_observations WHERE deployment_id = ${itemDeployment} AND payload->>'accountId' = 'acc-checking') AS checking_rows,
+        (SELECT count(*)::int FROM raw_observations WHERE deployment_id = ${itemDeployment} AND provider_version = 'plaid:txn:card-1') AS card_transactions,
+        (SELECT count(*)::int FROM projection_outbox WHERE deployment_id = ${itemDeployment} AND payload->>'accountId' = 'wf-acc-card' AND payload->>'kind' = 'ActivityUpsert') AS card_activities,
+        (SELECT count(*)::int FROM projection_outbox WHERE deployment_id = ${itemDeployment} AND payload->>'accountId' = 'wf-acc-checking') AS checking_outbox,
+        (SELECT count(*)::int FROM plaid_item_checkpoints WHERE deployment_id = ${itemDeployment}) AS cursors`)[0]
+
+    const controls = { providersEnabled: true, projectionEnabled: false }
+    const condition = { failures: 0, plaidItemConditions: [{ providerConnectionId: itemId, reason: 'ACCOUNT_NOT_RETURNED' }] }
+    await expect(runConfiguredSyncCycle(itemDeployment, deps, controls)).resolves.toMatchObject(condition)
+    // The sibling is ingested; the missing account has no observation, no outbox row, and the cursor is not stored.
+    expect(await stored()).toEqual({ checking_rows: 0, card_transactions: 1, card_activities: 1, checking_outbox: 0, cursors: 0 })
+
+    // The next cycle replays the same stream from the held cursor without duplicating the sibling's rows.
+    await expect(runConfiguredSyncCycle(itemDeployment, deps, controls)).resolves.toMatchObject(condition)
+    expect(await stored()).toEqual({ checking_rows: 0, card_transactions: 1, card_activities: 1, checking_outbox: 0, cursors: 0 })
+
+    checkingReturned = true
+    await expect(runConfiguredSyncCycle(itemDeployment, deps, controls)).resolves.toMatchObject({ failures: 0, plaidItemConditions: [] })
+    const [caughtUp] = await sql<{ kinds: string[] }[]>`
+      SELECT array_agg(payload->>'kind' ORDER BY payload->>'kind') AS kinds FROM projection_outbox
+      WHERE deployment_id = ${itemDeployment} AND payload->>'accountId' = 'wf-acc-checking'`
+    expect(caughtUp.kinds).toEqual(['ActivityUpsert', 'CurrentStateUpsert'])
+    expect((await stored()).card_activities).toBe(1)
+    const [checkpoint] = await sql<{ cursor: string | null }[]>`
+      SELECT cursor FROM plaid_item_checkpoints WHERE deployment_id = ${itemDeployment} AND provider_connection_id = ${itemId}`
+    expect(checkpoint).toEqual({ cursor: 'cursor-1' })
+    expect(requestedCursors).toEqual([undefined, undefined, undefined])
+  })
+
+  it('still refuses a snapshot assembled without the account balance', async () => {
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    const transactionId = `no-balance-${runId}`
+    const transaction = observation(transactionId, { transactionId, accountId: 'provider-account', amount: '4', currency: 'USD', date: '2026-07-17' })
+    await expect(deps.persistAndEnqueue(connection, [transaction])).rejects.toThrow(/incomplete current-state snapshot: balance/)
+    const [counts] = await sql`SELECT count(*)::int AS observations FROM raw_observations
+      WHERE deployment_id=${deploymentId} AND payload->>'transactionId'=${transactionId}`
+    expect(counts).toEqual({ observations: 0 })
+  })
 })
 
 afterAll(async () => { await sql?.end() })
