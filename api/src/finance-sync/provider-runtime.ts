@@ -4,7 +4,7 @@ import { runInvestecAdapter, type InvestecTransport } from './probes/investec/in
 import { runMercurySync, type MercuryTransport } from './probes/mercury/mercury-adapter'
 import { runSnapTradeSync, type SnapTradeTransport } from './probes/snaptrade/snaptrade-adapter'
 import type { ProviderName } from './probes/provider-registry'
-import type { RuntimeConnection, ProviderRun, SnapTradeAuthMode } from './runtime'
+import type { PlaidAccountIdentity, RuntimeConnection, ProviderRun, SnapTradeAuthMode } from './runtime'
 import { readExclusiveInput } from './secret-input'
 
 const PROVIDERS = new Set<ProviderName>(['investec', 'mercury', 'plaid', 'snaptrade'])
@@ -55,6 +55,20 @@ function optionalString(c: Record<string, unknown>, name: string): string | unde
   if (typeof value !== 'string' || value.length === 0) throw new Error(`connection ${name} must be a non-empty string`)
   return value
 }
+function optionalAccountIdentities(c: Record<string, unknown>): Readonly<Record<string, PlaidAccountIdentity>> | undefined {
+  if (c.accountIdentities === undefined) return undefined
+  const result: Record<string, PlaidAccountIdentity> = {}
+  for (const [accountId, entry] of Object.entries(record(c.accountIdentities, 'connection accountIdentities must be an object'))) {
+    const identity = record(entry, 'connection accountIdentities must contain objects')
+    const { mask, name, currency } = identity
+    if (!accountId || typeof mask !== 'string' || !mask || typeof name !== 'string' || !name || typeof currency !== 'string' || !currency) {
+      throw new Error('connection accountIdentities must contain mask, name and currency')
+    }
+    result[accountId] = Object.freeze({ mask, name, currency })
+  }
+  return Object.freeze(result)
+}
+
 function optionalStringRecord(c: Record<string, unknown>, name: string): Readonly<Record<string, string>> | undefined {
   const value = c[name]
   if (value === undefined) return undefined
@@ -141,6 +155,7 @@ export function parseRuntimeConnections(env: ProviderRuntimeEnv, deploymentId: s
       case 'plaid': return {
         ...common, provider, clientId: string(c, 'clientId'), clientSecret: string(c, 'clientSecret'),
         accessToken: string(c, 'accessToken'), sourceResourceIncarnationIds: optionalStringRecord(c, 'sourceResourceIncarnationIds'), maxPages: optionalPositive(c, 'maxPages'),
+        accountIdentities: optionalAccountIdentities(c),
       }
       case 'investec': return {
         ...common, provider, clientId: string(c, 'clientId'), clientSecret: string(c, 'clientSecret'), apiKey: string(c, 'apiKey'),
@@ -530,6 +545,7 @@ export async function runRuntimeProvider(connection: RuntimeConnection, cursor: 
         nextCursor: run.nextCursor,
         currentStateUnavailableAccountIds: run.accountsWithoutBalance,
         accountsNotReturned: run.accountsNotReturned,
+        accountsReissued: run.accountsReissued,
         plaidSync: {
           added: run.counts.added,
           modified: run.counts.modified,

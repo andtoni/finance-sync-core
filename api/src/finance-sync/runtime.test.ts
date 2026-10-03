@@ -346,6 +346,95 @@ describe('configured sync runtime', () => {
     }
   })
 
+  describe('a Plaid account re-issued under a new account id', () => {
+    const identity = { mask: '0042', name: 'Everyday Checking', currency: 'USD' }
+    const dead = { ...plaidConnection('item-dead', 'token-dead', 'acc-old'), accountIdentities: { 'acc-old': identity } }
+    const live = plaidConnection('item-live', 'token-live', 'acc-live')
+    const observation = (transactionId: string, date: string, amount: string, name: string) => ({
+      deploymentId: 'd', localOwnerId: dead.localOwnerId, sourceResourceIncarnationId: dead.sourceResourceIncarnationId,
+      providerVersion: `plaid:txn:${transactionId}`, semanticHash: transactionId, hashSpecificationVersion: 1, domain: 'cash_ledger' as const,
+      payload: { transactionId, accountId: 'acc-old', date, amount, name }, observedAt: `${date}T00:00:00.000Z`,
+    })
+    const cycle = (itemsReturningIt: readonly string[], history?: SyncRuntimeDependencies['loadPlaidReissuedHistory']) => {
+      const persisted: Array<{ connection: string; transactions: unknown[] }> = []
+      const checkpoints: string[] = []
+      const candidates: unknown[] = []
+      const deps: SyncRuntimeDependencies = {
+        loadConnections: async () => [dead, live, plaidConnection('item-other', 'token-other', 'acc-other')],
+        loadCheckpoint: async () => null,
+        loadPlaidItemCheckpoint: async () => null,
+        savePlaidItemCheckpoint: async connection => { checkpoints.push(String(connection.providerConnectionId)) },
+        runProvider: async connection => {
+          if (connection.providerConnectionId === 'item-dead') {
+            throw Object.assign(new Error('plaid request failed'), { code: 'NO_ACCOUNTS', errorType: 'ITEM_ERROR' })
+          }
+          candidates.push((connection as { reissueCandidates?: unknown }).reissueCandidates)
+          if (!itemsReturningIt.includes(String(connection.providerConnectionId))) return { nextCursor: 'cursor-1', observations: [] }
+          return {
+            nextCursor: 'cursor-1', accountsReissued: { 'acc-old': 'acc-new' },
+            observations: [
+              observation('older', '2026-08-01', '5', 'OLD'), observation('held', '2026-09-05', '12.5', 'COFFEE'),
+              observation('held-twice', '2026-09-05', '12.5', 'COFFEE'), observation('new', '2026-09-20', '7', 'LUNCH'),
+            ],
+          }
+        },
+        loadPlaidReissuedHistory: history,
+        persistAndEnqueue: async (connection, observations) => {
+          persisted.push({ connection: connection.connectionId, transactions: observations.map(item => item.payload.transactionId) })
+          return observations.length
+        },
+        projectPending: async () => ({ delivered: 0, failed: 0 }),
+        saveCheckpoint: async () => {},
+      }
+      return runConfiguredSyncCycle('d', deps).then(result => ({ result, persisted, checkpoints, candidates }))
+    }
+
+    it('is ingested from the one Item that returns it, without the history already held', async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const { result, persisted, checkpoints, candidates } = await cycle(['item-live'], async (connection, returnedAccountId) => {
+          expect([connection.connectionId, returnedAccountId]).toEqual([dead.connectionId, 'acc-new'])
+          return [{ date: '2026-09-05', amount: '12.5', name: 'COFFEE' }, { date: '2026-09-01', amount: '3', name: 'TEA' }]
+        })
+        // Every Item is offered the stored identity of the owner's admitted accounts.
+        expect(candidates[0]).toEqual({ 'acc-old': { ...identity, sourceResourceIncarnationId: dead.sourceResourceIncarnationId } })
+        // Before the overlap window: dropped. One held twin is dropped once; the second identical row is new.
+        expect(persisted.find(row => row.connection === dead.connectionId)?.transactions).toEqual(['held-twice', 'new'])
+        // The dead Item needs nothing from its owner once its account is ingested elsewhere.
+        expect(result.plaidItemConditions).toEqual([])
+        expect(result.failures).toBe(0)
+        expect(checkpoints).toContain('item-live')
+      } finally {
+        error.mockRestore()
+      }
+    })
+
+    it('is left alone when two Items return it, and the dead Item keeps its condition', async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const { result, persisted } = await cycle(['item-live', 'item-other'], async () => [])
+        expect(persisted.some(row => row.connection === dead.connectionId)).toBe(false)
+        expect(result.plaidItemConditions).toEqual([{ providerConnectionId: 'item-dead', reason: 'NO_ACCOUNTS' }])
+        expect(result.failures).toBe(0)
+      } finally {
+        error.mockRestore()
+      }
+    })
+
+    it('holds the Item cursor when the held history cannot be read', async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const { result, persisted, checkpoints } = await cycle(['item-live'])
+        expect(persisted.some(row => row.connection === dead.connectionId)).toBe(false)
+        expect(checkpoints).not.toContain('item-live')
+        expect(result.failures).toBeGreaterThan(0)
+        expect(result.plaidItemConditions).toEqual([{ providerConnectionId: 'item-dead', reason: 'NO_ACCOUNTS' }])
+      } finally {
+        error.mockRestore()
+      }
+    })
+  })
+
   const plaidItemCycle = (failure: unknown, persistFailure?: unknown) => runConfiguredSyncCycle('d', {
     loadConnections: async () => [plaidConnection('item-1', 'token')],
     loadCheckpoint: async () => null,

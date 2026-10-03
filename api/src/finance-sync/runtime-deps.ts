@@ -2314,6 +2314,23 @@ export function createRuntimeDependencies(
       return null
     },
     runProvider: async (connection, cursor) => runRuntimeProvider(connection, cursor, factories),
+    loadPlaidReissuedHistory: async (connection, returnedAccountId) => {
+      await assertDurableAuthority(sql, deploymentId, connection)
+      // Removal tombstones carry no date or amount, so the latest dated
+      // observation stands for each transaction the earlier account id delivered.
+      return sql<{ date: string; amount: string; name: string }[]>`
+        SELECT DISTINCT ON (payload->>'transactionId')
+          payload->>'date' AS date, payload->>'amount' AS amount, coalesce(payload->>'name', '') AS name
+        FROM raw_observations
+        WHERE deployment_id = ${deploymentId}
+          AND local_owner_id = ${connection.localOwnerId}
+          AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+          AND provider_version LIKE 'plaid:txn:%'
+          AND payload ? 'date' AND payload ? 'amount'
+          AND raw_payload->>'account_id' IS DISTINCT FROM ${returnedAccountId}
+        ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+      `
+    },
     persistAndEnqueue: async (connection, observations, options?: PersistEnqueueOptions) =>
       sql.begin(async transaction => persistAndEnqueueTx(
         transaction as unknown as FinanceSyncSql,

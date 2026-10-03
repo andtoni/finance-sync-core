@@ -36,6 +36,8 @@ export interface PlaidTransaction {
 export interface PlaidAccount {
   readonly account_id: string
   readonly name: string
+  readonly official_name?: string | null
+  readonly mask?: string | null
   readonly type: string
   readonly subtype: string | null
   readonly balances: {
@@ -74,8 +76,22 @@ export interface PlaidSyncConfig {
   /** Per-account native resource identity for item-level multi-account sync. */
   readonly sourceResourceIncarnationIds?: Readonly<Record<string, string>>
   readonly accountIds: readonly string[]
+  /**
+   * Stored identity of admitted accounts, keyed by admitted account id. An
+   * institution can re-issue an account under a new Plaid account id; a
+   * returned account that is not admitted and matches exactly one candidate
+   * that was not returned under its own id is ingested as that candidate.
+   */
+  readonly reissueCandidates?: Readonly<Record<string, PlaidReissueCandidate>>
   readonly initialCursor?: string
   readonly maxPages?: number
+}
+
+export interface PlaidReissueCandidate {
+  readonly mask: string
+  readonly name: string
+  readonly currency: string
+  readonly sourceResourceIncarnationId: string
 }
 
 export interface ObservationOutput {
@@ -122,6 +138,8 @@ export interface PlaidSyncResult {
    * that saves it cannot move past data that was not ingested.
    */
   readonly accountsNotReturned: readonly string[]
+  /** Admitted account id to the Plaid account id it was returned under this run. */
+  readonly accountsReissued: Readonly<Record<string, string>>
   readonly pagesStaged: number
   readonly mutationRestarts: number
   /** Bounded ingestion counters. Counts only — never provider text or values. */
@@ -139,6 +157,26 @@ function sha256(input: string): string {
 const HASH_SPEC_VERSION = 2
 const MAX_PAGES = 50
 
+/** Returned Plaid account id to the admitted account it was re-issued for. */
+function reissuedAccountIds(config: PlaidSyncConfig, returned: readonly PlaidAccount[]): Map<string, string> {
+  const returnedIds = new Set(returned.map(account => account.account_id))
+  const candidates = Object.entries(config.reissueCandidates ?? {}).filter(([accountId]) => !returnedIds.has(accountId))
+  const unadmitted = returned.filter(account => !config.accountIds.includes(account.account_id))
+  const same = (account: PlaidAccount, candidate: PlaidReissueCandidate): boolean =>
+    typeof account.mask === 'string' && account.mask.length > 0 && account.mask === candidate.mask
+    && (account.official_name ?? account.name) === candidate.name
+    && account.balances.iso_currency_code === candidate.currency
+  const result = new Map<string, string>()
+  for (const account of unadmitted) {
+    const matches = candidates.filter(([, candidate]) => same(account, candidate))
+    // Ambiguity in either direction leaves the account unadmitted.
+    if (matches.length !== 1) continue
+    if (unadmitted.filter(other => same(other, matches[0][1])).length !== 1) continue
+    result.set(account.account_id, matches[0][0])
+  }
+  return result
+}
+
 /**
  * Run one Plaid Transactions Sync session, producing canonical observations.
  * Handles MUTATION_DURING_PAGINATION restarts.
@@ -155,8 +193,14 @@ export async function runPlaidSync(
   let counts = emptyCounts()
   let accountsWithoutBalance: string[] = []
   let accountsNotReturned: string[] = []
+  let reissued = new Map<string, string>()
+  /** The admitted account a returned Plaid account id belongs to, if any. */
+  const admitted = (plaidAccountId: string): string | undefined =>
+    config.accountIds.includes(plaidAccountId) ? plaidAccountId : reissued.get(plaidAccountId)
   const sourceFor = (accountId: string): string =>
-    config.sourceResourceIncarnationIds?.[accountId] ?? config.sourceResourceIncarnationId
+    config.sourceResourceIncarnationIds?.[accountId]
+      ?? config.reissueCandidates?.[accountId]?.sourceResourceIncarnationId
+      ?? config.sourceResourceIncarnationId
   const removedSourceIds = (): readonly string[] => {
     const ids = Object.values(config.sourceResourceIncarnationIds ?? {})
     return ids.length > 0 ? [...new Set(ids)] : [config.sourceResourceIncarnationId]
@@ -172,8 +216,11 @@ export async function runPlaidSync(
     accountMap.clear()
 
     try {
-      for (const account of await transport.getAccounts?.(config.accessToken) ?? []) {
-        if (config.accountIds.includes(account.account_id)) accountMap.set(account.account_id, account)
+      const returnedAccounts = await transport.getAccounts?.(config.accessToken) ?? []
+      reissued = reissuedAccountIds(config, returnedAccounts)
+      for (const account of returnedAccounts) {
+        const accountId = admitted(account.account_id)
+        if (accountId !== undefined) accountMap.set(accountId, account)
       }
       for (let pageNum = 0; pageNum < (config.maxPages ?? MAX_PAGES); pageNum++) {
         const page = await transport.syncTransactions(config.accessToken, cursor)
@@ -182,13 +229,15 @@ export async function runPlaidSync(
 
         // Collect account metadata
         for (const acct of page.accounts ?? []) {
-          if (config.accountIds.includes(acct.account_id) && !accountMap.has(acct.account_id)) accountMap.set(acct.account_id, acct)
+          const accountId = admitted(acct.account_id)
+          if (accountId !== undefined && !accountMap.has(accountId)) accountMap.set(accountId, acct)
         }
 
         // Build observations from added transactions
         for (const txn of page.added) {
-          if (!config.accountIds.includes(txn.account_id)) { counts.skipped.unadmittedAccount++; continue }
-          const acct = accountMap.get(txn.account_id)
+          const accountId = admitted(txn.account_id)
+          if (accountId === undefined) { counts.skipped.unadmittedAccount++; continue }
+          const acct = accountMap.get(accountId)
           const currency = txn.iso_currency_code ?? txn.unofficial_currency_code ?? acct?.balances.iso_currency_code
 
           // No currency is unresolvable: the fallback needs the account object,
@@ -201,10 +250,10 @@ export async function runPlaidSync(
           counts.added++
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
-          const sourceResourceIncarnationId = sourceFor(txn.account_id)
+          const sourceResourceIncarnationId = sourceFor(accountId)
           const payload = {
             transactionId: txn.transaction_id,
-            accountId: txn.account_id,
+            accountId,
             amount: String(txn.amount),
             currency,
             date: txn.date,
@@ -244,8 +293,9 @@ export async function runPlaidSync(
 
         // Modified transactions: produce revision observations
         for (const txn of page.modified) {
-          if (!config.accountIds.includes(txn.account_id)) { counts.skipped.unadmittedAccount++; continue }
-          const acct = accountMap.get(txn.account_id)
+          const accountId = admitted(txn.account_id)
+          if (accountId === undefined) { counts.skipped.unadmittedAccount++; continue }
+          const acct = accountMap.get(accountId)
           const currency = txn.iso_currency_code ?? txn.unofficial_currency_code ?? acct?.balances.iso_currency_code
           if (!currency) {
             counts.skipped.missingCurrency++
@@ -255,10 +305,10 @@ export async function runPlaidSync(
           counts.modified++
 
           const domain = plaidResourceKind(acct?.type ?? 'other')
-          const sourceResourceIncarnationId = sourceFor(txn.account_id)
+          const sourceResourceIncarnationId = sourceFor(accountId)
           const payload = {
             transactionId: txn.transaction_id,
-            accountId: txn.account_id,
+            accountId,
             amount: String(txn.amount),
             currency,
             date: txn.date,
@@ -330,7 +380,8 @@ export async function runPlaidSync(
             ? await transport.getLiabilities?.(config.accessToken) ?? {}
             : {}
           const liabilityRows = [...(liabilities.credit ?? []), ...(liabilities.loan ?? []), ...(liabilities.student ?? []), ...(liabilities.mortgage ?? [])]
-          for (const accountId of config.accountIds) {
+          const guestAccountIds = [...reissued.values()].filter(accountId => !config.accountIds.includes(accountId))
+          for (const accountId of [...config.accountIds, ...guestAccountIds]) {
             const account = accountMap.get(accountId)
             // Plaid did not return this admitted account. Its type is unknown,
             // so nothing can be classified or emitted for it; the Item's other
@@ -369,7 +420,7 @@ export async function runPlaidSync(
               domain: plaidResourceKind(account.type), payload: balancePayload, rawPayload: account, observedAt: snapshotObservedAt,
             })
             if (account.type === 'credit' || account.type === 'loan') {
-              const details = liabilityRows.filter(row => row.account_id === accountId)
+              const details = liabilityRows.filter(row => row.account_id === account.account_id)
               const liabilityPayload = Object.freeze({ accountId, currentBalance: String(Math.abs(account.balances.current)), currency: accountCurrency, details })
               observations.push({
                 deploymentId: config.deploymentId, localOwnerId: config.localOwnerId,
@@ -410,6 +461,7 @@ export async function runPlaidSync(
             observations,
             accountsWithoutBalance,
             accountsNotReturned,
+            accountsReissued: Object.fromEntries([...reissued].map(([returnedId, accountId]) => [accountId, returnedId])),
             pagesStaged,
             mutationRestarts,
             counts,

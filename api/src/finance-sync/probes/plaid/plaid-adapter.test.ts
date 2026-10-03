@@ -220,6 +220,68 @@ describe('Plaid adapter G4', () => {
     await expect(runPlaidSync(config, transport)).resolves.toMatchObject({ nextCursor: null, accountsNotReturned: ['acc-absent'] })
   })
 
+  describe('an account the institution re-issued under a new account id', () => {
+    const account = (accountId: string, mask: string, name: string) =>
+      ({ account_id: accountId, name, mask, type: 'depository', subtype: 'checking', balances: { current: 365, iso_currency_code: 'USD' } })
+    const transportReturning = (accounts: ReturnType<typeof account>[], accountIdOfTransaction: string): PlaidTransport => ({
+      getAccounts: async () => accounts,
+      syncTransactions: async () => ({
+        added: [{ transaction_id: 'txn-new', account_id: accountIdOfTransaction, amount: 20, date: '2026-10-01', name: 'COFFEE' }],
+        modified: [], removed: [], accounts: [], next_cursor: 'cursor-1', has_more: false,
+      }),
+    })
+    const config = {
+      accessToken: 'access', deploymentId: 'd', localOwnerId: 'owner', sourceResourceIncarnationId: 'item',
+      accountIds: ['acc-old'], sourceResourceIncarnationIds: { 'acc-old': 'source-old' },
+      reissueCandidates: { 'acc-old': { mask: '0042', name: 'Everyday Checking', currency: 'USD', sourceResourceIncarnationId: 'source-old' } },
+    }
+
+    it('ingests it as the admitted account and advances the cursor', async () => {
+      const result = await runPlaidSync(config, transportReturning([account('acc-new', '0042', 'Everyday Checking')], 'acc-new'))
+      expect(result.accountsNotReturned).toEqual([])
+      expect(result.accountsReissued).toEqual({ 'acc-old': 'acc-new' })
+      expect(result.nextCursor).toBe('cursor-1')
+      expect(result.counts.skipped.unadmittedAccount).toBe(0)
+      const [transaction] = transactionObservations(result)
+      expect(transaction).toMatchObject({ sourceResourceIncarnationId: 'source-old', payload: { transactionId: 'txn-new', accountId: 'acc-old' } })
+      // The provider's own account id stays in the raw evidence.
+      expect(transaction.rawPayload).toMatchObject({ account_id: 'acc-new' })
+      const balance = result.observations.find(observation => observation.providerVersion === 'plaid:balance:acc-old')
+      expect(balance).toMatchObject({ sourceResourceIncarnationId: 'source-old', payload: { accountId: 'acc-old', currentBalance: '365' } })
+    })
+
+    it('ingests an account of another Item of the same owner under that account\'s own source', async () => {
+      const result = await runPlaidSync({
+        ...config, accountIds: ['acc-home'], sourceResourceIncarnationIds: { 'acc-home': 'source-home' },
+      }, transportReturning([account('acc-home', '0020', 'Savings'), account('acc-new', '0042', 'Everyday Checking')], 'acc-new'))
+      expect(result.accountsNotReturned).toEqual([])
+      expect(result.accountsReissued).toEqual({ 'acc-old': 'acc-new' })
+      expect(transactionObservations(result)[0]).toMatchObject({ sourceResourceIncarnationId: 'source-old', payload: { accountId: 'acc-old' } })
+      expect(result.observations.some(observation => observation.providerVersion === 'plaid:balance:acc-old')).toBe(true)
+    })
+
+    it('leaves the account unadmitted when the match is ambiguous or differs', async () => {
+      for (const accounts of [
+        [account('acc-new', '0042', 'Everyday Checking'), account('acc-other', '0042', 'Everyday Checking')],
+        [account('acc-new', '0042', 'Another Account')],
+        [account('acc-new', '9999', 'Everyday Checking')],
+      ]) {
+        const result = await runPlaidSync(config, transportReturning(accounts, 'acc-new'))
+        expect(result.accountsReissued).toEqual({})
+        expect(result.accountsNotReturned).toEqual(['acc-old'])
+        expect(transactionObservations(result)).toHaveLength(0)
+        expect(result.counts.skipped.unadmittedAccount).toBe(1)
+      }
+    })
+
+    it('never re-homes an account that is still returned under its own id', async () => {
+      const result = await runPlaidSync(config, transportReturning(
+        [account('acc-old', '0042', 'Everyday Checking'), account('acc-new', '0042', 'Everyday Checking')], 'acc-new'))
+      expect(result.accountsReissued).toEqual({})
+      expect(transactionObservations(result)).toHaveLength(0)
+    })
+  })
+
   it('uses per-account sourceResourceIncarnationIds for checking and credit accounts', async () => {
     const transport = mockTransport({
       syncTransactions: async () => ({

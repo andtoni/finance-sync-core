@@ -151,6 +151,27 @@ suite('runtime dependencies with PostgreSQL', () => {
     expect(counts).toEqual({ deletes: 0, removals: 1 })
   })
 
+  it('reads the transactions an account holds under an earlier provider account id', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    const held = (transactionId: string, accountId: string, date: string, amount: string, name: string): ObservationOutput => ({
+      ...observation(`reissue-${transactionId}`, { transactionId: `reissue-${transactionId}`, accountId: 'provider-account', amount, currency: 'USD', date, name }),
+      rawPayload: { transaction_id: `reissue-${transactionId}`, account_id: accountId },
+    })
+    await deps.persistAndEnqueue(connection, [
+      held('old-1', 'account-old', '2026-09-05', '12.5', 'COFFEE'),
+      held('old-2', 'account-old', '2026-09-06', '-40', 'REFUND'),
+      held('new-1', 'account-new', '2026-09-20', '7', 'LUNCH'),
+      // A removal of an old transaction carries no date or amount and must not hide it.
+      { ...observation('reissue-old-1', { transactionId: 'reissue-old-1', isRemoved: true }), semanticHash: 'c'.repeat(64) },
+    ], { skipCurrentState: true })
+    const rows = await deps.loadPlaidReissuedHistory!(connection as Extract<RuntimeConnection, { provider: 'plaid' }>, 'account-new')
+    expect([...rows].filter(row => ['COFFEE', 'REFUND', 'LUNCH'].includes(row.name)).sort((a, b) => a.date.localeCompare(b.date))).toEqual([
+      { date: '2026-09-05', amount: '12.5', name: 'COFFEE' },
+      { date: '2026-09-06', amount: '-40', name: 'REFUND' },
+    ])
+  })
+
   it('concurrent workers claim each row once and a batch tail remains blocking', async () => {
     await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
     for (let index = 0; index < 30; index++) {

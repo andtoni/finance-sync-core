@@ -19,6 +19,9 @@ interface RuntimeRow {
   wealthfolio_account_id: string
   asset_mappings: readonly { providerAssetId: string; wealthfolioAssetId: string }[]
   source_resource_incarnation_id: string
+  mask: string | null
+  provider_name: string | null
+  currency: string | null
 }
 
 /**
@@ -36,7 +39,7 @@ export async function loadDurableRuntimeConnections(
       pc.provider_connection_id, pc.secret_reference, pc.provider_generation,
       pc.configuration, dpa.provider_account_id, paa.wealthfolio_account_id,
       paa.receiver_access_generation, paa.asset_mappings,
-      dpa.source_resource_incarnation_id::text
+      dpa.source_resource_incarnation_id::text, dpa.mask, dpa.provider_name, dpa.currency
     FROM provider_connections pc
     JOIN discovered_provider_accounts dpa
       ON dpa.deployment_id = pc.deployment_id
@@ -75,6 +78,11 @@ export async function loadDurableRuntimeConnections(
       providerGeneration: row.provider_generation,
       receiverAccessGeneration: row.receiver_access_generation,
       secretReference: row.secret_reference,
+      // Stored identity lets a Plaid account the institution re-issued under a
+      // new account id be recognised as this admitted account.
+      ...(row.provider === 'plaid' && row.mask && row.provider_name && row.currency
+        ? { accountIdentities: { [row.provider_account_id]: { mask: row.mask, name: row.provider_name, currency: row.currency } } }
+        : {}),
       ...(row.provider === 'snaptrade' ? { assetMappings: Object.fromEntries(row.asset_mappings.map(mapping =>
         [mapping.providerAssetId, mapping.wealthfolioAssetId])) } : {}),
     }

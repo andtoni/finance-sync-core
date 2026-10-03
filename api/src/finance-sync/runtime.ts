@@ -30,7 +30,13 @@ export interface PlaidRuntimeConnection extends RuntimeConnectionBase {
   /** Per-account native resource identity retained while one Plaid item is synced once. */
   readonly sourceResourceIncarnationIds?: Readonly<Record<string, string>>
   readonly maxPages?: number
+  /** Stored mask, name and currency per admitted account, for re-issue matching. */
+  readonly accountIdentities?: Readonly<Record<string, PlaidAccountIdentity>>
+  /** Set on the item-level connection only: every admitted Plaid account of the owner. */
+  readonly reissueCandidates?: Readonly<Record<string, PlaidAccountIdentity & { readonly sourceResourceIncarnationId: string }>>
 }
+
+export interface PlaidAccountIdentity { readonly mask: string; readonly name: string; readonly currency: string }
 
 export interface InvestecRuntimeConnection extends RuntimeConnectionBase {
   readonly provider: 'investec'
@@ -82,6 +88,8 @@ export interface ProviderRun {
   readonly currentStateUnavailableAccountIds?: readonly string[]
   /** Admitted provider accounts the provider did not return; the run carries nothing for them. Never logged. */
   readonly accountsNotReturned?: readonly string[]
+  /** Admitted Plaid account id to the account id the provider returned it under. Never logged. */
+  readonly accountsReissued?: Readonly<Record<string, string>>
 }
 
 /**
@@ -124,6 +132,49 @@ export interface SyncRuntimeDependencies {
   projectPending(connection: RuntimeConnection): Promise<{ delivered: number; failed: number }>
   saveCheckpoint(connection: RuntimeConnection, cursor: string | null): Promise<void>
   savePlaidItemCheckpoint?(connection: Extract<RuntimeConnection, { provider: 'plaid' }>, cursor: string | null): Promise<void>
+  /**
+   * Transactions already held for an admitted Plaid account under any provider
+   * account id other than the one it is returned under now.
+   */
+  loadPlaidReissuedHistory?(
+    connection: Extract<RuntimeConnection, { provider: 'plaid' }>,
+    returnedAccountId: string,
+  ): Promise<readonly PlaidHeldTransaction[]>
+}
+export interface PlaidHeldTransaction { readonly date: string; readonly amount: string; readonly name: string }
+
+const REISSUE_OVERLAP_DAYS = 14
+
+/**
+ * A re-issued account's stream repeats its history under new transaction ids.
+ * Keep only what the earlier account id did not deliver: nothing dated before
+ * an overlap window ending at its last held transaction, and inside the window
+ * nothing with the date, amount and name of a held transaction.
+ */
+export function withoutReissuedHistory(
+  observations: readonly ObservationOutput[],
+  held: readonly PlaidHeldTransaction[],
+): ObservationOutput[] {
+  if (held.length === 0) return [...observations]
+  const lastDate = held.reduce((latest, row) => row.date > latest ? row.date : latest, '')
+  const windowStart = new Date(Date.parse(`${lastDate}T00:00:00.000Z`) - REISSUE_OVERLAP_DAYS * 86_400_000)
+    .toISOString().slice(0, 10)
+  const fingerprint = (date: unknown, amount: unknown, name: unknown) => [date, amount, name ?? ''].join('\x00')
+  const remaining = new Map<string, number>()
+  for (const row of held) {
+    const key = fingerprint(row.date, row.amount, row.name)
+    remaining.set(key, (remaining.get(key) ?? 0) + 1)
+  }
+  return observations.filter(observation => {
+    const { date, amount, name } = observation.payload
+    if (!observation.providerVersion.startsWith('plaid:txn:') || typeof date !== 'string') return true
+    if (date < windowStart) return false
+    const key = fingerprint(date, amount, name)
+    const count = remaining.get(key) ?? 0
+    if (count === 0) return true
+    remaining.set(key, count - 1)
+    return false
+  })
 }
 /**
  * A condition of one Plaid Item that only its owner can resolve. It is reported
@@ -360,13 +411,60 @@ export async function runConfiguredSyncCycle(
   // projection, but perform one provider request per item and commit its
   // cursor only after every admitted account has projected successfully.
   if (plaidItemCursorEnabled) {
+    const plaidConnections = [...plaidGroups.values()].flat()
+    const sameOwner = (a: PlaidRuntimeConnection, b: PlaidRuntimeConnection) =>
+      a.deploymentId === b.deploymentId && a.localOwnerId === b.localOwnerId
+    // An institution can re-issue an account under a new Plaid account id, in
+    // its own Item or in another Item of the same owner. Every Item is fetched
+    // before anything is written, so an account its own Item no longer returns
+    // can be ingested from the Item that does.
+    const fetched: Array<{ expected: readonly PlaidRuntimeConnection[]; item: PlaidRuntimeConnection; run: ProviderRun }> = []
+    const conditioned: Array<{ expected: readonly PlaidRuntimeConnection[]; condition: PlaidItemCondition }> = []
+    /** Admitted connections their own Item did not return under their own id this cycle. */
+    const unserved = new Set<PlaidRuntimeConnection>()
     for (const expected of plaidGroups.values()) {
       if (expected.length === 0) continue
       try {
-        const item = await runPlaidStage('item_build', () => plaidItemConnection(expected))
+        const built = await runPlaidStage('item_build', () => plaidItemConnection(expected))
+        const item: PlaidRuntimeConnection = {
+          ...built,
+          reissueCandidates: Object.fromEntries(plaidConnections
+            .filter(connection => sameOwner(connection, built))
+            .flatMap(connection => connection.accountIds.flatMap(accountId => {
+              const identity = connection.accountIdentities?.[accountId]
+              const sourceResourceIncarnationId = connection.sourceResourceIncarnationIds?.[accountId] ?? connection.sourceResourceIncarnationId
+              return identity ? [[accountId, { ...identity, sourceResourceIncarnationId }] as const] : []
+            }))),
+        }
         const cursor = await runPlaidStage('item_checkpoint', () => deps.loadPlaidItemCheckpoint!(item))
         const run = await runPlaidStage('item_sync', () => deps.runProvider(item, cursor))
         logPlaidItemObserved(run)
+        const notReturned = new Set(run.accountsNotReturned ?? [])
+        for (const connection of expected) {
+          if (connection.accountIds.some(accountId => notReturned.has(accountId))) unserved.add(connection)
+        }
+        fetched.push({ expected, item, run })
+      } catch (error) {
+        logPlaidItemFailure('item_sync', error)
+        const providerConnectionId = expected[0]?.providerConnectionId
+        const condition = plaidItemCondition(error)
+        if (providerConnectionId && condition) {
+          // Nothing was ingested and the cursor is untouched; only the owner can
+          // restore this Item, so it must not hold the service unhealthy.
+          conditioned.push({ expected, condition: { providerConnectionId, ...condition } })
+          for (const connection of expected) unserved.add(connection)
+          continue
+        }
+        failures += 1
+        console.error('Finance Sync connection cycle failed')
+      }
+    }
+
+    /** Connections ingested this cycle from an Item other than their own. */
+    const servedElsewhere = new Set<PlaidRuntimeConnection>()
+    const itemsReturning = (accountId: string) => fetched.filter(({ run }) => run.accountsReissued?.[accountId] !== undefined).length
+    for (const { expected, item, run } of fetched) {
+      try {
         const bySourceResource = new Map<string, ObservationOutput[]>()
         for (const observation of run.observations) {
           const rows = bySourceResource.get(observation.sourceResourceIncarnationId) ?? []
@@ -376,24 +474,37 @@ export async function runConfiguredSyncCycle(
         let itemFailed = false
         const withoutBalance = new Set(run.currentStateUnavailableAccountIds ?? [])
         const notReturned = new Set(run.accountsNotReturned ?? [])
-        for (const connection of expected) {
+        // An unserved connection of another Item is ingested here only when
+        // this is the one Item that returned its account.
+        const guests = [...unserved].filter(connection => !expected.includes(connection) && sameOwner(connection, item)
+          && connection.accountIds.every(accountId => run.accountsReissued?.[accountId] !== undefined && itemsReturning(accountId) === 1))
+        for (const connection of [...expected, ...guests]) {
           // Nothing is written for an account the provider did not return.
           if (connection.accountIds.some(accountId => notReturned.has(accountId))) continue
           const accountObservations = connection.accountIds.flatMap(accountId =>
             bySourceResource.get(connection.sourceResourceIncarnationIds?.[accountId] ?? connection.sourceResourceIncarnationId) ?? [])
+          const returnedAccountId = connection.accountIds.map(accountId => run.accountsReissued?.[accountId]).find(id => id !== undefined)
           // Without a provider balance no snapshot is assembled for this
           // connection at all, so the complete-snapshot rule is never asked to
           // accept a partial one and the receiver keeps its last full snapshot.
           const skipCurrentState = connection.accountIds.some(accountId => withoutBalance.has(accountId))
           try {
+            const fresh = returnedAccountId === undefined
+              ? accountObservations
+              : withoutReissuedHistory(accountObservations, await runPlaidStage('persist_or_project', () => {
+                if (!deps.loadPlaidReissuedHistory) throw new Error('Plaid re-issued account history is unavailable')
+                return deps.loadPlaidReissuedHistory(connection, returnedAccountId)
+              }))
             observations += await runPlaidStage('persist_or_project', () => skipCurrentState
-              ? deps.persistAndEnqueue(connection, accountObservations, { skipCurrentState: true })
-              : deps.persistAndEnqueue(connection, accountObservations))
-            if (!controls.projectionEnabled) continue
-            const projection = await runPlaidStage('persist_or_project', () => deps.projectPending(connection))
-            delivered += projection.delivered
-            failures += projection.failed
-            if (projection.failed > 0) itemFailed = true
+              ? deps.persistAndEnqueue(connection, fresh, { skipCurrentState: true })
+              : deps.persistAndEnqueue(connection, fresh))
+            if (controls.projectionEnabled) {
+              const projection = await runPlaidStage('persist_or_project', () => deps.projectPending(connection))
+              delivered += projection.delivered
+              failures += projection.failed
+              if (projection.failed > 0) { itemFailed = true; continue }
+            }
+            if (guests.includes(connection)) servedElsewhere.add(connection)
           } catch (error) {
             itemFailed = true
             failures += 1
@@ -418,18 +529,15 @@ export async function runConfiguredSyncCycle(
         }
       } catch (error) {
         logPlaidItemFailure('item_sync', error)
-        const providerConnectionId = expected[0]?.providerConnectionId
-        const condition = plaidItemCondition(error)
-        if (providerConnectionId && condition) {
-          // Nothing was ingested and the cursor is untouched; only the owner can
-          // restore this Item, so it must not hold the service unhealthy.
-          plaidItemConditions.push({ providerConnectionId, ...condition })
-          logPlaidItemNeedsAttention(condition.reason)
-          continue
-        }
         failures += 1
         console.error('Finance Sync connection cycle failed')
       }
+    }
+    for (const { expected, condition } of conditioned) {
+      // An Item whose every account is now ingested from another Item needs nothing from its owner.
+      if (expected.every(connection => servedElsewhere.has(connection))) continue
+      plaidItemConditions.push(condition)
+      logPlaidItemNeedsAttention(condition.reason)
     }
   }
 
