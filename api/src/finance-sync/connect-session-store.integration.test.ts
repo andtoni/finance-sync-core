@@ -29,6 +29,22 @@ suite('PostgreSQL provider Connect sessions', () => {
     expect(count.count).toBe(0)
   })
 
+  it('lets a subject restart an abandoned Link session while still blocking another subject', async () => {
+    const deploymentId = 'abandoned-session-test'
+    const store = new PostgresConnectSessionStore(sql)
+    const abandoned = await store.create({ deploymentId, subject: 'wealthfolio#owner-a', provider: 'plaid', secretReference: 'PLAID_SLOT_A', flow: 'new' })
+    expect(abandoned).toEqual(expect.any(String))
+    await expect(store.create({ deploymentId, subject: 'wealthfolio#owner-b', provider: 'plaid', secretReference: 'PLAID_SLOT_A', flow: 'new' })).resolves.toBeUndefined()
+    const restarted = await store.create({ deploymentId, subject: 'wealthfolio#owner-a', provider: 'plaid', secretReference: 'PLAID_SLOT_A', flow: 'new' })
+    expect(restarted).toEqual(expect.any(String))
+    expect(restarted).not.toBe(abandoned)
+    // The abandoned token died with its row; only the restarted session completes.
+    await expect(store.consume({ deploymentId, subject: 'wealthfolio#owner-a', provider: 'plaid', token: abandoned!, flow: 'new' })).resolves.toBeUndefined()
+    await expect(store.consume({ deploymentId, subject: 'wealthfolio#owner-a', provider: 'plaid', token: restarted!, flow: 'new' })).resolves.toMatchObject({ secretReference: 'PLAID_SLOT_A', flow: 'new' })
+    // A consumed session is mid-completion and is not replaced by a restart.
+    await expect(store.create({ deploymentId, subject: 'wealthfolio#owner-a', provider: 'plaid', secretReference: 'PLAID_SLOT_A', flow: 'new' })).resolves.toBeUndefined()
+  })
+
   it('binds a continuation to deployment and subject and consumes it once', async () => {
     const store = new PostgresConnectSessionStore(sql)
     const token = await store.create({ deploymentId: 'connect-session-test', subject: 'wealthfolio#owner-a', provider: 'plaid', secretReference: 'PLAID_SLOT_A', flow: 'new' })

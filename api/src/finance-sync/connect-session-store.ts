@@ -63,9 +63,11 @@ export class PostgresConnectSessionStore implements ConnectSessionStore {
           if (!active?.active) return false
         }
         // The partial unique index is the live-session reservation mutex. An
-        // unconsumed expired Link session is safe to delete; a consumed session
-        // is retained until its bounded completion-recovery window has elapsed.
-        await tx`DELETE FROM provider_connect_sessions WHERE deployment_id = ${input.deploymentId} AND provider = ${input.provider} AND selected_secret_reference = ${input.secretReference} AND released_at IS NULL AND consumed_at IS NULL AND expires_at <= now()`
+        // unconsumed Link session is safe to delete once it has expired, or at
+        // once when the same subject starts again: Link was abandoned before
+        // completing and its token dies with the row. A consumed session is
+        // retained until its bounded completion-recovery window has elapsed.
+        await tx`DELETE FROM provider_connect_sessions WHERE deployment_id = ${input.deploymentId} AND provider = ${input.provider} AND selected_secret_reference = ${input.secretReference} AND released_at IS NULL AND consumed_at IS NULL AND (expires_at <= now() OR subject = ${input.subject})`
         await tx`UPDATE provider_connect_sessions
           SET released_at = now()
           WHERE deployment_id = ${input.deploymentId} AND provider = ${input.provider}
