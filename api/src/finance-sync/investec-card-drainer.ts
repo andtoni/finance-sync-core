@@ -39,10 +39,16 @@ async function exactCardAccount(sql: FinanceSyncSql, deploymentId: string, mask:
 interface RetainedCardObservationRow {
   readonly payload: unknown
   readonly raw_payload: unknown
+  readonly provider_version: string
   readonly semantic_hash: string
   readonly hash_specification_version: number
   readonly observed_at: string | Date
   readonly source_resource_incarnation_id: string
+}
+
+/** True when the stored observation is the retirement of an authorization the provider never settled. */
+function isRetiredAuthorization(payload: RecordValue | undefined): boolean {
+  return record(record(record(payload?.metadata)?.providerOwned)?.investec)?.authorizationRetired === true
 }
 
 async function exactRetainedCardAccount(
@@ -80,7 +86,7 @@ export async function reprojectRetainedInvestecCards(
   const rows = await sql<RetainedCardObservationRow[]>`
     WITH latest AS (
       SELECT DISTINCT ON (o.source_resource_incarnation_id, o.payload->>'transactionId')
-        payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id::text
+        payload, raw_payload, provider_version, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id::text
       FROM raw_observations o
       WHERE o.deployment_id = ${deploymentId}
         AND o.provider_version LIKE 'investec:card:%'
@@ -96,7 +102,7 @@ export async function reprojectRetainedInvestecCards(
         )
       ORDER BY o.source_resource_incarnation_id, o.payload->>'transactionId', o.recorded_at DESC, o.observation_id DESC
     )
-    SELECT payload, raw_payload, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id
+    SELECT payload, raw_payload, provider_version, semantic_hash, hash_specification_version, observed_at, source_resource_incarnation_id
     FROM latest
   `
   if (rows.length === 0) return 0
@@ -128,6 +134,30 @@ export async function reprojectRetainedInvestecCards(
       && candidate.sourceResourceIncarnationId === row.source_resource_incarnation_id)
     if (!connection) {
       unresolved = true
+      continue
+    }
+    const observedAt = row.observed_at instanceof Date ? row.observed_at.toISOString() : row.observed_at
+    if (normalizedPayload && isRetiredAuthorization(normalizedPayload)) {
+      // The latest fact for this hold is its retirement. Rebuilding the hold
+      // from the retained card payload would project it as pending again, so
+      // project the stored retirement itself.
+      const identity = `${connection.connectionId}:${row.semantic_hash}`
+      if (seen.has(identity)) continue
+      seen.add(identity)
+      const batch = batches.get(connection.connectionId) ?? { connection, observations: [] }
+      batch.observations.push({
+        deploymentId,
+        localOwnerId: connection.localOwnerId,
+        sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+        providerVersion: row.provider_version,
+        semanticHash: row.semantic_hash,
+        hashSpecificationVersion: row.hash_specification_version,
+        domain: 'cash_ledger',
+        payload: normalizedPayload,
+        rawPayload: row.raw_payload,
+        observedAt,
+      })
+      batches.set(connection.connectionId, batch)
       continue
     }
     const observation = investecCardObservation({

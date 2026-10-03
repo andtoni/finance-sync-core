@@ -140,6 +140,45 @@ describe('Investec card observations', () => {
     expect(persistedRawPayloads).toEqual([rawPayload])
   })
 
+  it('re-projects a retired authorization as its retirement, never as the pending hold', async () => {
+    const connection = {
+      deploymentId: 'wealthfolio-production', provider: 'investec', connectionId: 'connection:provider-account',
+      localOwnerId: 'urn:wealthfolio:password#local', sourceResourceIncarnationId: input.sourceResourceIncarnationId,
+    } as RuntimeConnection
+    const retired = {
+      transactionId: 'investec-card:provider-account:reference-TEST-REF-003', accountId: 'provider-account', status: 'void',
+      metadata: { providerOwned: { investec: { authorizationRetired: true, authorizationRetiredReason: 'NO_SETTLEMENT_WITHIN_WINDOW' } } },
+    }
+    const sql = (async (strings: TemplateStringsArray) => {
+      const text = strings.join('?')
+      if (/FROM raw_observations/i.test(text)) return [{
+        payload: retired,
+        raw_payload: { schemaVersion: 1, eventType: 'after_transaction', providerEventTime: '2026-01-06T02:31:00.000Z', transaction: { accountNumber: '10000000003', dateTime: '2026-01-06T02:31:00.000Z', centsAmount: 12345, currencyCode: 'zar', type: 'card', reference: 'TEST-REF-003', card: { id: 'TEST-CARD' }, merchant: { name: 'SYNTHETIC MERCHANT' } } },
+        provider_version: 'investec:card:reference-TEST-REF-003', semantic_hash: 'retirement-hash', hash_specification_version: 3,
+        observed_at: '2026-01-06T02:31:00.000Z', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+      }]
+      if (/FROM discovered_provider_accounts/i.test(text)) return [{
+        local_owner_id: connection.localOwnerId, connection_id: 'connection', provider_account_id: 'provider-account',
+        wealthfolio_account_id: 'wealthfolio-account', source_resource_incarnation_id: connection.sourceResourceIncarnationId,
+        currency: 'ZAR', mask: '3333',
+      }]
+      return []
+    }) as unknown as FinanceSyncSql
+    const persisted: Array<{ payload: unknown; semanticHash: string; providerVersion: string }> = []
+    const deps = {
+      loadConnections: async () => [connection],
+      persistAndEnqueue: async (_runtimeConnection: RuntimeConnection, observations: ReadonlyArray<{ payload: unknown; semanticHash: string; providerVersion: string }>) => {
+        persisted.push(...observations)
+        return observations.length
+      },
+      projectPending: async () => ({ delivered: 1, failed: 0 }),
+    } as unknown as SyncRuntimeDependencies
+
+    await expect(reprojectRetainedInvestecCards(sql, 'wealthfolio-production', deps)).resolves.toBe(1)
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]).toMatchObject({ payload: retired, semanticHash: 'retirement-hash', providerVersion: 'investec:card:reference-TEST-REF-003' })
+  })
+
   it('keeps retained replay pending when any retained card cannot be mapped exactly', async () => {
     const connection = {
       deploymentId: 'wealthfolio-production', provider: 'investec', connectionId: 'connection:provider-account',
