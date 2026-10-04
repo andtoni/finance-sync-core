@@ -1623,7 +1623,23 @@ describe('retireUnmatchedInvestecCardAuthorizations', () => {
     it('is left pending when no posted charge is close enough, from another merchant, or outside the window', async () => {
       await expect(retire([hold('basket', '1380.00')], [posted('other', '600.00')])).resolves.toEqual([])
       await expect(retire([hold('basket', '1380.00')], [{ ...posted('other', '1380.00'), description: 'ANOTHER SHOP' }])).resolves.toEqual([])
-      await expect(retire([hold('basket', '1380.00', day(-6))], [posted('late', '1380.00', day(-1))])).resolves.toEqual([])
+      await expect(retire([hold('basket', '1380.00', day(-4))], [posted('late', '1380.00', day(0))])).resolves.toEqual([])
+    })
+
+    it('is retired after five days whatever the matcher found', async () => {
+      await expect(retire([hold('basket', '1380.00', day(-6))], [posted('late', '1380.00', day(-1))]))
+        .resolves.toEqual([{ id: 'investec-card:acc-1:basket', reason: 'NO_SETTLEMENT_WITHIN_WINDOW' }])
+    })
+
+    it('is retired on an equal amount when the two feeds only write the merchant differently', async () => {
+      for (const [card, charge] of [['ShipCo', 'SHIPCO00000001 ANYTOWN ZA'], ['AMAZON MKTPLACE PMTS', 'AMAZON MKTPL*000000000 AMAZON.']]) {
+        const holds = [{ ...hold('parcel', '2095.20'), description: card }]
+        await expect(retire(holds, [{ ...posted('settled-parcel', '2095.20'), description: charge }])).resolves.toEqual([settled('parcel')])
+        // A different amount needs the merchant written the same way.
+        await expect(retire(holds, [{ ...posted('settled-parcel', '2090.00'), description: charge }])).resolves.toEqual([])
+      }
+      // An equal amount at an unrelated merchant is no evidence.
+      await expect(retire([{ ...hold('parcel', '2095.20'), description: 'ShipCo' }], [{ ...posted('other', '2095.20'), description: 'SAMPLE CAFE' }])).resolves.toEqual([])
     })
 
     it('is retired for every identical purchase the matcher finds ambiguous', async () => {

@@ -578,6 +578,24 @@ function merchantMatches(card: Readonly<Record<string, unknown>>, settled: Reado
   return postedMerchant === cardMerchant || new RegExp(`^${escaped}(?:\\s|$)`).test(postedMerchant)
 }
 
+/**
+ * The posted feed writes a merchant differently from the card feed ("ShipCo"
+ * against "SHIPCO00000001 ANYTOWN ZA", "AMAZON MKTPLACE PMTS" against "AMAZON
+ * MKTPL*000000000"). Compared on letters and digits only, the names agree when
+ * the card's is a prefix of the posted one or they share their first eight.
+ * Too weak to pair on its own; it is used only beside an equal amount.
+ */
+function merchantRoughlyMatches(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+  if (merchantMatches(card, settled)) return true
+  const key = (value: unknown) => normalizedText(value).normalize('NFKC').replace(/[^A-Z0-9]/g, '')
+  const cardMerchant = key(card.description)
+  const postedMerchant = key(settled.description)
+  if (cardMerchant.length < 4 || postedMerchant.length < 4) return false
+  let shared = 0
+  while (shared < cardMerchant.length && shared < postedMerchant.length && cardMerchant[shared] === postedMerchant[shared]) shared += 1
+  return shared === cardMerchant.length || shared >= 8
+}
+
 function cardSettlementDateMatches(cardDate: string, settledDate: string): boolean {
   const cardMs = Date.parse(`${cardDate}T00:00:00Z`)
   const settledMs = Date.parse(`${settledDate}T00:00:00Z`)
@@ -595,6 +613,7 @@ function cardSettlementDateMatches(cardDate: string, settledDate: string): boole
 export function investecProviderFactPairShapeMatches(
   card: Readonly<Record<string, unknown>>,
   settled: Readonly<Record<string, unknown>>,
+  sameMerchant: (card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>) => boolean = merchantMatches,
 ): boolean {
   if (hasConflictingLifecycleIds(card) || hasConflictingLifecycleIds(settled)
     || providerLifecycleTransactionId(card) || providerLifecycleTransactionId(settled)
@@ -615,7 +634,7 @@ export function investecProviderFactPairShapeMatches(
   if (!cardDate || !settledDate || !cardSettlementDateMatches(cardDate, settledDate)) return false
   const cardDirection = providerDirection(card)
   if (!cardDirection || cardDirection !== providerDirection(settled)) return false
-  if (!merchantMatches(card, settled)) return false
+  if (!sameMerchant(card, settled)) return false
   const originalAmount = typeof card.originalAmount === 'string' ? card.originalAmount : undefined
   const originalCurrency = currencyCode(card.originalCurrency)
   const cardCurrency = currencyCode(card.currency)
@@ -1339,8 +1358,14 @@ async function investecHoldHasSettled(
       )
   `
   const all = rows.map(counterpartFromRow).filter((row): row is InvestecCounterpart => row !== undefined)
+  // The same merchant with a near amount, or an equal amount from a merchant
+  // the two feeds only write differently.
   const settles = (hold: Readonly<Record<string, unknown>>, posted: Readonly<Record<string, unknown>>) =>
-    investecProviderFactPairShapeMatches(hold, posted) && holdAmountSettledBy(hold, posted)
+    (investecProviderFactPairShapeMatches(hold, posted) && holdAmountSettledBy(hold, posted))
+    || (investecProviderFactPairShapeMatches(hold, posted, merchantRoughlyMatches) && sameCurrencyAmountWithinTolerance(
+      { amount: hold.originalAmount, currency: currencyCode(hold.originalCurrency) },
+      { amount: posted.settlementAmount ?? posted.amount, currency: currencyCode(posted.settlementCurrency ?? posted.currency) },
+    ))
   const evidence = all.filter(row => row.providerVersion.startsWith('investec:txn:') && settles(card, row.payload))
   if (evidence.length === 0) return false
   // Holds competing for the same posted charges, this one included, oldest first.
@@ -1358,7 +1383,7 @@ async function investecHoldHasSettled(
  * Investec releases abandoned holds well inside this window; the exact
  * settlement window used for matching is deliberately much shorter.
  */
-const INVESTEC_CARD_AUTHORIZATION_TTL_DAYS = 10
+const INVESTEC_CARD_AUTHORIZATION_TTL_DAYS = 5
 
 /**
  * Retire card authorizations the provider never settled.
