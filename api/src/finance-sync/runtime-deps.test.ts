@@ -1567,6 +1567,80 @@ describe('retireUnmatchedInvestecCardAuthorizations', () => {
     const deps = {} as unknown as SyncRuntimeDependencies
     await expect(retireUnmatchedInvestecCardAuthorizations(sql, 'dep-1', CONNECTION, deps)).resolves.toBe(0)
   })
+
+  describe('a recent hold that posted charges show has settled', () => {
+    const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10)
+    const hold = (id: string, amount: string, date = day(-2)) => ({
+      transactionId: `investec-card:acc-1:${id}`, accountId: 'acc-1', amount: `-${amount}`, currency: 'ZAR',
+      originalAmount: amount, originalCurrency: 'ZAR', status: 'pending', transactionDate: date, date,
+      type: 'DEBIT', description: 'SYNTHETIC GROCER', cardNumber: 'TEST-CARD-0011',
+      metadata: { providerOwned: { investec: { accountCurrency: 'ZAR', provisionalSpending: true } } },
+    })
+    const posted = (id: string, amount: string, date = day(-1)) => ({
+      transactionId: id, accountId: 'acc-1', amount: `-${amount}`, currency: 'ZAR', status: 'posted',
+      transactionDate: date, date, type: 'DEBIT', transactionType: 'CARDPURCHASES',
+      description: 'SYNTHETIC GROCER SAMPLEVILLE ZA', cardNumber: '400000xxxxxx0011',
+    })
+    const row = (payload: Record<string, unknown>, lane: 'card' | 'txn') => ({
+      payload, raw_payload: { id: payload.transactionId }, provider_version: `investec:${lane}:${String(payload.transactionId)}`,
+      semantic_hash: String(payload.transactionId).padEnd(64, 'b').slice(0, 64), hash_specification_version: 5,
+      observed_at: `${String(payload.transactionDate)}T10:00:00.000Z`,
+    })
+    const retire = async (holds: ReturnType<typeof hold>[], charges: ReturnType<typeof posted>[], migratedIds: string[] = []) => {
+      const retired: Array<{ id: unknown; reason: unknown }> = []
+      const sql = (async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const text = strings.join('?')
+        if (/authorizationRetired/.test(text)) return holds.map(item => row(item, 'card'))
+        if (/projection_outbox/.test(text)) return migratedIds.some(id => values.some(value => String(value).endsWith(id))) ? [{ migrated: 1 }] : []
+        if (/BETWEEN/.test(text)) return [...holds.map(item => row(item, 'card')), ...charges.map(item => row(item, 'txn'))]
+        return []
+      }) as unknown as FinanceSyncSql
+      const deps = {
+        persistAndEnqueue: async (_connection: RuntimeConnection, observations: readonly ObservationOutput[]) => {
+          for (const observation of observations) {
+            retired.push({
+              id: observation.payload.transactionId,
+              reason: (observation.payload.metadata as Record<string, any>).providerOwned.investec.authorizationRetiredReason,
+            })
+            expect(observation.payload.status).toBe('void')
+          }
+          return observations.length
+        },
+        projectPending: async () => ({ delivered: retired.length, failed: 0 }),
+      } as unknown as SyncRuntimeDependencies
+      await retireUnmatchedInvestecCardAuthorizations(sql, 'dep-1', AGED_CARD_CONNECTION, deps)
+      return retired
+    }
+    const settled = (id: string) => ({ id: `investec-card:acc-1:${id}`, reason: 'SETTLED_WITHOUT_EXACT_MATCH' })
+
+    it('is retired when the merchant charged a different final amount', async () => {
+      // A grocery pre-authorization of 1 380.00 settles at 1 214.35.
+      await expect(retire([hold('basket', '1380.00')], [posted('settled-basket', '1214.35')])).resolves.toEqual([settled('basket')])
+      // Within ten rand counts for a small amount too.
+      await expect(retire([hold('coffee', '30.00')], [posted('settled-coffee', '38.00')])).resolves.toEqual([settled('coffee')])
+    })
+
+    it('is left pending when no posted charge is close enough, from another merchant, or outside the window', async () => {
+      await expect(retire([hold('basket', '1380.00')], [posted('other', '600.00')])).resolves.toEqual([])
+      await expect(retire([hold('basket', '1380.00')], [{ ...posted('other', '1380.00'), description: 'ANOTHER SHOP' }])).resolves.toEqual([])
+      await expect(retire([hold('basket', '1380.00', day(-6))], [posted('late', '1380.00', day(-1))])).resolves.toEqual([])
+    })
+
+    it('is retired for every identical purchase the matcher finds ambiguous', async () => {
+      const holds = [hold('vend-1', '14.00'), hold('vend-2', '14.00'), hold('vend-3', '14.00')]
+      const charges = [posted('p-1', '14.00'), posted('p-2', '14.00'), posted('p-3', '14.00')]
+      await expect(retire(holds, charges)).resolves.toEqual([settled('vend-1'), settled('vend-2'), settled('vend-3')])
+    })
+
+    it('leaves the newer of two identical holds pending when only one charge has posted', async () => {
+      const holds = [hold('vend-1', '14.00', day(-2)), hold('vend-2', '14.00', day(-1))]
+      await expect(retire(holds, [posted('p-1', '14.00', day(-1))])).resolves.toEqual([settled('vend-1')])
+    })
+
+    it('is skipped when it was already migrated to its settlement', async () => {
+      await expect(retire([hold('basket', '1380.00')], [posted('settled-basket', '1214.35')], ['investec-card:acc-1:basket'])).resolves.toEqual([])
+    })
+  })
 })
 
 describe('projectPending transaction and receipt contract', () => {

@@ -1276,6 +1276,83 @@ export async function reconcileInvestecCardLifecycles(
   return observations.length
 }
 
+/** A hold counts as settled by a posted charge within R10 or 20% of it. */
+const INVESTEC_HOLD_SETTLED_ABSOLUTE = 10
+const INVESTEC_HOLD_SETTLED_RATIO = 0.2
+
+function holdAmountSettledBy(card: Readonly<Record<string, unknown>>, settled: Readonly<Record<string, unknown>>): boolean {
+  // A foreign authorization and its account-currency settlement are not
+  // comparable, as in the exact matcher.
+  if (currencyCode(card.originalCurrency) !== currencyCode(settled.settlementCurrency ?? settled.currency)) return true
+  const hold = Math.abs(Number(card.originalAmount))
+  const posted = Math.abs(Number(settled.settlementAmount ?? settled.amount))
+  if (!Number.isFinite(hold) || !Number.isFinite(posted)) return false
+  return Math.abs(hold - posted) <= Math.max(INVESTEC_HOLD_SETTLED_ABSOLUTE, hold * INVESTEC_HOLD_SETTLED_RATIO)
+}
+
+/**
+ * Whether posted card purchases show that this hold has settled although the
+ * exact matcher could not pair it: the merchant charged a different final
+ * amount, or several identical purchases made the pairing ambiguous.
+ *
+ * Posted charges from the same merchant inside the settlement window with a
+ * near amount are the evidence. Each one accounts for one hold, oldest first,
+ * so a second purchase that is still genuinely pending is left alone.
+ */
+async function investecHoldHasSettled(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: ProjectionConnection,
+  card: Readonly<Record<string, unknown>>,
+): Promise<boolean> {
+  const accountId = typeof card.accountId === 'string' ? card.accountId : undefined
+  const cardDate = typeof card.transactionDate === 'string' ? card.transactionDate : undefined
+  const cardId = transactionId(card)
+  if (!accountId || !cardDate || !cardId) return false
+  const rows = await sql<InvestecCounterpartRow[]>`
+    WITH latest AS (
+      SELECT DISTINCT ON (payload->>'transactionId')
+        payload, provider_version, semantic_hash, hash_specification_version, observed_at
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId} AND local_owner_id = ${connection.localOwnerId}
+        AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+        AND payload->>'accountId' = ${accountId}
+        AND (provider_version LIKE 'investec:card:%' OR provider_version LIKE 'investec:txn:%')
+      ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, provider_version, semantic_hash, hash_specification_version, observed_at
+    FROM latest
+    WHERE (payload->>'transactionDate')::date BETWEEN
+        (${cardDate}::date - (${INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS} || ' days')::interval)::date
+        AND (${cardDate}::date + (${INVESTEC_CARD_SETTLEMENT_WINDOW_DAYS} || ' days')::interval)::date
+      AND payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND (
+        (provider_version LIKE 'investec:card:%' AND payload->>'status' = 'pending')
+        OR (provider_version LIKE 'investec:txn:%' AND payload->>'status' = 'posted')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = ${deploymentId} AND q.local_owner_id = ${connection.localOwnerId}
+          AND q.source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+          AND q.provider_version = latest.provider_version AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  const all = rows.map(counterpartFromRow).filter((row): row is InvestecCounterpart => row !== undefined)
+  const settles = (hold: Readonly<Record<string, unknown>>, posted: Readonly<Record<string, unknown>>) =>
+    investecProviderFactPairShapeMatches(hold, posted) && holdAmountSettledBy(hold, posted)
+  const evidence = all.filter(row => row.providerVersion.startsWith('investec:txn:') && settles(card, row.payload))
+  if (evidence.length === 0) return false
+  // Holds competing for the same posted charges, this one included, oldest first.
+  const order = (payload: Readonly<Record<string, unknown>>) => `${String(payload.transactionDate)}\x00${transactionId(payload) ?? ''}`
+  const holds = [card, ...all
+    .filter(row => row.providerVersion.startsWith('investec:card:') && transactionId(row.payload) !== cardId)
+    .map(row => row.payload)
+    .filter(other => evidence.some(row => settles(other, row.payload)))]
+    .sort((left, right) => order(left).localeCompare(order(right)))
+  return holds.indexOf(card) < evidence.length
+}
+
 /**
  * Days after which a card authorization with no settlement is retracted.
  * Investec releases abandoned holds well inside this window; the exact
@@ -1323,8 +1400,7 @@ export async function retireUnmatchedInvestecCardAuthorizations(
     WHERE payload->>'isRemoved' IS DISTINCT FROM 'true'
       AND upper(coalesce(payload->>'status', '')) = 'PENDING'
       AND coalesce(payload->'metadata'->'providerOwned'->'investec'->>'authorizationRetired', 'false') <> 'true'
-      AND coalesce(payload->>'transactionDate', payload->>'date')::date
-        <= (now()::date - (${ttlDays} || ' days')::interval)::date
+      AND coalesce(payload->>'transactionDate', payload->>'date')::date < now()::date
       AND NOT EXISTS (
         SELECT 1 FROM observation_quarantines q
         WHERE q.deployment_id = latest.deployment_id
@@ -1337,6 +1413,7 @@ export async function retireUnmatchedInvestecCardAuthorizations(
   `
   const retirements: ObservationOutput[] = []
   const retiredAt = new Date().toISOString()
+  const agedBefore = new Date(Date.now() - ttlDays * DAY_MS).toISOString().slice(0, 10)
   for (const row of rows) {
     const payload = observationPayload(row.payload)
     if (!payload || typeof payload.transactionId !== 'string' || typeof payload.accountId !== 'string') continue
@@ -1352,9 +1429,28 @@ export async function retireUnmatchedInvestecCardAuthorizations(
       ...(row.raw_payload === null || row.raw_payload === undefined ? {} : { rawPayload: row.raw_payload }),
       observedAt: row.observed_at,
     }
-    // A settlement already in the raw store is paired by the ordinary path.
+    // A settlement the matcher pairs exactly is migrated by the ordinary path.
     const counterpart = await findInvestecCounterpart(sql, deploymentId, connection, authorization)
-    if (counterpart !== undefined) continue
+    if (counterpart !== undefined && !('ambiguous' in counterpart)) continue
+    // A hold already migrated to its settlement no longer exists at the receiver.
+    const migrated = await sql<{ migrated: number }[]>`
+      SELECT 1 AS migrated FROM projection_outbox
+      WHERE deployment_id = ${deploymentId}
+        AND connection_id = ${connection.connectionId}
+        AND state IN ('delivered', 'uncertain')
+        AND payload->>'kind' = 'ActivityUpsert'
+        AND payload->>'resourceId' = ${`${deploymentId}:${connection.sourceResourceIncarnationId}:${payload.transactionId}`}
+        AND payload->>'lifecycleSuccessorId' IS NOT NULL
+      LIMIT 1
+    `
+    if (migrated.length > 0) continue
+    // Otherwise the hold is retired once posted charges show it has settled,
+    // and in any case when it has outlived the retirement window.
+    const holdDate = String(payload.transactionDate ?? payload.date ?? '').slice(0, 10)
+    const reason = await investecHoldHasSettled(sql, deploymentId, connection, payload)
+      ? 'SETTLED_WITHOUT_EXACT_MATCH'
+      : holdDate !== '' && holdDate <= agedBefore ? 'NO_SETTLEMENT_WITHIN_WINDOW' : undefined
+    if (reason === undefined) continue
     const existingMetadata = recordPayload(payload.metadata)
     const existingProviderOwned = recordPayload(existingMetadata?.providerOwned)
     const existingInvestec = recordPayload(existingProviderOwned?.investec)
@@ -1373,7 +1469,7 @@ export async function retireUnmatchedInvestecCardAuthorizations(
             investec: {
               ...(existingInvestec ?? {}),
               authorizationRetired: true,
-              authorizationRetiredReason: 'NO_SETTLEMENT_WITHIN_WINDOW',
+              authorizationRetiredReason: reason,
               authorizationRetiredAt: retiredAt,
               authorizationRetiredWindowDays: ttlDays,
             },

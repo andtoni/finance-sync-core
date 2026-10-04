@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import postgres from 'postgres'
 import { resolve } from 'node:path'
-import { createRuntimeDependencies } from './runtime-deps'
+import { createRuntimeDependencies, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
 import { migrate } from './storage/migrate'
 import { bridgeOperationToWire, currentStateToBridge } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
@@ -227,6 +227,43 @@ suite('runtime dependencies with PostgreSQL', () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+
+  it('retires a recent hold whose merchant posted a different final amount, in real PostgreSQL', async () => {
+    await sql`DELETE FROM projection_outbox WHERE deployment_id=${deploymentId}`
+    const investecConnection: RuntimeConnection = {
+      ...connection, provider: 'investec', apiKey: 'test-api-key',
+      eligibleProductNames: ['Private Bank Account'], fromDate: '2026-07-17', toDate: '2026-07-18',
+    }
+    const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10)
+    const hold = {
+      ...observation('grocer-hold', {
+        transactionId: 'grocer-hold', accountId: 'provider-account', amount: '-1380.00', currency: 'ZAR',
+        originalAmount: '1380.00', originalCurrency: 'ZAR', transactionDate: day(-2), date: day(-2),
+        description: 'SYNTHETIC GROCER', type: 'DEBIT', transactionType: 'CARD', cardNumber: 'TEST-CARD-0011',
+        metadata: { providerOwned: { investec: { accountCurrency: 'ZAR' } } }, status: 'pending',
+      }), providerVersion: 'investec:card:grocer-hold',
+    }
+    const charge = {
+      ...observation('grocer-posted', {
+        transactionId: 'grocer-posted', accountId: 'provider-account', amount: '-1214.35', currency: 'ZAR',
+        transactionDate: day(-1), date: day(-1), postingDate: day(-1), settlementDate: day(-1),
+        description: 'SYNTHETIC GROCER SAMPLEVILLE ZA', type: 'DEBIT', transactionType: 'CARDPURCHASES',
+        cardNumber: '400000xxxxxx0011', status: 'posted',
+      }), providerVersion: 'investec:txn:grocer-posted',
+    }
+    const deps = createRuntimeDependencies(sql, deploymentId, runtimeEnv)
+    await deps.persistAndEnqueue(investecConnection, [hold, charge], { skipCurrentState: true })
+    const withoutDelivery = { ...deps, projectPending: async () => ({ delivered: 0, failed: 0 }) }
+    await expect(retireUnmatchedInvestecCardAuthorizations(sql, deploymentId, investecConnection, withoutDelivery)).resolves.toBe(1)
+    const [retirement] = await sql`
+      SELECT payload->'activity'->>'status' AS status
+      FROM projection_outbox
+      WHERE deployment_id = ${deploymentId} AND payload->>'resourceId' LIKE '%:grocer-hold'
+      ORDER BY created_at DESC LIMIT 1`
+    expect(retirement.status).toBe('VOID')
+    // The retirement is the hold's latest fact, so it is not considered again.
+    await expect(retireUnmatchedInvestecCardAuthorizations(sql, deploymentId, investecConnection, withoutDelivery)).resolves.toBe(0)
   })
 
   it('blocks a queued Investec predecessor after terminal lifecycle acceptance in real PostgreSQL', async () => {
