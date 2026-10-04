@@ -264,6 +264,14 @@ suite('runtime dependencies with PostgreSQL', () => {
     expect(retirement.status).toBe('VOID')
     // The retirement is the hold's latest fact, so it is not considered again.
     await expect(retireUnmatchedInvestecCardAuthorizations(sql, deploymentId, investecConnection, withoutDelivery)).resolves.toBe(0)
+    // A replay of the original pending observation must not bring the hold back.
+    await deps.persistAndEnqueue(investecConnection, [hold], { skipCurrentState: true })
+    const projected = await sql`
+      SELECT payload->'activity'->>'status' AS status
+      FROM projection_outbox
+      WHERE deployment_id = ${deploymentId} AND payload->>'resourceId' LIKE '%:grocer-hold'
+      ORDER BY created_at, (payload->>'observationRevision')::bigint`
+    expect(projected.map(row => row.status)).toEqual(['PENDING', 'VOID'])
   })
 
   it('blocks a queued Investec predecessor after terminal lifecycle acceptance in real PostgreSQL', async () => {

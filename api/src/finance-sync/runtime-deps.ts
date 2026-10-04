@@ -1113,6 +1113,32 @@ async function investecLifecycleDisposition(
   return rows[0]?.state ?? 'none'
 }
 
+/**
+ * A retired authorization stays retired. Replays re-persist older observations
+ * of a hold; projecting one after its retirement would give the stale pending
+ * payload a newer revision and bring the hold back at the receiver.
+ */
+async function retiredAuthorizationSupersedes(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connection: ProjectionConnection,
+  observation: ObservationOutput,
+): Promise<boolean> {
+  if (!observation.providerVersion.startsWith('investec:card:')) return false
+  const [latest] = await sql<{ semantic_hash: string; retired: boolean }[]>`
+    SELECT semantic_hash,
+      coalesce(payload->'metadata'->'providerOwned'->'investec'->>'authorizationRetired', 'false') = 'true' AS retired
+    FROM raw_observations
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${connection.localOwnerId}
+      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+      AND provider_version = ${observation.providerVersion}
+    ORDER BY recorded_at DESC, observation_id DESC
+    LIMIT 1
+  `
+  return latest !== undefined && latest.retired === true && latest.semantic_hash !== observation.semanticHash
+}
+
 async function investecProjectionOperations(
   sql: FinanceSyncSql,
   deploymentId: string,
@@ -1123,6 +1149,7 @@ async function investecProjectionOperations(
   connectionId: string,
 ): Promise<BridgeDisclosureOperation[]> {
   if (await primeSaverWeakObservationAlreadyCanonical(sql, deploymentId, connection, observation)) return []
+  if (await retiredAuthorizationSupersedes(sql, deploymentId, connection, observation)) return []
   const counterpart = await findInvestecCounterpart(sql, deploymentId, connection, observation)
   const current = recordPayload(observation.payload)
   if (!current || !transactionId(current) || !counterpart) {
