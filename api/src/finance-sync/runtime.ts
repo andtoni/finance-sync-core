@@ -369,6 +369,27 @@ function logPlaidItemFailure(stage: PlaidFailureStage, error: unknown): void {
   }))
 }
 
+const NETWORK_FAILURE_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+])
+
+/**
+ * The provider itself is down or throttling: it answered HTTP 5xx or 429, or
+ * the request got no answer. That is the provider's outage, not a failure of
+ * this service. Nothing was ingested and the checkpoint is untouched, so the
+ * next cycle retries from the same place.
+ */
+export function providerUnavailable(error: unknown): boolean {
+  const failure = error instanceof PlaidStageFailure ? error.failure : error
+  if (!(failure instanceof Error)) return false
+  const status = (failure as { status?: unknown }).status
+  if (typeof status === 'number') return status >= 500 || status === 429
+  if (failure.name === 'TimeoutError' || failure.name === 'AbortError') return true
+  const code = (failure as { cause?: { code?: unknown } }).cause?.code
+  return typeof code === 'string' && NETWORK_FAILURE_CODES.has(code)
+}
+
 /** Read-only provider ingestion. With projection enabled, cursor promotion waits for full outbox delivery. */
 export async function runConfiguredSyncCycle(
   deploymentId: string,
@@ -401,6 +422,10 @@ export async function runConfiguredSyncCycle(
       const run = await deps.runProvider(connection, cursor)
       runs.push({ connection, cursor, run })
     } catch (error) {
+      if (providerUnavailable(error)) {
+        logFailure('FINANCE_SYNC_PROVIDER_UNAVAILABLE', error, { provider: connection.provider })
+        continue
+      }
       failures += 1
       // Provider errors can embed tokens, identifiers, request payloads, and financial data.
       logFailure('Finance Sync connection cycle failed', error, { stage: 'provider_run', provider: connection.provider })
@@ -453,6 +478,10 @@ export async function runConfiguredSyncCycle(
           // restore this Item, so it must not hold the service unhealthy.
           conditioned.push({ expected, condition: { providerConnectionId, ...condition } })
           for (const connection of expected) unserved.add(connection)
+          continue
+        }
+        if (providerUnavailable(error)) {
+          logFailure('FINANCE_SYNC_PROVIDER_UNAVAILABLE', error instanceof PlaidStageFailure ? error.failure : error, { provider: 'plaid' })
           continue
         }
         failures += 1

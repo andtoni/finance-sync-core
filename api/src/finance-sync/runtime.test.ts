@@ -346,6 +346,42 @@ describe('configured sync runtime', () => {
     }
   })
 
+  it('treats a provider outage as the provider\'s condition, not a failed cycle', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const outage = (fields: Record<string, unknown>, name = 'Error') => Object.assign(new Error('investec request failed: HTTP 504 secret-account'), fields, { name })
+    const cycle = (failure: unknown) => runConfiguredSyncCycle('d', {
+      loadConnections: async () => [investecConnection('provider:a', 'a', '00000000-0000-0000-0000-000000000010')],
+      loadCheckpoint: async () => null,
+      runProvider: async () => { throw failure },
+      persistAndEnqueue: async () => 0,
+      projectPending: async () => ({ delivered: 0, failed: 0 }),
+      saveCheckpoint: async () => { throw new Error('checkpoint must not move') },
+    })
+    try {
+      for (const failure of [
+        outage({ status: 504 }), outage({ status: 500 }), outage({ status: 429 }), outage({}, 'TimeoutError'),
+        Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }),
+      ]) {
+        const result = await cycle(failure)
+        expect(result.failures).toBe(0)
+        expect(syncCycleOutcome(result)).toMatchObject({ cycleFailed: false, event: 'FINANCE_SYNC_CYCLE_OK' })
+      }
+      const logged = error.mock.calls.filter(call => call[0] === 'FINANCE_SYNC_PROVIDER_UNAVAILABLE')
+      expect(logged).toHaveLength(5)
+      expect(JSON.parse(String(logged[0][1]))).toMatchObject({ provider: 'investec', status: 504 })
+      expect(JSON.stringify(error.mock.calls)).not.toMatch(/secret-account|request failed/)
+
+      // A rejected request or a fault in this service is still a failed cycle.
+      for (const failure of [outage({ status: 401 }), outage({ status: 400 }), new Error('invalid Investec accounts response')]) {
+        const result = await cycle(failure)
+        expect(result.failures).toBe(1)
+        expect(syncCycleOutcome(result)).toMatchObject({ cycleFailed: true })
+      }
+    } finally {
+      error.mockRestore()
+    }
+  })
+
   describe('a Plaid account re-issued under a new account id', () => {
     const identity = { mask: '0042', name: 'Everyday Checking', currency: 'USD' }
     const dead = { ...plaidConnection('item-dead', 'token-dead', 'acc-old'), accountIdentities: { 'acc-old': identity } }
