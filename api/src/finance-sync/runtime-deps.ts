@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { observationRevisionNumber, type FinanceSyncSql } from './storage/pg'
 import type { ObservationOutput } from './probes/plaid/plaid-adapter'
-import { investecPrimeSaverSupersessionKey } from './probes/investec/investec-adapter'
+import { investecNarrativeValueDate, investecPrimeSaverSupersessionKey } from './probes/investec/investec-adapter'
 import {
   createProviderTransportFactories,
   parseRuntimeConnections,
@@ -264,7 +264,9 @@ function primeSaverDuplicatePair(
   const strongDirection = primeSaverDirection(strong)
   if (!weakDirection || !strongDirection
     || weak.accountId !== strong.accountId
-    || primeSaverTransactionDate(weak) !== primeSaverTransactionDate(strong)
+    // The weak row is dated the day the transfer took effect. The strong row
+    // names that day in its narrative and may itself be dated the day after.
+    || primeSaverTransactionDate(weak) !== (investecNarrativeValueDate(strong.description) ?? primeSaverTransactionDate(strong))
     || weakDirection !== strongDirection
     || decimalMagnitude(weak.amount) !== decimalMagnitude(strong.amount)) return false
   const weakDescription = normalizedText(weak.description)

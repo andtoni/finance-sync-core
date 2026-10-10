@@ -309,6 +309,26 @@ describe('Investec adapter G5', () => {
     expect(singletonTopology.map(item => item.semanticHash)).toEqual(transfers.map(item => item.semanticHash))
   })
 
+  it('pairs a transfer whose PrimeSaver leg is dated the day after its narrative value date', () => {
+    const make = (accountId: string, direction: string, id: string, date: string, description: string) => ({
+      deploymentId: 'g5-test', localOwnerId: 'alexis', sourceResourceIncarnationId: `investec:${accountId}`,
+      providerVersion: `investec:txn:${id}`, semanticHash: 'a'.repeat(64), hashSpecificationVersion: 4,
+      domain: 'cash_ledger' as const, observedAt: '2026-08-08T03:30:00.000Z',
+      payload: { accountId, transactionId: id, amount: direction === 'DEBIT' ? '-10.00' : '10.00', currency: 'ZAR', date, transactionDate: date, direction, type: direction, description, reference: null },
+    })
+    const accountNumbers = { main: '11112222', saver: '22223333' }
+    const debit = make('main', 'DEBIT', 'main-tx', '2026-08-07', 'HOLDER 22223333')
+    const credit = make('saver', 'CREDIT', 'saver-tx', '2026-08-08', 'Synthetic inbound Value Date 07Aug26 MBP9000000001 11112222 Holder 22223333')
+    const correlated = correlateInvestecTransferObservations([debit, credit], accountNumbers, 'investec:principal')
+    expect(correlated.map(item => (item.payload as Record<string, unknown>).activityType)).toEqual(['TRANSFER_OUT', 'TRANSFER_IN'])
+    expect((correlated[0].payload as Record<string, unknown>).sourceGroupId).toBe((correlated[1].payload as Record<string, unknown>).sourceGroupId)
+
+    // The value date decides: a debit dated the day the PrimeSaver row was posted is a different transfer.
+    const nextDayDebit = make('main', 'DEBIT', 'main-tx-2', '2026-08-08', 'HOLDER 22223333')
+    const unrelated = correlateInvestecTransferObservations([nextDayDebit, credit], accountNumbers, 'investec:principal')
+    expect(unrelated.every(item => (item.payload as Record<string, unknown>).sourceGroupId === undefined)).toBe(true)
+  })
+
   it('correlates frozen singleton observations without mutating the source payloads', () => {
     const make = (accountId: string, accountNumber: string, direction: string, id: string) => Object.freeze({
       deploymentId: 'g5-test', localOwnerId: 'alexis', sourceResourceIncarnationId: `investec:${accountId}`,

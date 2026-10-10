@@ -850,6 +850,23 @@ function transferNarrative(payload: Readonly<Record<string, unknown>>): string {
   return [payload.description, payload.reference].filter(value => typeof value === 'string').join(' ')
 }
 
+const NARRATIVE_MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+
+/**
+ * The day a PrimeSaver transfer took effect, as the provider writes it into
+ * the narrative ("Value Date 09Oct26"). A transfer made late in the day is
+ * dated the next day in transactionDate, while its counterpart in the other
+ * account and its own provisional row both carry the value date.
+ */
+export function investecNarrativeValueDate(description: unknown): string | undefined {
+  if (typeof description !== 'string') return undefined
+  const match = description.match(/\bValue Date (\d{2})([A-Za-z]{3})(\d{2})\b/)
+  if (!match) return undefined
+  const month = NARRATIVE_MONTHS.indexOf(match[2].toUpperCase())
+  if (month < 0) return undefined
+  return `20${match[3]}-${String(month + 1).padStart(2, '0')}-${match[1]}`
+}
+
 function narrativeContainsAccountNumber(payload: Readonly<Record<string, unknown>>, accountNumber: string): boolean {
   if (!accountNumber) return false
   for (const value of [payload.description, payload.reference]) {
@@ -924,8 +941,9 @@ function correlateExactOwnAccountTransfers(
     const direction = identityText(payload.direction ?? payload.type)
     const amount = normalizedDecimal(payload.amount)
     const currency = identityText(payload.currency)
-    const date = typeof payload.transactionDate === 'string' ? payload.transactionDate
-      : typeof payload.date === 'string' ? payload.date : ''
+    const date = investecNarrativeValueDate(payload.description)
+      ?? (typeof payload.transactionDate === 'string' ? payload.transactionDate
+        : typeof payload.date === 'string' ? payload.date : '')
     if (!accountNumber || invalidAccounts.has(accountId) || !['CREDIT', 'DEBIT'].includes(direction) || !amount || !currency || !date) continue
     candidates.push({ observation, payload, accountNumber, direction: direction as 'CREDIT' | 'DEBIT', amount: amount.replace(/^-/, ''), currency, date })
   }

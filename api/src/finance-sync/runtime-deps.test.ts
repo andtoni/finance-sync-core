@@ -585,6 +585,46 @@ describe('PrimeSaver identity supersession projection', () => {
     ])
   })
 
+  it('suppresses a weak PrimeSaver row when the strong row is dated the day after its value date', async () => {
+    const strongPayload = {
+      transactionId: 'synthetic-v2-strong', accountId: 'acc-1', amount: '3150', currency: 'ZAR',
+      date: '2026-08-08', transactionDate: '2026-08-08', type: 'CREDIT',
+      description: 'Synthetic inbound Value Date 07Aug26 MBP9000000001 Synthetic Holder 9001',
+      reference: null, cardNumber: null,
+    }
+    const weakPayload = {
+      ...strongPayload, transactionId: 'synthetic-v2-weak',
+      date: '2026-08-07', transactionDate: '2026-08-07', description: 'Synthetic Holder 9001',
+    }
+    const strongObservation = {
+      deploymentId: 'dep-1', localOwnerId: CONNECTION.localOwnerId,
+      sourceResourceIncarnationId: CONNECTION.sourceResourceIncarnationId,
+      providerVersion: 'investec:txn:synthetic-v2-strong', semanticHash: 'strong-hash',
+      hashSpecificationVersion: 3, observedAt: '2026-08-08T03:30:00.000Z', domain: 'cash_ledger' as const,
+      payload: { ...strongPayload, primeSaverIdentityKey: investecPrimeSaverIdentityKey(strongPayload) },
+      rawPayload: { runningBalance: '98765.43' },
+    }
+    const priorWeak = {
+      payload: { ...weakPayload, primeSaverIdentityKey: investecPrimeSaverIdentityKey(weakPayload) },
+      rawPayload: { runningBalance: 0 },
+    }
+    const fixture = outboxSql({ id: '00000000-0000-0000-0000-000000000094', payload: {
+      deploymentId: 'dep-1', accountId: 'wf-acc-1', subject: CONNECTION.localOwnerId,
+      idempotencyKey: 'unused', accessGeneration: 1, kind: 'ActivityDelete', resourceId: 'unused',
+    }, attempts: 0 }, [priorWeak, priorWeak])
+    const deps = createRuntimeDependencies(fixture.sql, 'dep-1', env({ FINANCE_SYNC_CONNECTIONS_JSON: '[]' }))
+    const investecConnection: RuntimeConnection = {
+      ...CONNECTION, provider: 'investec', connectionId: 'investec-connection',
+      apiKey: 'api-key', eligibleProductNames: ['PrimeSaver'], fromDate: '2026-08-01', toDate: '2026-08-08',
+    }
+    await deps.persistAndEnqueue(investecConnection, [strongObservation], { skipCurrentState: true })
+    expect(fixture.enqueued).toHaveLength(1)
+    expect(fixture.enqueued[0].resourceId).toContain('synthetic-v2-strong')
+    expect(fixture.enqueued[0].supersededResourceIds).toEqual([
+      'dep-1:00000000-0000-0000-0000-000000000001:synthetic-v2-weak',
+    ])
+  })
+
   it('leaves a weak PrimeSaver row visible when strong identities are ambiguous', async () => {
     const weakPayload = {
       transactionId: 'synthetic-v2-weak', accountId: 'acc-1', amount: '3150', currency: 'ZAR',
