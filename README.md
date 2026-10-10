@@ -5,8 +5,8 @@ immutable facts, reconciles them, and delivers the result to a downstream ledger
 every write. It is read-only towards providers: it never initiates payments, transfers or trades.
 
 This repository is the reconciliation core, published from a private working repository. Deployment
-configuration, the user interface and other modules are not included, the commit history is not
-published, and test data has been replaced with synthetic values.
+configuration, the user interface and other modules are not included, commit messages are reduced to
+their subject lines, and test data has been replaced with synthetic values.
 
 Built with AI coding agents (Claude Code, Codex and Pi) that I direct. Every change in the private
 working repository goes through a pull request gated by CI and security scanning.
