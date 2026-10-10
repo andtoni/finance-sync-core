@@ -1,19 +1,10 @@
-// ════════════════════════════════════════════════════════════════════════
-// The tight outbound drainer (the design notes). UI/READ runs this as a persistent
-// in-process loop (~10–15 s cadence — NOT a 2-min cron) that pulls the Cloudflare
-// Queue HTTP *pull consumer* (the webhook worker is the producer), hands
-// each message to `ingest`, then acks. No inbound port is opened — everything
-// reaches OUT; the private network is never made reachable.
-//
-// The webhook is a LATENCY optimisation, not a correctness dependency: if CF is
-// unreachable the loop simply idles/backs off and the 2-min `sync-fast` cron
-// remains the backstop — nothing breaks. `fetch` is injected (the house test seam)
-// and the message handler is injected too, so the integration layer wires the real
-// `webhook_events`-dedup + `ingest(source, …)` path and STARTS the loop; this
-// module is never mounted here.
-// ════════════════════════════════════════════════════════════════════════
+// Outbound queue drainer. A persistent in-process loop pulls a Cloudflare Queue HTTP pull
+// consumer, hands each message to an injected handler, then acknowledges it. The service only
+// makes outbound requests. The queue is a latency optimisation, not a correctness dependency:
+// if it is unreachable the loop backs off and scheduled synchronisation remains the backstop.
+// `fetch` and the message handler are injected so tests can drive the loop.
 
-/** The envelope the worker enqueues (worker/src/index.ts `QueueEnvelope`). */
+/** The envelope the worker enqueues. */
 export interface QueueEnvelope {
   source: string
   dedup_key: string

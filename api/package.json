@@ -1,0 +1,21 @@
+{
+  "name": "finance-sync",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run src/finance-sync scripts",
+    "dev": "bun run src/finance-sync/sync-runner.ts",
+    "build": "bun build src/finance-sync/sync-runner.ts --outdir dist --target bun",
+    "typecheck": "tsc -p tsconfig.finance-sync.json --noEmit",
+    "migrate": "bun run src/finance-sync/storage/migrate-cli.ts"
+  },
+  "dependencies": {
+    "postgres": "3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.4",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}

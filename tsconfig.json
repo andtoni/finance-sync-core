@@ -1,0 +1,19 @@
+{
+  "//": "Root base tsconfig — extended by each package. Strict, no-emit (typecheck only). Runs via `pnpm -r typecheck` (per-package tsc --noEmit). `include`/`exclude` are intentionally absent: they are not inherited by `extends`, so each package sets its own.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "lib": ["ES2023"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "types": []
+  }
+}
