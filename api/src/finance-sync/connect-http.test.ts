@@ -13,10 +13,12 @@ let corrected: Record<string, unknown>[]
 let linked: Record<string, unknown>[]
 let recovered: Record<string, unknown>[]
 let plaidItemConditions: Map<string, string | undefined>
+let moved: Record<string, unknown>[]
 
 beforeEach(async () => {
   plaidItemConditions = new Map([['item-1', 'ACCOUNT_NOT_RETURNED']])
   admitted = []
+  moved = []
   quarantined = []
   corrected = []
   linked = []
@@ -24,7 +26,7 @@ beforeEach(async () => {
   const connect = new FinanceSyncConnectControl({
     deploymentId: 'deployment-1',
     connections: [{
-      provider: 'plaid' as const, connectionId: 'runtime-connection', providerConnectionId: 'item-1', deploymentId: 'deployment-1',
+      provider: 'plaid' as const, connectionId: 'runtime-connection:account-1', providerConnectionId: 'item-1', deploymentId: 'deployment-1',
       localOwnerId: subject, sourceResourceIncarnationId: '00000000-0000-4000-8000-000000000001',
       accountIds: ['account-1'], wealthfolioAccountIds: { 'account-1': 'wf-1' },
       providerGeneration: 1, receiverAccessGeneration: 1, secretReference: 'PLAID_SLOT_A',
@@ -33,6 +35,7 @@ beforeEach(async () => {
     plaid: {
       createLinkToken: async () => ({ linkToken: 'link-token' }),
       createUpdateLinkToken: async () => ({ linkToken: 'update-link-token' }),
+      institutionName: async () => 'Bank A',
       exchangePublicToken: async () => ({ clientId: 'client-id', clientSecret: 'client-secret', accessToken: 'durable-secret', itemId: 'item-1' }),
       listAccounts: async () => [{ providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', assets: [] }],
     },
@@ -60,10 +63,19 @@ beforeEach(async () => {
         receiverAccessGeneration: 7, baselineStatus: 'verified', baselineDigest: 'sha256:baseline', assetMappingDigest: 'sha256:empty' }),
       listConnectedAccounts: async boundSubject => boundSubject === subject
         ? [{ providerConnectionId: 'item-1', name: 'Checking', mask: '1234' }] : [],
+      moveAdmission: async input => {
+        moved.push(input)
+        return { wealthfolioAccountId: input.wealthfolioAccountId, connectionId: input.connectionId, providerAccountId: input.providerAccountId, providerGeneration: 5 }
+      },
     },
     onPlaidConnected: async () => undefined,
     onPlaidAccountsUpdated: async () => undefined,
     plaidItemConditions,
+    plaidReissuedAccounts: new Map([['wf-1', {
+      wealthfolioAccountId: 'wf-1',
+      from: { connectionId: 'runtime-connection', providerAccountId: 'account-1' },
+      to: { connectionId: 'connection-live', providerAccountId: 'account-new' },
+    }]]),
   })
   const handler = createFinanceSyncHttpHandler({
     controlToken, providersEnabled: true, connect,
@@ -262,7 +274,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     }
     expect(await plaid()).toEqual({
       provider: 'plaid', status: 'configured', message: 'Provider is configured.',
-      connections: [{ connectionId: 'item-1', label: 'Checking •••• 1234', needsReauth: true, reason: 'ACCOUNT_NOT_RETURNED' }],
+      connections: [{ connectionId: 'item-1', label: 'Checking •••• 1234', institutionName: 'Bank A', providerAccountIds: ['account-1'], needsReauth: true, reason: 'ACCOUNT_NOT_RETURNED' }],
     })
 
     const update = await fetch(`${base}/control/v1/provider-connections/plaid/update`, {
@@ -276,7 +288,7 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(complete.status).toBe(200)
     expect(await plaid()).toEqual({
       provider: 'plaid', status: 'configured', message: 'Provider is configured.',
-      connections: [{ connectionId: 'item-1', label: 'Checking •••• 1234', needsReauth: false }],
+      connections: [{ connectionId: 'item-1', label: 'Checking •••• 1234', institutionName: 'Bank A', providerAccountIds: ['account-1'], needsReauth: false }],
     })
   })
 
@@ -347,6 +359,29 @@ describe('Finance Sync internal Connect HTTP routes', () => {
     expect(invalid.status).toBe(400)
   })
 
+  it('lists where the subject\'s Plaid accounts are admitted and moves an admission to the account it was re-issued as', async () => {
+    const listed = await fetch(`${base}/control/v1/provider-connections/plaid/admissions`, { headers: headers() })
+    expect(listed.status).toBe(200)
+    expect(await listed.json()).toEqual([{
+      wealthfolioAccountId: 'wf-1', connectionId: 'runtime-connection', providerAccountId: 'account-1', providerGeneration: 1,
+      reissuedAs: { connectionId: 'connection-live', providerAccountId: 'account-new' },
+    }])
+    const other = await fetch(`${base}/control/v1/provider-connections/plaid/admissions`, { headers: headers({ 'x-authenticated-subject': 'wealthfolio#owner-b' }) })
+    expect(await other.json()).toEqual([])
+
+    const body = { wealthfolioAccountId: 'wf-1', connectionId: 'connection-live', providerAccountId: 'account-new' }
+    const response = await fetch(`${base}/control/v1/provider-connections/plaid/admissions/move`, {
+      method: 'POST', headers: { ...headers(), 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ ...body, providerGeneration: 5 })
+    expect(moved).toEqual([{ subject, ...body, from: { connectionId: 'runtime-connection', providerAccountId: 'account-1' } }])
+    const invalid = await fetch(`${base}/control/v1/provider-connections/plaid/admissions/move`, {
+      method: 'POST', headers: { ...headers(), 'content-type': 'application/json' }, body: JSON.stringify({ ...body, providerAccountId: 7 }),
+    })
+    expect(invalid.status).toBe(400)
+  })
+
   it('disconnects a subject-bound provider without exposing a 501 path', async () => {
     const response = await fetch(`${base}/control/v1/provider-connections/plaid/connection-1`, { method: 'DELETE', headers: headers() })
     expect(response.status).toBe(200)
@@ -373,6 +408,8 @@ describe('Finance Sync internal Connect HTTP routes', () => {
         ['/control/v1/provider-connections/plaid/admissions/connection-1/account-1', { method: 'GET' }],
         ['/control/v1/provider-connections/plaid/admit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
         ['/control/v1/provider-connections/plaid/start', { method: 'POST' }],
+        ['/control/v1/provider-connections/plaid/admissions', { method: 'GET' }],
+        ['/control/v1/provider-connections/plaid/admissions/move', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }],
         ['/control/v1/provider-connections/plaid/update', { method: 'POST' }],
         ['/control/v1/provider-connections/plaid/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ publicToken: 'token', continuationToken: 'token' }) }],
         ['/control/v1/provider-connections/plaid/update/complete', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ continuationToken: 'token' }) }],

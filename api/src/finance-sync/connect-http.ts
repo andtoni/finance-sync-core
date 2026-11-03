@@ -184,6 +184,18 @@ export function createFinanceSyncHttpHandler(input: {
       if (request.method === 'GET' && path === '/control/v1/provider-connections') {
         return send(response, 200, await connect.list(rawSubject))
       }
+      if (request.method === 'GET' && path === '/control/v1/provider-connections/plaid/admissions') {
+        return send(response, 200, await connect.plaidAdmissions(rawSubject))
+      }
+      if (request.method === 'POST' && path === '/control/v1/provider-connections/plaid/admissions/move') {
+        const body = await jsonBody(request)
+        const fields = ['wealthfolioAccountId', 'connectionId', 'providerAccountId'] as const
+        if (!fields.every(field => typeof body[field] === 'string')) throw new ConnectControlError(400, 'invalid admission move request')
+        return send(response, 200, await connect.moveAdmission(rawSubject, {
+          wealthfolioAccountId: body.wealthfolioAccountId as string,
+          connectionId: body.connectionId as string, providerAccountId: body.providerAccountId as string,
+        }))
+      }
       const accounts = path.match(/^\/control\/v1\/provider-connections\/([^/]+)\/accounts$/)
       if (request.method === 'GET' && accounts) {
         return send(response, 200, await connect.pendingAccounts(rawSubject, decodeURIComponent(accounts[1])))

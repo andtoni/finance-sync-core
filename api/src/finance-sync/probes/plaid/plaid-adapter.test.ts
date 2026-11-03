@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { plaidResourceKind, runPlaidSync } from './plaid-adapter'
 import type { PlaidTransport } from './plaid-adapter'
+import { providerObservationToBridge } from '../../projection/bridge-client'
 
 function transactionObservations(result: Awaited<ReturnType<typeof runPlaidSync>>) {
   return result.observations.filter(observation => observation.providerVersion.startsWith('plaid:txn:'))
@@ -70,7 +71,7 @@ describe('Plaid adapter G4', () => {
       }),
     })
     const result = await runPlaidSync({
-      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'urn:test#alexis',
       sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-1'],
     }, transport)
     const transactions = transactionObservations(result)
@@ -174,7 +175,7 @@ describe('Plaid adapter G4', () => {
       getLiabilities: async () => ({ credit: [{ account_id: 'acc-credit' }] }),
     })
     const result = await runPlaidSync({
-      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'urn:test#alexis',
       sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-checking', 'acc-credit', 'acc-savings'],
     }, transport)
 
@@ -205,7 +206,7 @@ describe('Plaid adapter G4', () => {
       }),
     })
     const config = {
-      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'alexis',
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'urn:test#alexis',
       sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-present', 'acc-absent'],
     }
     const result = await runPlaidSync({ ...config, initialCursor: 'cursor-0' }, transport)
@@ -359,5 +360,62 @@ describe('Plaid adapter G4', () => {
     expect(result.counts.skipped.unadmittedAccount).toBe(2)
     expect(transactionObservations(result)).toHaveLength(1)
     expect(transactionObservations(result)[0].payload.transactionId).toBe('txn-admitted')
+  })
+})
+
+describe('money into a Plaid credit card', () => {
+  const card = { account_id: 'acc-card', name: 'Cashback Card', type: 'credit', subtype: 'credit card', balances: { current: 300, iso_currency_code: 'USD' } }
+  const checking = { account_id: 'acc-checking', name: 'Checking', type: 'depository', subtype: 'checking', balances: { current: 1000, iso_currency_code: 'USD' } }
+  const refund = {
+    transaction_id: 'txn-refund', account_id: 'acc-card', amount: -115, date: '2026-10-21', name: 'SAASCO* SUBSCRIPTION',
+    transaction_code: 'adjustment', personal_finance_category: { primary: 'INCOME', detailed: 'INCOME_OTHER_INCOME' },
+  }
+  const payment = {
+    transaction_id: 'txn-payment', account_id: 'acc-card', amount: -192.25, date: '2026-10-14', name: 'BANK A MOBILE PYMT',
+    transaction_code: 'payment', personal_finance_category: { primary: 'LOAN_PAYMENTS', detailed: 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT' },
+  }
+  const uncodedPayment = {
+    transaction_id: 'txn-uncoded-payment', account_id: 'acc-card', amount: -50, date: '2026-10-15', name: 'AUTOPAY',
+    personal_finance_category: { primary: 'LOAN_PAYMENTS', detailed: 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT' },
+  }
+  const purchase = {
+    transaction_id: 'txn-purchase', account_id: 'acc-card', amount: 115, date: '2026-10-01', name: 'SAASCO* SUBSCRIPTION',
+    transaction_code: 'purchase',
+  }
+  const deposit = {
+    transaction_id: 'txn-deposit', account_id: 'acc-checking', amount: -50, date: '2026-10-15', name: 'BANK B NA',
+    transaction_code: 'adjustment', personal_finance_category: { primary: 'TRANSFER_IN' },
+  }
+
+  async function projected(page: { added?: readonly unknown[]; modified?: readonly unknown[] }) {
+    const result = await runPlaidSync({
+      accessToken: 'access-sandbox-abc', deploymentId: 'g4-test', localOwnerId: 'urn:test#alexis',
+      sourceResourceIncarnationId: 'plaid:item-1', accountIds: ['acc-card', 'acc-checking'],
+    }, mockTransport({
+      syncTransactions: async () => ({
+        added: (page.added ?? []) as never, modified: (page.modified ?? []) as never, removed: [],
+        accounts: [card, checking], next_cursor: 'cursor-1', has_more: false,
+      }),
+    }))
+    return new Map(transactionObservations(result).map(observation => [
+      String(observation.payload.transactionId),
+      providerObservationToBridge('plaid', observation, 1, 'wf-account')?.activity,
+    ]))
+  }
+
+  it('projects a refund as a credit to the card and leaves payments, purchases and bank deposits as they were', async () => {
+    const activities = await projected({ added: [refund, payment, uncodedPayment, purchase, deposit] })
+    expect(activities.get('txn-refund')).toMatchObject({ activityType: 'CREDIT', subtype: 'REFUND', amount: '115' })
+    expect(activities.get('txn-payment')).toMatchObject({ activityType: 'DEPOSIT', amount: '192.25' })
+    expect(activities.get('txn-payment')?.subtype).toBeUndefined()
+    expect(activities.get('txn-uncoded-payment')).toMatchObject({ activityType: 'DEPOSIT' })
+    expect(activities.get('txn-purchase')).toMatchObject({ activityType: 'WITHDRAWAL' })
+    expect(activities.get('txn-deposit')).toMatchObject({ activityType: 'DEPOSIT' })
+  })
+
+  it('projects a modified refund as a credit to the card', async () => {
+    const activities = await projected({ modified: [refund, payment] })
+    expect(activities.get('txn-refund')).toMatchObject({ activityType: 'CREDIT', subtype: 'REFUND' })
+    expect(activities.get('txn-payment')).toMatchObject({ activityType: 'DEPOSIT' })
   })
 })

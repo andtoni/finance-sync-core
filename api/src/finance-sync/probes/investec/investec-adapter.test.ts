@@ -241,6 +241,18 @@ describe('Investec adapter G5', () => {
     expect(r.quarantine.some(item => item.reason === 'PENDING_NOT_PROJECTED')).toBe(true)
   })
 
+  it('ingests a PrimeSaver row dated after the current day while the balance stays dated today', async () => {
+    const transport = makeTransport([], undefined, [{ accountId: 'saver', productName: 'PrimeSaver', accountName: 'Prime Saver' }])
+    // Investec returns only rows whose transactionDate falls inside the requested window.
+    transport.getTransactionPage = async (_accountId, window) => ({
+      transactions: [{ uuid: '', status: 'POSTED', postedOrder: 0, type: 'DEBIT', amount: 5000, transactionDate: '2026-10-19', postingDate: '2026-10-19', description: 'Synthetic transfer Value Date 18Oct26 MBP9000000002 11112222 Holder 22223333' }]
+        .filter(row => row.transactionDate <= window.toDate) as any[],
+    })
+    const r = await runInvestecAdapter({ ...BASE_CONFIG, toDate: '2026-10-18', eligibleProductNames: ['PrimeSaver'] }, transport)
+    expect(transactionObservations(r).map(o => o.payload.transactionDate)).toEqual(['2026-10-19'])
+    expect(r.observations.find(o => o.providerVersion.startsWith('investec:balance:'))?.payload.asOfDate).toBe('2026-10-18')
+  })
+
   it('quarantines postedOrder=0 as provisional', async () => {
     const r = await runInvestecAdapter(BASE_CONFIG, makeTransport(
       [{ uuid: 't1', status: 'POSTED', postedOrder: 0, type: 'DEBIT', amount: 100, postingDate: '2026-07-10', description: 'P' }], undefined))

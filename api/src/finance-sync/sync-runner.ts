@@ -1,12 +1,12 @@
 /** Finance Sync durable runner: read-only provider ingestion, canonical persistence, bridge outbox projection. */
 import { createServer } from 'node:http'
 import { resolve } from 'node:path'
-import { assertBridgeConfiguration, createRuntimeDependencies, linkZelleTransferPairs, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
-import { runConfiguredSyncCycle } from './runtime'
+import { assertBridgeConfiguration, createRuntimeDependencies, linkZelleTransferPairs, reclassifyPlaidCardRefunds, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
+import { runConfiguredSyncCycle, type PlaidReissuedAccount } from './runtime'
 import { connectFinanceSync } from './storage/pg'
 import { migrate } from './storage/migrate'
 import { parseServiceConfig } from './service-config'
-import { financeSyncHealthResponse, syncCycleOutcome } from './health'
+import { financeSyncHealthResponse, syncCycleOutcome, webhookDrainState } from './health'
 import { logFailure } from './failure-reason'
 import {
   createPlaidConnectTransport,
@@ -45,8 +45,12 @@ Provider credentials are resolved through scoped server-side Infisical machine i
   // reason code. Derived from the provider on every cycle, so nothing durable
   // has to remember it.
   const plaidItemConditions = new Map<string, string | undefined>()
+  // Admissions the last completed cycle ingested under a re-issued account id,
+  // by Wealthfolio account id. Derived on every cycle like the conditions.
+  const plaidReissuedAccounts = new Map<string, PlaidReissuedAccount>()
   let retainedCardReplayNeeded = true
   let quarantinedCardReplayNeeded = true
+  let plaidCardRefundReclassificationNeeded = true
   const cycle = async () => {
     if (!config.providersEnabled) {
       connectionCount = 0
@@ -64,6 +68,8 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       connectionCount = result.connections
       plaidItemConditions.clear()
       for (const condition of result.plaidItemConditions) plaidItemConditions.set(condition.providerConnectionId, condition.reason)
+      plaidReissuedAccounts.clear()
+      for (const account of result.plaidReissuedAccounts) plaidReissuedAccounts.set(account.wealthfolioAccountId, account)
       const outcome = syncCycleOutcome(result)
       cycleReady = outcome.cycleReady
       cycleFailed = outcome.cycleFailed
@@ -139,6 +145,20 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       logFailure('FINANCE_SYNC_PLAID_ZELLE_LINK_FAILED', error)
     }
   }
+  const reclassifyCardRefunds = async () => {
+    if (!plaidCardRefundReclassificationNeeded) return
+    if (!deps || !config.projectionEnabled) {
+      plaidCardRefundReclassificationNeeded = false
+      return
+    }
+    try {
+      const reclassified = await reclassifyPlaidCardRefunds(sql, config.deploymentId, await deps.loadConnections(config.deploymentId), deps)
+      plaidCardRefundReclassificationNeeded = false
+      if (reclassified > 0) console.log('FINANCE_SYNC_PLAID_CARD_REFUNDS_RECLASSIFIED', JSON.stringify({ refunds: reclassified }))
+    } catch (error) {
+      logFailure('FINANCE_SYNC_PLAID_CARD_REFUND_RECLASSIFICATION_FAILED', error)
+    }
+  }
   const replay = async () => {
     try { await sql`SELECT 1`; databaseReady = true }
     catch { databaseReady = false; console.error('FINANCE_SYNC_DATABASE_NOT_READY') }
@@ -187,11 +207,13 @@ Provider credentials are resolved through scoped server-side Infisical machine i
           }),
           onPlaidAccountsUpdated: input => onboarding.updateConnectionAccounts(input),
           plaidItemConditions,
+          plaidReissuedAccounts,
         })
       }
     }
     await cycle()
     await linkZelleTransfers()
+    await reclassifyCardRefunds()
     await reprojectRetainedCards()
     await replayQuarantinedCards()
     await sweepInvestecCardLifecycles()
@@ -210,7 +232,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       investecTerminalRevisionRecovery: terminalRecoveryEnabled && deps?.terminalRevisionResolver
         ? createInvestecTerminalRevisionRecoveryControl(sql, config.deploymentId, deps.terminalRevisionResolver)
         : undefined,
-      health: () => financeSyncHealthResponse(databaseReady, cycleReady, connectionCount, cycleFailed),
+      health: () => financeSyncHealthResponse(databaseReady, cycleReady, connectionCount, cycleFailed, webhookDrainState(webhookDrainer)),
     })
     const server = createServer((request, response) => { void handler(request, response) })
     await new Promise<void>((ok, fail) => { server.once('error', fail); server.listen(config.healthPort, '0.0.0.0', ok) })
@@ -219,7 +241,7 @@ Provider credentials are resolved through scoped server-side Infisical machine i
       webhookDrainer = startInvestecCardDrainer(sql, config.deploymentId, deps, process.env)
       console.log(webhookDrainer ? 'FINANCE_SYNC_WEBHOOK_DRAINER_STARTED' : 'FINANCE_SYNC_WEBHOOK_DRAINER_DISABLED')
     }
-    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await linkZelleTransfers(); await reprojectRetainedCards(); await replayQuarantinedCards(); await sweepInvestecCardLifecycles(); if (!stopping) schedule() }, config.intervalMs) }
+    const schedule = () => { timer = setTimeout(async () => { await replay(); await cycle(); await linkZelleTransfers(); await reclassifyCardRefunds(); await reprojectRetainedCards(); await replayQuarantinedCards(); await sweepInvestecCardLifecycles(); if (!stopping) schedule() }, config.intervalMs) }
     if (config.schedulesEnabled) schedule()
     await new Promise<void>(done => { const stop = () => { if (stopping) return; stopping = true; if (timer) clearTimeout(timer); webhookDrainer?.stop(); server.close(() => done()) }; process.once('SIGTERM', stop); process.once('SIGINT', stop) })
   } finally { if (timer) clearTimeout(timer); webhookDrainer?.stop(); await webhookDrainer?.done; await sql.end() }

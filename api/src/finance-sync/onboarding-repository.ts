@@ -37,6 +37,13 @@ export interface AdmissionMetadata {
   readonly assetMappingDigest: string
 }
 
+export interface MovedAdmission {
+  readonly wealthfolioAccountId: string
+  readonly connectionId: string
+  readonly providerAccountId: string
+  readonly providerGeneration: number
+}
+
 function assetMappingDigest(mappings: readonly ProviderAssetMapping[]): string {
   const canonical = [...mappings].sort((a, b) => a.providerAssetId.localeCompare(b.providerAssetId))
   return `sha256:${createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex')}`
@@ -263,6 +270,164 @@ export class PostgresOnboardingRepository {
           AND connection_id = ${connection[0]!.connectionId}::uuid AND revoked_at IS NULL
       `
       return true
+    })
+  }
+
+  /**
+   * Moves the active Plaid admission of one Wealthfolio account to the provider
+   * account its institution re-issued it as, in the same connection or in
+   * another one. The two discovered accounts exchange their source resources,
+   * so the admission keeps its observations, their identities and the activity
+   * ids already delivered, and the account left behind holds none. Repeating a
+   * completed move returns the same result.
+   */
+  async moveAdmission(input: {
+    readonly subject: string; readonly wealthfolioAccountId: string
+    readonly connectionId: string; readonly providerAccountId: string
+    /** Where the last sync cycle saw this admission returned as the requested account; absent otherwise. */
+    readonly from?: { readonly connectionId: string; readonly providerAccountId: string }
+  }): Promise<MovedAdmission> {
+    return await this.sql.begin(async transaction => {
+      const tx = transaction as unknown as FinanceSyncSql
+      const [source] = await tx<{
+        connectionId: string; providerAccountId: string; providerGeneration: number; receiverAccessGeneration: number
+        assetMappings: readonly ProviderAssetMapping[]; assetMappingDigest: string; baselineFingerprint: string
+        accountIncarnationId: string; sourceResourceIncarnationId: string
+        mask: string | null; name: string; currency: string
+      }[]>`
+        SELECT paa.connection_id::text AS "connectionId", paa.provider_account_id AS "providerAccountId",
+          pc.provider_generation AS "providerGeneration", paa.receiver_access_generation AS "receiverAccessGeneration",
+          paa.asset_mappings AS "assetMappings", paa.asset_mapping_digest AS "assetMappingDigest",
+          paa.baseline_fingerprint AS "baselineFingerprint",
+          dpa.account_incarnation_id::text AS "accountIncarnationId",
+          dpa.source_resource_incarnation_id::text AS "sourceResourceIncarnationId",
+          dpa.mask, dpa.provider_name AS name, dpa.currency
+        FROM provider_account_admissions paa
+        JOIN provider_connections pc
+          ON pc.deployment_id = paa.deployment_id AND pc.local_owner_id = paa.local_owner_id
+          AND pc.connection_id = paa.connection_id
+        JOIN discovered_provider_accounts dpa
+          ON dpa.deployment_id = paa.deployment_id AND dpa.local_owner_id = paa.local_owner_id
+          AND dpa.connection_id = paa.connection_id AND dpa.provider_account_id = paa.provider_account_id
+        WHERE paa.deployment_id = ${this.deploymentId} AND paa.local_owner_id = ${input.subject}
+          AND paa.wealthfolio_account_id = ${input.wealthfolioAccountId}
+          AND pc.provider = 'plaid' AND pc.state = 'active' AND pc.disabled_at IS NULL
+          AND dpa.discovery_generation = pc.provider_generation
+          AND paa.provider_generation = pc.provider_generation
+          AND paa.revoked_at IS NULL AND paa.baseline_state = 'verified'
+        FOR UPDATE OF paa, dpa
+      `
+      if (!source) throw new Error('admission to move was not found')
+      if (source.connectionId === input.connectionId && source.providerAccountId === input.providerAccountId) {
+        return {
+          wealthfolioAccountId: input.wealthfolioAccountId, connectionId: source.connectionId,
+          providerAccountId: source.providerAccountId, providerGeneration: source.providerGeneration,
+        }
+      }
+      if (input.from?.connectionId !== source.connectionId || input.from.providerAccountId !== source.providerAccountId) {
+        throw new Error('admission is not returned under the requested provider account')
+      }
+      // The re-issued account must be discovered in a connected Item and carry
+      // the identity the sync cycle recognised it by.
+      const [target] = await tx<{ providerGeneration: number; accountIncarnationId: string; sourceResourceIncarnationId: string }[]>`
+        SELECT pc.provider_generation AS "providerGeneration",
+          dpa.account_incarnation_id::text AS "accountIncarnationId",
+          dpa.source_resource_incarnation_id::text AS "sourceResourceIncarnationId"
+        FROM discovered_provider_accounts dpa
+        JOIN provider_connections pc
+          ON pc.deployment_id = dpa.deployment_id AND pc.local_owner_id = dpa.local_owner_id
+          AND pc.connection_id = dpa.connection_id
+        WHERE dpa.deployment_id = ${this.deploymentId} AND dpa.local_owner_id = ${input.subject}
+          AND dpa.connection_id = ${input.connectionId}::uuid
+          AND dpa.provider_account_id = ${input.providerAccountId}
+          AND pc.provider = 'plaid' AND pc.state = 'active' AND pc.disabled_at IS NULL
+          AND dpa.discovery_generation = pc.provider_generation
+          AND dpa.mask = ${source.mask} AND dpa.provider_name = ${source.name} AND dpa.currency = ${source.currency}
+        FOR UPDATE OF dpa
+      `
+      if (!target || !source.mask) throw new Error('re-issued provider account is not discovered')
+      const earlier = await tx<{ wealthfolioAccountId: string; revokedAt: string | null }[]>`
+        SELECT wealthfolio_account_id AS "wealthfolioAccountId", revoked_at::text AS "revokedAt"
+        FROM provider_account_admissions
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND connection_id = ${input.connectionId}::uuid AND provider_account_id = ${input.providerAccountId}
+        FOR UPDATE
+      `
+      if (earlier[0]?.revokedAt === null) throw new Error('re-issued provider account belongs to another admission')
+      // A revoked admission of the re-issued account to another Wealthfolio
+      // account was abandoned: it gives no authority, and its row is replaced
+      // below. What it observed stays with its own source resource, which the
+      // exchange hands to the account left behind, so none of it can reach the
+      // Wealthfolio account that is kept. Observations with no such admission
+      // to explain them, or taken for this same Wealthfolio account, would
+      // split one history over two source resources and are refused.
+      const abandoned = earlier[0] !== undefined && earlier[0].wealthfolioAccountId !== input.wealthfolioAccountId
+      const held = abandoned ? [] : await tx`
+        SELECT 1 FROM raw_observations
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND source_resource_incarnation_id = ${target.sourceResourceIncarnationId}::uuid
+        LIMIT 1
+      `
+      if (held.length !== 0) throw new Error('re-issued provider account already holds observations')
+      // Projections queued under the previous runtime connection could no
+      // longer be delivered or recovered once the admission has left it. The
+      // runtime connection moved to must be clear as well: anything an
+      // abandoned admission left queued there would be delivered under the
+      // new admission's authority.
+      const unresolved = await tx`
+        SELECT 1 FROM projection_outbox
+        WHERE deployment_id = ${this.deploymentId}
+          AND connection_id IN (${`${source.connectionId}:${source.providerAccountId}`}, ${`${input.connectionId}:${input.providerAccountId}`})
+          AND state IN ('pending', 'uncertain', 'dead_letter')
+        LIMIT 1
+      `
+      if (unresolved.length !== 0) throw new Error('admission has undelivered projections')
+      await tx`
+        UPDATE discovered_provider_accounts
+        SET account_incarnation_id = ${target.accountIncarnationId}::uuid,
+          source_resource_incarnation_id = ${target.sourceResourceIncarnationId}::uuid
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND connection_id = ${source.connectionId}::uuid AND provider_account_id = ${source.providerAccountId}
+      `
+      await tx`
+        UPDATE discovered_provider_accounts
+        SET account_incarnation_id = ${source.accountIncarnationId}::uuid,
+          source_resource_incarnation_id = ${source.sourceResourceIncarnationId}::uuid
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND connection_id = ${input.connectionId}::uuid AND provider_account_id = ${input.providerAccountId}
+      `
+      // One Wealthfolio account has one active admission, so the previous one
+      // is revoked before the new one exists.
+      await tx`
+        UPDATE provider_account_admissions SET revoked_at = now(), baseline_state = 'pending',
+          baseline_verified_at = NULL, baseline_fingerprint = NULL
+        WHERE deployment_id = ${this.deploymentId} AND local_owner_id = ${input.subject}
+          AND connection_id = ${source.connectionId}::uuid AND provider_account_id = ${source.providerAccountId}
+      `
+      await tx`
+        INSERT INTO provider_account_admissions (
+          deployment_id, local_owner_id, connection_id, provider_account_id,
+          wealthfolio_account_id, provider_generation, receiver_access_generation, asset_mappings, asset_mapping_digest,
+          baseline_state, baseline_verified_at, baseline_fingerprint
+        ) VALUES (
+          ${this.deploymentId}, ${input.subject}, ${input.connectionId}::uuid, ${input.providerAccountId},
+          ${input.wealthfolioAccountId}, ${target.providerGeneration}, ${source.receiverAccessGeneration},
+          ${tx.json(source.assetMappings as never)}, ${source.assetMappingDigest},
+          'verified', now(), ${source.baselineFingerprint}
+        )
+        ON CONFLICT (deployment_id, local_owner_id, connection_id, provider_account_id)
+        DO UPDATE SET wealthfolio_account_id = EXCLUDED.wealthfolio_account_id, admitted_at = now(),
+          provider_generation = EXCLUDED.provider_generation,
+          receiver_access_generation = EXCLUDED.receiver_access_generation,
+          asset_mappings = EXCLUDED.asset_mappings,
+          asset_mapping_digest = EXCLUDED.asset_mapping_digest,
+          baseline_state = 'verified', baseline_verified_at = now(),
+          baseline_fingerprint = EXCLUDED.baseline_fingerprint, revoked_at = NULL
+      `
+      return {
+        wealthfolioAccountId: input.wealthfolioAccountId, connectionId: input.connectionId,
+        providerAccountId: input.providerAccountId, providerGeneration: target.providerGeneration,
+      }
     })
   }
 

@@ -11,10 +11,11 @@
     "migrate": "bun run src/finance-sync/storage/migrate-cli.ts"
   },
   "dependencies": {
+    "@infisical/sdk": "5.0.2",
     "postgres": "3.4.9"
   },
   "devDependencies": {
-    "@types/node": "26.6.4",
+    "@types/node": "26.6.5",
     "typescript": "5.9.3",
     "vitest": "3.2.7"
   }

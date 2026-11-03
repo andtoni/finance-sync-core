@@ -1,10 +1,23 @@
 import { randomUUID } from 'node:crypto'
+import { InfisicalSDK } from '@infisical/sdk'
 import type { PlaidTokenWriter, ProviderSecretReader } from './connect-control'
 import { unavailableProviderSecretStore } from './connect-control'
 import { readExclusiveInput } from './secret-input'
 
 type Env = Readonly<Record<string, string | undefined>>
 type Scope = 'READER' | 'PLAID_WRITER'
+type SdkAuth = ReturnType<InfisicalSDK['auth']>
+type SdkSecrets = ReturnType<InfisicalSDK['secrets']>
+
+/** The part of the official SDK client this store uses; injected in tests. */
+export interface InfisicalClient {
+  auth(): {
+    readonly universalAuth: { login(options: Parameters<SdkAuth['universalAuth']['login']>[0]): Promise<InfisicalClient> }
+    getAccessToken(): string | null
+  }
+  secrets(): Pick<SdkSecrets, 'getSecret' | 'createSecret' | 'updateSecret'>
+}
+export type InfisicalClientFactory = (siteUrl: string) => InfisicalClient
 
 const attempts = 4
 const SLOT = /^[A-Z][A-Z0-9_]{0,127}$/
@@ -68,11 +81,24 @@ function scoped(env: Env, scope: Scope, minimumSlots: number): InfisicalConfig |
 const pause = (attempt: number) => new Promise(resolve => setTimeout(resolve, 50 * (2 ** attempt)))
 const retryable = (status: number) => status === 429 || status >= 500
 
-async function request(fetchImpl: typeof fetch, url: string, init: RequestInit): Promise<{ status: number; body: unknown }> {
-  const response = await fetchImpl(url, { ...init, redirect: 'error' })
-  let body: unknown
-  try { body = await response.json() } catch { body = undefined }
-  return { status: response.status, body }
+/**
+ * HTTP status of a failed SDK call. @infisical/sdk 5.0.2 neither exports its
+ * error classes nor exposes a status field: the status exists only in the
+ * message, in exactly these two shapes. Anything else is a transport failure.
+ */
+function failureStatus(error: unknown): number | undefined {
+  const message = error instanceof Error ? error.message : ''
+  const match = /^\[URL=[^\]]*\] \[Method=[A-Z]+\] \[StatusCode=(\d{3})\] /.exec(message) ?? /^Request failed with status (\d{3})$/.exec(message)
+  return match ? Number(match[1]) : undefined
+}
+
+/** Run one SDK call. A resolved call is status 200; transport failures are rethrown. */
+async function call<T>(operation: () => Promise<T>): Promise<{ status: 200; value: T } | { status: number; value?: undefined }> {
+  try { return { status: 200, value: await operation() } } catch (error) {
+    const status = failureStatus(error)
+    if (status === undefined || status === 200) throw error
+    return { status }
+  }
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -85,30 +111,20 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? 'null'
 }
 
-async function accessToken(config: InfisicalConfig, fetchImpl: typeof fetch): Promise<string> {
-  const result = await request(fetchImpl, `${config.baseUrl}/api/v1/auth/universal-auth/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clientId: config.clientId, clientSecret: config.clientSecret }),
-  })
-  const token = object(result.body)?.accessToken
-  if (result.status !== 200 || typeof token !== 'string' || !token) throw new Error('Infisical authentication failed')
-  return token
+async function authenticated(config: InfisicalConfig, createClient: InfisicalClientFactory): Promise<InfisicalClient> {
+  try {
+    const client = await createClient(config.baseUrl).auth().universalAuth.login({ clientId: config.clientId, clientSecret: config.clientSecret })
+    if (client.auth().getAccessToken()) return client
+  } catch { /* redact all transport and provider responses */ }
+  throw new Error('Infisical authentication failed')
 }
 
-function secretUrl(config: InfisicalConfig, reference: string): string {
-  if ((!config.allowedSlots.includes(reference) && !new RegExp(`^${config.secretPrefix}[0-9A-F]{32}$`).test(reference)) || !SLOT.test(reference)) throw new Error('provider secret reference is not allowlisted')
-  const query = new URLSearchParams({
-    projectId: config.projectId,
-    environment: config.environment,
-    secretPath: config.secretPath,
-    expandSecretReferences: 'false',
-    includeImports: 'false',
-  })
-  return `${config.baseUrl}/api/v4/secrets/${encodeURIComponent(reference)}?${query}`
+function assertAllowlisted(config: InfisicalConfig, reference: string): void {
+  if ((!config.allowedSlots.includes(reference) && !isDynamicReference(config, reference)) || !SLOT.test(reference)) throw new Error('provider secret reference is not allowlisted')
 }
 
-function secretBundle(body: unknown): Readonly<Record<string, unknown>> | undefined {
-  const value = object(object(body)?.secret)?.secretValue
+function secretBundle(secret: unknown): Readonly<Record<string, unknown>> | undefined {
+  const value = object(secret)?.secretValue
   if (typeof value !== 'string') return undefined
   try {
     const parsed = object(JSON.parse(value))
@@ -116,7 +132,7 @@ function secretBundle(body: unknown): Readonly<Record<string, unknown>> | undefi
   } catch { return undefined }
 }
 
-function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlots: number) {
+function createStore(env: Env, scope: Scope, createClient: InfisicalClientFactory, minimumSlots: number) {
   const config = scoped(env, scope, minimumSlots)
   if (!config) return {
     available: false,
@@ -129,14 +145,19 @@ function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlo
     storePlaidAccessToken: unavailableProviderSecretStore.storePlaidAccessToken.bind(unavailableProviderSecretStore),
   }
 
+  const location = { projectId: config.projectId, environment: config.environment, secretPath: config.secretPath }
+  const read = async (client: InfisicalClient, reference: string) => {
+    const result = await call(() => client.secrets().getSecret({ ...location, secretName: reference, expandSecretReferences: false, includeImports: false }))
+    return { status: result.status, bundle: result.status === 200 ? secretBundle(result.value) : undefined }
+  }
+
   const resolve: ProviderSecretReader['resolve'] = async reference => {
-    const url = secretUrl(config, reference)
+    assertAllowlisted(config, reference)
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
-        const token = await accessToken(config, fetchImpl)
-        const result = await request(fetchImpl, url, { headers: { authorization: `Bearer ${token}` } })
-        const bundle = secretBundle(result.body)
-        if (result.status === 200 && bundle) return bundle
+        const client = await authenticated(config, createClient)
+        const result = await read(client, reference)
+        if (result.status === 200 && result.bundle) return result.bundle
         if (!retryable(result.status)) break
       } catch { /* redact all transport and provider responses */ }
       if (attempt < attempts - 1) await pause(attempt)
@@ -145,25 +166,20 @@ function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlo
   }
 
   const prepare: PlaidTokenWriter['prepare'] = async reservation => {
-    const token = await accessToken(config, fetchImpl)
+    const client = await authenticated(config, createClient)
     if (!reservation) return
     const reference = reservation.secretReference
-    const url = secretUrl(config, reference)
+    assertAllowlisted(config, reference)
     const dynamic = isDynamicReference(config, reference)
     if (!dynamic) throw new Error('Infisical Plaid destination is not a generated reservation')
     const binding = reservationBinding(reservation.reservationBinding)
     if (!binding) throw new Error('Infisical Plaid reservation binding is invalid')
     const placeholder = reservationPlaceholder(binding)
-    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
-    const result = await request(fetchImpl, url, {
-      method: 'POST', headers,
-      body: JSON.stringify({ projectId: config.projectId, environment: config.environment, secretPath: config.secretPath, secretValue: JSON.stringify(placeholder), secretComment: 'Finance Sync Plaid provider bundle reservation' }),
-    })
+    const result = await call(() => client.secrets().createSecret(reference, { ...location, secretValue: JSON.stringify(placeholder), secretComment: 'Finance Sync Plaid provider bundle reservation' }))
     if (result.status === 200) return
     if (result.status === 400 || result.status === 409) {
-      const existing = await request(fetchImpl, url, { headers })
-      const existingBundle = secretBundle(existing.body)
-      if (existing.status === 200 && existingBundle && canonical(existingBundle) === canonical(placeholder)) return
+      const existing = await read(client, reference)
+      if (existing.status === 200 && existing.bundle && canonical(existing.bundle) === canonical(placeholder)) return
     }
     throw new Error('Infisical Plaid destination is not writable')
   }
@@ -171,7 +187,7 @@ function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlo
   const recoverPlaidAccessToken: NonNullable<PlaidTokenWriter['recoverPlaidAccessToken']> = async reference => resolve(reference)
 
   const storePlaidAccessToken: PlaidTokenWriter['storePlaidAccessToken'] = async input => {
-    const url = secretUrl(config, input.secretReference)
+    assertAllowlisted(config, input.secretReference)
     const dynamic = isDynamicReference(config, input.secretReference)
     const binding = dynamic ? reservationBinding(input.reservationBinding) : undefined
     if (dynamic && !binding) throw new Error('Infisical Plaid reservation binding is required')
@@ -180,9 +196,8 @@ function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlo
     const placeholder = binding ? reservationPlaceholder(binding) : undefined
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
-        const token = await accessToken(config, fetchImpl)
-        const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
-        const existing = await request(fetchImpl, url, { headers })
+        const client = await authenticated(config, createClient)
+        const existing = await read(client, input.secretReference)
         if (existing.status === 404) {
           if (!dynamic) throw new Error('Infisical provider slot is not provisioned')
           throw new Error('Infisical Plaid reservation is missing')
@@ -191,20 +206,15 @@ function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlo
           if (!retryable(existing.status)) break
           throw new Error('retry')
         }
-        const existingBundle = secretBundle(existing.body)
         if (dynamic) {
-          if (existingBundle && canonical(existingBundle) === canonical(expected)) return input.secretReference
-          if (!existingBundle || !placeholder || canonical(existingBundle) !== canonical(placeholder)) throw new Error('Infisical secret persistence conflict')
+          if (existing.bundle && canonical(existing.bundle) === canonical(expected)) return input.secretReference
+          if (!existing.bundle || !placeholder || canonical(existing.bundle) !== canonical(placeholder)) throw new Error('Infisical secret persistence conflict')
         }
-        const result = await request(fetchImpl, url, {
-          method: 'PATCH', headers,
-          body: JSON.stringify({ projectId: config.projectId, environment: config.environment, secretPath: config.secretPath, secretValue, secretComment: 'Finance Sync Plaid provider bundle' }),
-        })
+        const result = await call(() => client.secrets().updateSecret(input.secretReference, { ...location, secretValue, secretComment: 'Finance Sync Plaid provider bundle' }))
         if (result.status === 200) return input.secretReference
         if ((result.status === 400 || result.status === 409) && dynamic) {
-          const retry = await request(fetchImpl, url, { headers })
-          const retryBundle = secretBundle(retry.body)
-          if (retry.status === 200 && retryBundle && canonical(retryBundle) === canonical(expected)) return input.secretReference
+          const retry = await read(client, input.secretReference)
+          if (retry.status === 200 && retry.bundle && canonical(retry.bundle) === canonical(expected)) return input.secretReference
           throw new Error('Infisical secret persistence conflict')
         }
         if (!retryable(result.status)) break
@@ -224,12 +234,14 @@ function createStore(env: Env, scope: Scope, fetchImpl: typeof fetch, minimumSlo
   return { available: true, allowedSlots: config.allowedSlots, acceptsPlaidSecretReference, allocatePlaidSecretReference, prepare, recoverPlaidAccessToken, resolve, storePlaidAccessToken }
 }
 
-export function createInfisicalProviderSecretReader(env: Env, fetchImpl: typeof fetch = fetch): ProviderSecretReader {
-  const store = createStore(env, 'READER', fetchImpl, 1)
+const officialClient: InfisicalClientFactory = siteUrl => new InfisicalSDK({ siteUrl })
+
+export function createInfisicalProviderSecretReader(env: Env, createClient: InfisicalClientFactory = officialClient): ProviderSecretReader {
+  const store = createStore(env, 'READER', createClient, 1)
   return Object.freeze({ available: store.available, resolve: store.resolve })
 }
 
-export function createInfisicalPlaidTokenWriter(env: Env, fetchImpl: typeof fetch = fetch): PlaidTokenWriter {
-  const store = createStore(env, 'PLAID_WRITER', fetchImpl, 2)
+export function createInfisicalPlaidTokenWriter(env: Env, createClient: InfisicalClientFactory = officialClient): PlaidTokenWriter {
+  const store = createStore(env, 'PLAID_WRITER', createClient, 2)
   return Object.freeze({ available: store.available, allowedSlots: store.allowedSlots, acceptsPlaidSecretReference: store.acceptsPlaidSecretReference, allocatePlaidSecretReference: store.allocatePlaidSecretReference, prepare: store.prepare, recoverPlaidAccessToken: store.recoverPlaidAccessToken, storePlaidAccessToken: store.storePlaidAccessToken })
 }

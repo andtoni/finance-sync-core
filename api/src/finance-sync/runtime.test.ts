@@ -124,7 +124,7 @@ describe('configured sync runtime', () => {
       saveCheckpoint: async (_connection, cursor) => { calls.push(`checkpoint:${cursor}`) },
     }
     const result = await runConfiguredSyncCycle('d', deps)
-    expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0, plaidItemConditions: [] })
+    expect(result).toEqual({ connections: 1, observations: 1, delivered: 1, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] })
     expect(calls).toEqual(['persist+enqueue:1', 'project', 'checkpoint:cursor-1'])
   })
 
@@ -142,7 +142,7 @@ describe('configured sync runtime', () => {
     }
 
     await expect(runConfiguredSyncCycle('d', deps, { providersEnabled: false, projectionEnabled: false }))
-      .resolves.toEqual({ connections: 0, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] })
+      .resolves.toEqual({ connections: 0, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] })
     expect(loadConnections).not.toHaveBeenCalled()
     expect(runProvider).not.toHaveBeenCalled()
     expect(projectPending).not.toHaveBeenCalled()
@@ -160,7 +160,7 @@ describe('configured sync runtime', () => {
     }
 
     await expect(runConfiguredSyncCycle('d', deps, { providersEnabled: true, projectionEnabled: false }))
-      .resolves.toEqual({ connections: 1, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] })
+      .resolves.toEqual({ connections: 1, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] })
     expect(calls).toEqual(['persist+enqueue', 'checkpoint'])
   })
 
@@ -281,7 +281,7 @@ describe('configured sync runtime', () => {
 
     try {
       const result = await runConfiguredSyncCycle('d', deps)
-      expect(result).toEqual({ connections: 2, observations: 2, delivered: 0, failures: 0, plaidItemConditions: [] })
+      expect(result).toEqual({ connections: 2, observations: 2, delivered: 0, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] })
       expect(persistAndEnqueue.mock.calls).toEqual([
         [expect.objectContaining({ accountIds: ['acc-checking'] }), [transaction('acc-checking')], { skipCurrentState: true }],
         [expect.objectContaining({ accountIds: ['acc-credit'] }), [transaction('acc-credit')]],
@@ -320,13 +320,14 @@ describe('configured sync runtime', () => {
       expect(result).toEqual({
         connections: 2, observations: 0, delivered: 0, failures: 0,
         plaidItemConditions: [{ providerConnectionId: 'item-login', reason: 'ITEM_LOGIN_REQUIRED' }],
+        plaidReissuedAccounts: [],
       })
       // Nothing is ingested or checkpointed for the Item awaiting its owner; the healthy Item is unaffected.
       expect(calls).toEqual(['persist:item-healthy', 'checkpoint:item-healthy'])
       // A cycle whose only problems are Item conditions is a healthy cycle.
       const outcome = syncCycleOutcome(result)
       expect(outcome).toEqual({ cycleReady: true, cycleFailed: false, event: 'FINANCE_SYNC_CYCLE_OK' })
-      expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed))
+      expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed, 'disabled'))
         .toMatchObject({ status: 200, body: { ok: true, providerReady: true } })
       const diagnostic = error.mock.calls.find(call => call[0] === 'FINANCE_SYNC_PLAID_ITEM_FAILED')
       expect(JSON.parse(String(diagnostic![1]))).toEqual({ stage: 'item_sync', errorClass: 'Error', code: 'ITEM_LOGIN_REQUIRED', errorType: 'ITEM_ERROR' })
@@ -339,7 +340,7 @@ describe('configured sync runtime', () => {
       loginRequired = false
       calls.length = 0
       const recovered = await runConfiguredSyncCycle('d', deps)
-      expect(recovered).toEqual({ connections: 2, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] })
+      expect(recovered).toEqual({ connections: 2, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] })
       expect(calls).toContain('checkpoint:item-login')
     } finally {
       error.mockRestore()
@@ -384,7 +385,10 @@ describe('configured sync runtime', () => {
 
   describe('a Plaid account re-issued under a new account id', () => {
     const identity = { mask: '0042', name: 'Everyday Checking', currency: 'USD' }
-    const dead = { ...plaidConnection('item-dead', 'token-dead', 'acc-old'), accountIdentities: { 'acc-old': identity } }
+    const dead = {
+      ...plaidConnection('item-dead', 'token-dead', 'acc-old'), sourceResourceIncarnationId: '00000000-0000-0000-0000-000000000002',
+      accountIdentities: { 'acc-old': identity },
+    }
     const live = plaidConnection('item-live', 'token-live', 'acc-live')
     const observation = (transactionId: string, date: string, amount: string, name: string) => ({
       deploymentId: 'd', localOwnerId: dead.localOwnerId, sourceResourceIncarnationId: dead.sourceResourceIncarnationId,
@@ -438,6 +442,12 @@ describe('configured sync runtime', () => {
         expect(persisted.find(row => row.connection === dead.connectionId)?.transactions).toEqual(['held-twice', 'new'])
         // The dead Item needs nothing from its owner once its account is ingested elsewhere.
         expect(result.plaidItemConditions).toEqual([])
+        // The owner can move the admission to where it is returned now.
+        expect(result.plaidReissuedAccounts).toEqual([{
+          wealthfolioAccountId: 'wf-a',
+          from: { connectionId: 'item-dead', providerAccountId: 'acc-old' },
+          to: { connectionId: 'item-live', providerAccountId: 'acc-new' },
+        }])
         expect(result.failures).toBe(0)
         expect(checkpoints).toContain('item-live')
       } finally {
@@ -451,6 +461,7 @@ describe('configured sync runtime', () => {
         const { result, persisted } = await cycle(['item-live', 'item-other'], async () => [])
         expect(persisted.some(row => row.connection === dead.connectionId)).toBe(false)
         expect(result.plaidItemConditions).toEqual([{ providerConnectionId: 'item-dead', reason: 'NO_ACCOUNTS' }])
+        expect(result.plaidReissuedAccounts).toEqual([])
         expect(result.failures).toBe(0)
       } finally {
         error.mockRestore()
@@ -468,6 +479,57 @@ describe('configured sync runtime', () => {
       } finally {
         error.mockRestore()
       }
+    })
+
+    it('filters a replayed stream of a moved admission by the history it holds under its earlier account id', async () => {
+      const moved = { ...plaidConnection('item-live', 'token-live', 'acc-new'), sourceResourceIncarnationId: dead.sourceResourceIncarnationId }
+      const persisted: unknown[][] = []
+      const asked: unknown[] = []
+      const deps: SyncRuntimeDependencies = {
+        loadConnections: async () => [moved],
+        loadCheckpoint: async () => null,
+        loadPlaidItemCheckpoint: async () => null,
+        savePlaidItemCheckpoint: async () => {},
+        // The Item is replayed from its origin: the whole history arrives again under the account's own id.
+        runProvider: async () => ({
+          nextCursor: 'cursor-1',
+          observations: [
+            observation('older', '2026-08-01', '5', 'OLD'), observation('held', '2026-09-05', '12.5', 'COFFEE'),
+            observation('new', '2026-09-20', '7', 'LUNCH'),
+          ],
+        }),
+        loadPlaidReissuedHistory: async (connection, returnedAccountId) => {
+          asked.push([connection.connectionId, returnedAccountId])
+          return [{ date: '2026-09-05', amount: '12.5', name: 'COFFEE' }]
+        },
+        persistAndEnqueue: async (_connection, observations) => {
+          persisted.push(observations.map(item => item.payload.transactionId))
+          return observations.length
+        },
+        projectPending: async () => ({ delivered: 0, failed: 0 }),
+        saveCheckpoint: async () => {},
+      }
+      const result = await runConfiguredSyncCycle('d', deps)
+      expect(asked).toEqual([['item-live', 'acc-new']])
+      expect(persisted).toEqual([['new']])
+      expect(result).toMatchObject({ failures: 0, plaidReissuedAccounts: [] })
+    })
+
+    it('does not read held history for a cycle that brought no transactions', async () => {
+      const history = vi.fn(async () => [])
+      const deps: SyncRuntimeDependencies = {
+        loadConnections: async () => [live],
+        loadCheckpoint: async () => null,
+        loadPlaidItemCheckpoint: async () => null,
+        savePlaidItemCheckpoint: async () => {},
+        runProvider: async () => ({ nextCursor: 'cursor-1', observations: [] }),
+        loadPlaidReissuedHistory: history,
+        persistAndEnqueue: async () => 0,
+        projectPending: async () => ({ delivered: 0, failed: 0 }),
+        saveCheckpoint: async () => {},
+      }
+      await expect(runConfiguredSyncCycle('d', deps)).resolves.toMatchObject({ failures: 0 })
+      expect(history).not.toHaveBeenCalled()
     })
   })
 
@@ -533,7 +595,7 @@ describe('configured sync runtime', () => {
         expect(result.plaidItemConditions).toEqual([])
         const outcome = syncCycleOutcome(result)
         expect(outcome.event).toBe('FINANCE_SYNC_CYCLE_FAILED')
-        expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed).status).toBe(503)
+        expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed, 'disabled').status).toBe(503)
       }
       for (const failure of [new Error('INCOMPLETE_ACCOUNT_BALANCE_CURRENCY'), new TypeError('fetch failed'), 'not an error']) {
         const result = await plaidItemCycle(failure)
@@ -573,10 +635,11 @@ describe('configured sync runtime', () => {
       expect(result).toEqual({
         connections: 2, observations: 0, delivered: 0, failures: 1,
         plaidItemConditions: [{ providerConnectionId: 'item-owner', reason: 'NO_ACCOUNTS' }],
+        plaidReissuedAccounts: [],
       })
       const outcome = syncCycleOutcome(result)
       expect(outcome).toEqual({ cycleReady: false, cycleFailed: true, event: 'FINANCE_SYNC_CYCLE_FAILED' })
-      expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed))
+      expect(financeSyncHealthResponse(true, outcome.cycleReady, result.connections, outcome.cycleFailed, 'disabled'))
         .toMatchObject({ status: 503, body: { ok: false, providerReady: false } })
       expect(error.mock.calls.filter(call => call[0] === 'Finance Sync connection cycle failed')).toHaveLength(1)
     } finally {
@@ -625,6 +688,7 @@ describe('configured sync runtime', () => {
       expect(result).toEqual({
         connections: 2, observations: 1, delivered: 0, failures: 0,
         plaidItemConditions: [{ providerConnectionId: item, reason: 'ACCOUNT_NOT_RETURNED' }],
+        plaidReissuedAccounts: [],
       })
       expect(persistAndEnqueue.mock.calls).toEqual([
         [expect.objectContaining({ accountIds: ['acc-credit'] }), [observation('acc-credit', 'plaid:txn:acc-credit')]],
@@ -641,7 +705,7 @@ describe('configured sync runtime', () => {
       missing = false
       persistAndEnqueue.mockClear()
       const recovered = await runConfiguredSyncCycle('d', deps)
-      expect(recovered).toEqual({ connections: 2, observations: 3, delivered: 0, failures: 0, plaidItemConditions: [] })
+      expect(recovered).toEqual({ connections: 2, observations: 3, delivered: 0, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] })
       expect(persistAndEnqueue.mock.calls.map(call => (call[0] as { accountIds: string[] }).accountIds[0])).toEqual(['acc-checking', 'acc-credit'])
       expect(savePlaidItemCheckpoint).toHaveBeenCalledWith(expect.objectContaining({ providerConnectionId: item }), 'cursor-1')
     } finally {

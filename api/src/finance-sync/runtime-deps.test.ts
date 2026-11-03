@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { assertBridgeConfiguration, createRuntimeDependencies, linkZelleTransferPairs, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
+import { assertBridgeConfiguration, createRuntimeDependencies, linkZelleTransferPairs, reclassifyPlaidCardRefunds, reconcileInvestecCardLifecycles, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
 import { investecPrimeSaverIdentityKey } from './probes/investec/investec-adapter'
 import { bridgeOperationToWire, currentStateToBridge, providerObservationToBridge, validateBridgeReceipt } from './projection/bridge-client'
 import { currentStateSemanticHash } from './projection/current-state'
@@ -1539,6 +1539,65 @@ describe('linkZelleTransferPairs', () => {
     await expect(linkZelleTransferPairs(
       sqlFor([[checking, debit], [bankb, credit]]), 'dep-1', [INVESTEC_CARD_CONNECTION_FOR_TEST], value,
     )).resolves.toBe(0)
+  })
+})
+
+describe('reclassifyPlaidCardRefunds', () => {
+  const card: RuntimeConnection = {
+    ...CONNECTION, provider: 'plaid', connectionId: 'item:acc-card', sourceResourceIncarnationId: '00000000-0000-0000-0000-0000000000cc',
+    accountIds: ['acc-card'], wealthfolioAccountIds: { 'acc-card': 'wf-card' },
+  }
+  const retained = (transactionId: string, amount: number, raw: Record<string, unknown>, plaidAccountType = 'credit') => ({
+    payload: {
+      transactionId, accountId: 'acc-card', amount: String(amount), currency: 'USD', date: '2026-10-21',
+      name: String(raw.name ?? transactionId), plaidAccountType,
+    },
+    raw_payload: { transaction_id: transactionId, account_id: 'acc-card', amount, ...raw },
+    provider_version: `plaid:txn:${transactionId}`,
+    semantic_hash: transactionId.padEnd(64, 'a').slice(0, 64),
+    hash_specification_version: 2,
+    observed_at: '2026-10-21T00:00:00.000Z',
+    source_resource_incarnation_id: card.sourceResourceIncarnationId,
+  })
+  const refund = retained('refund-1', -115, { name: 'SAASCO* SUBSCRIPTION', transaction_code: 'adjustment', personal_finance_category: { primary: 'INCOME' } })
+  const payment = retained('payment-1', -192.25, { name: 'BANK A MOBILE PYMT', transaction_code: 'payment', personal_finance_category: { primary: 'LOAN_PAYMENTS' } })
+  const deposit = retained('deposit-1', -50, { name: 'BANK B NA', transaction_code: 'cash' }, 'depository')
+
+  function deps() {
+    const persisted: Array<{ connection: RuntimeConnection; observations: readonly ObservationOutput[] }> = []
+    return {
+      persisted,
+      value: {
+        persistAndEnqueue: async (connection: RuntimeConnection, observations: readonly ObservationOutput[]) => {
+          persisted.push({ connection, observations }); return observations.length
+        },
+        projectPending: async () => ({ delivered: 1, failed: 0 }),
+      } as unknown as SyncRuntimeDependencies,
+    }
+  }
+  const sqlFor = (rows: readonly unknown[]) => (async () => rows) as unknown as FinanceSyncSql
+
+  it('re-projects a refund retained as a card deposit as a credit to the card', async () => {
+    const { value, persisted } = deps()
+    await expect(reclassifyPlaidCardRefunds(sqlFor([refund, payment, deposit]), 'dep-1', [card], value)).resolves.toBe(1)
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]!.connection).toBe(card)
+    const [observation] = persisted[0]!.observations
+    expect(observation!.providerVersion).toBe('plaid:txn:refund-1')
+    expect(observation!.semanticHash).not.toBe(refund.semantic_hash)
+    const operation = providerObservationToBridge('plaid', observation!, 1, 'wf-card')
+    expect(operation?.resourceId).toBe(`dep-1:${card.sourceResourceIncarnationId}:refund-1`)
+    expect(operation?.activity).toMatchObject({ activityType: 'CREDIT', subtype: 'REFUND', amount: '115' })
+
+    const again = deps()
+    await reclassifyPlaidCardRefunds(sqlFor([refund]), 'dep-1', [card], again.value)
+    expect(again.persisted[0]!.observations[0]!.semanticHash).toBe(observation!.semanticHash)
+  })
+
+  it('leaves card payments and bank deposits alone', async () => {
+    const { value, persisted } = deps()
+    await expect(reclassifyPlaidCardRefunds(sqlFor([payment, deposit]), 'dep-1', [card], value)).resolves.toBe(0)
+    expect(persisted).toHaveLength(0)
   })
 })
 

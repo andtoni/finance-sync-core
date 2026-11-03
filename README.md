@@ -4,9 +4,9 @@ A headless service that reads transactions and balances from financial providers
 immutable facts, reconciles them, and delivers the result to a downstream ledger with a receipt for
 every write. It is read-only towards providers: it never initiates payments, transfers or trades.
 
-This repository is the reconciliation core, published from a private working repository. Deployment
-configuration, the user interface and other modules are not included, commit messages are reduced to
-their subject lines, and test data has been replaced with synthetic values.
+> **Public mirror.** This is a sanitised copy of a private repository I use in production. A scripted export regenerates it from the private source and removes secrets, personal data and infrastructure details. Every update must pass a leak check (a private-string denylist and gitleaks over the full history) before it is published. Development happens in the private repository, so this copy takes no pull requests. Last synced 3 November 2026.
+
+This repository contains the reconciliation core only; deployment configuration, the user interface and other modules are not included.
 
 Built with AI coding agents (Claude Code, Codex and Pi) that I direct. Every change in the private
 working repository goes through a pull request gated by CI and security scanning.

@@ -110,7 +110,7 @@ export async function pullBatch(cfg: DrainerConfig, deps: DrainerDeps): Promise<
       batch_size: cfg.batchSize ?? DEFAULTS.batchSize,
     }),
   })
-  if (!res.ok) throw new Error(`queue pull failed: ${res.status}`)
+  if (!res.ok) throw Object.assign(new Error(`queue pull failed: ${res.status}`), { status: res.status })
   const json = (await res.json()) as {
     success?: boolean
     result?: { messages?: Array<{ body: unknown; id: string; attempts?: number; lease_id: string }> }
@@ -140,7 +140,7 @@ export async function ackBatch(
       retries: retries.map((lease_id) => ({ lease_id })),
     }),
   })
-  if (!res.ok) throw new Error(`queue ack failed: ${res.status}`)
+  if (!res.ok) throw Object.assign(new Error(`queue ack failed: ${res.status}`), { status: res.status })
 }
 
 /**
@@ -172,6 +172,8 @@ export interface DrainerHandle {
   stop(): void
   /** Resolves when the loop has fully exited. */
   done: Promise<void>
+  /** Failed passes since the last successful one. */
+  consecutiveFailedPasses(): number
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -228,5 +230,6 @@ export function startDrainer(cfg: DrainerConfig, deps: DrainerDeps): DrainerHand
       stopped = true
     },
     done,
+    consecutiveFailedPasses: () => failures,
   }
 }

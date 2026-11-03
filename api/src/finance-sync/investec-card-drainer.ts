@@ -3,6 +3,7 @@ import type { ObservationOutput } from './probes/investec/investec-adapter'
 import type { RuntimeConnection, SyncRuntimeDependencies } from './runtime'
 import type { FinanceSyncSql } from './storage/pg'
 import { readExclusiveInput } from './secret-input'
+import { logFailure } from './failure-reason'
 import { parseInvestecCardDelivery, sanitizeInvestecCardEnvelope } from './investec-card-code-v1'
 import { investecCardObservation, accountMask, type InvestecCardPayload } from './investec-card-observation'
 export { investecCardObservation, accountMask, type InvestecCardPayload } from './investec-card-observation'
@@ -340,6 +341,9 @@ export function startInvestecCardDrainer(
       message,
       await deps.loadConnections(deploymentId),
     ),
-    log: level => { if (level === 'warn' || level === 'error') console.error('FINANCE_SYNC_WEBHOOK_DRAIN_RETRY') },
+    log: (level, _message, error) => {
+      if (level === 'error') logFailure('FINANCE_SYNC_WEBHOOK_DRAIN_RETRY', error, { stage: 'handler' })
+      else if (level === 'warn') logFailure('FINANCE_SYNC_WEBHOOK_DRAIN_RETRY', error, { stage: 'pass' })
+    },
   })
 }

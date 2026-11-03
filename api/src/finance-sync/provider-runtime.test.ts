@@ -259,7 +259,7 @@ describe('four-provider runtime configuration', () => {
     }
   })
 
-  it('advances the Investec transaction upper bound to the poll date', async () => {
+  it('advances the Investec transaction upper bound a week past the poll date', async () => {
     const connection = parseRuntimeConnections(runtimeEnv(), 'dep-1').find(item => item.provider === 'investec')
     if (!connection || connection.provider !== 'investec') throw new Error('missing Investec fixture')
     let requestedWindow: { fromDate: string; toDate: string } | undefined
@@ -270,9 +270,11 @@ describe('four-provider runtime configuration', () => {
       getTransactionPage: async (_accountId, window) => { requestedWindow = window; return { transactions: [] } },
     })
     await runRuntimeProvider(connection, null, injected)
+    const weekAhead = new Date()
+    weekAhead.setUTCDate(weekAhead.getUTCDate() + 7)
     expect(requestedWindow).toEqual({
       fromDate: '2026-01-01',
-      toDate: new Date().toISOString().slice(0, 10),
+      toDate: weekAhead.toISOString().slice(0, 10),
     })
   })
 

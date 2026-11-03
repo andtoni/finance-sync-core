@@ -26,11 +26,27 @@ export interface PlaidTransaction {
   readonly pending_transaction_id?: string | null
   readonly iso_currency_code?: string | null
   readonly unofficial_currency_code?: string | null
+  readonly transaction_code?: string | null
   readonly personal_finance_category?: {
     readonly primary?: string | null
     readonly detailed?: string | null
     readonly confidence_level?: string | null
   } | null
+}
+
+/**
+ * Money into a credit card either pays the card or refunds a charge. Plaid
+ * marks a payment with transaction code `payment` or the LOAN_PAYMENTS
+ * category; everything else coming in is a refund. Its category is unreliable
+ * (a refund can read as INCOME or TRANSFER_IN), so it is only the guard.
+ */
+export function plaidCardRefund(
+  accountType: string | null | undefined,
+  txn: Pick<PlaidTransaction, 'amount' | 'transaction_code' | 'personal_finance_category'>,
+): { readonly activityType: 'CREDIT'; readonly subtype: 'REFUND' } | undefined {
+  if (accountType !== 'credit' || !(txn.amount < 0)) return undefined
+  if (txn.transaction_code === 'payment' || txn.personal_finance_category?.primary === 'LOAN_PAYMENTS') return undefined
+  return { activityType: 'CREDIT', subtype: 'REFUND' }
 }
 
 export interface PlaidAccount {
@@ -264,6 +280,7 @@ export async function runPlaidSync(
             plaidAccountName: acct?.name ?? null,
             plaidAccountType: acct?.type ?? null,
             accountCurrency: currency,
+            ...plaidCardRefund(acct?.type, txn),
             merchantContext: merchantContext({
               provider: 'plaid', rawDescription: txn.name, merchantDisplay: txn.merchant_name ?? txn.name,
               // Plaid's PFC is retained as provider evidence only; it is not a category assignment.
@@ -317,6 +334,7 @@ export async function runPlaidSync(
             pending: txn.pending ?? false,
             pendingTransactionId: txn.pending_transaction_id ?? null,
             isModified: true,
+            ...plaidCardRefund(acct?.type, txn),
             merchantContext: merchantContext({
               provider: 'plaid', rawDescription: txn.name, merchantDisplay: txn.merchant_name ?? txn.name,
               amount: -txn.amount, providerHint: txn.personal_finance_category ? { personalFinanceCategory: txn.personal_finance_category } : null,

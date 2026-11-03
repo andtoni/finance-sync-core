@@ -3,9 +3,9 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import { assertIssuerQualifiedSubject } from './projection/bridge-client'
 import type { ProviderName } from './probes/provider-registry'
 import type { ProviderRuntimeEnv } from './provider-runtime'
-import type { PlaidRuntimeConnection, RuntimeConnection, SnapTradeRuntimeConnection } from './runtime'
+import type { PlaidReissuedAccount, PlaidRuntimeConnection, RuntimeConnection, SnapTradeRuntimeConnection } from './runtime'
 import type { NativeProviderOnboarding } from './server-onboarding'
-import type { AdmissionMetadata, DiscoveredProviderAsset, ProviderAssetMapping } from './onboarding-repository'
+import type { AdmissionMetadata, DiscoveredProviderAsset, MovedAdmission, ProviderAssetMapping } from './onboarding-repository'
 
 export const CONNECT_PROVIDERS = ['investec', 'mercury', 'plaid', 'snaptrade'] as const
 export type ConnectProvider = (typeof CONNECT_PROVIDERS)[number]
@@ -46,6 +46,8 @@ export type ProviderSecretStore = PlaidTokenWriter & ProviderSecretReader
 export interface PlaidConnectTransport {
   createLinkToken(subject: string): Promise<{ readonly linkToken: string }>
   createUpdateLinkToken?(subject: string, input: Pick<PlaidRuntimeConnection, 'accessToken' | 'clientId' | 'clientSecret'>): Promise<{ readonly linkToken: string }>
+  /** The bank behind an Item, as Plaid names it; undefined when Plaid has no name for it. */
+  institutionName?(input: Pick<PlaidRuntimeConnection, 'accessToken' | 'clientId' | 'clientSecret'>): Promise<string | undefined>
   exchangePublicToken(publicToken: string): Promise<{
     readonly clientId: string; readonly clientSecret: string; readonly accessToken: string; readonly itemId: string
   }>
@@ -117,6 +119,10 @@ export interface ConnectControlDependencies {
     }): Promise<AdmissionMetadata>
     revoke(subject: string, provider: string, connectionId: string): Promise<boolean>
     reconciliationStatus(subject: string, provider: string, connectionId: string, providerAccountId: string): Promise<AdmissionMetadata | null>
+    moveAdmission?(input: {
+      subject: string; wealthfolioAccountId: string; connectionId: string; providerAccountId: string
+      from?: { connectionId: string; providerAccountId: string }
+    }): Promise<MovedAdmission>
     /** Names and masks of the subject's admitted accounts, used only to label a connection. */
     listConnectedAccounts?(subject: string, provider: string): Promise<readonly {
       readonly providerConnectionId: string; readonly name: string; readonly mask?: string | null
@@ -128,6 +134,12 @@ export interface ConnectControlDependencies {
    * a completed update clears its Item.
    */
   readonly plaidItemConditions?: Map<string, string | undefined>
+  /**
+   * Admissions the last sync cycle ingested under a re-issued account id, by
+   * Wealthfolio account id. Owned and replaced by the sync runner each cycle;
+   * a completed move clears its account.
+   */
+  readonly plaidReissuedAccounts?: Map<string, PlaidReissuedAccount>
   readonly onPlaidConnected?: (input: {
     readonly subject: string; readonly itemId: string; readonly secretReference: string
     readonly accounts: Awaited<ReturnType<PlaidConnectTransport['listAccounts']>>
@@ -148,10 +160,24 @@ export interface ProviderConnectionSummary {
   readonly connectionId: string
   /** Account names and masks only; never a credential, token, or balance. */
   readonly label: string
+  /** The bank's display name from Plaid; absent until Plaid has answered for this Item. */
+  readonly institutionName?: string
+  /** Provider ids of the Item's connected accounts, so a caller can tell which bank an account belongs to. */
+  readonly providerAccountIds: readonly string[]
   /** The Item needs its owner; Link update mode with account selection is the remedy. */
   readonly needsReauth: boolean
   /** A documented Plaid ITEM_ERROR code or ACCOUNT_NOT_RETURNED; never provider text. */
   readonly reason?: string
+}
+
+export interface PlaidAdmissionSummary {
+  readonly wealthfolioAccountId: string
+  /** Durable connection id and provider account id the account is admitted under. */
+  readonly connectionId: string
+  readonly providerAccountId: string
+  readonly providerGeneration: number
+  /** Where the last sync cycle saw the account returned instead; the move route accepts exactly this. */
+  readonly reissuedAs?: { readonly connectionId: string; readonly providerAccountId: string }
 }
 
 export interface ProviderConnectStatus {
@@ -163,6 +189,7 @@ export interface ProviderConnectStatus {
 }
 
 const MAX_CONNECTION_LABEL_LENGTH = 200
+const PLAID_INSTITUTION_TIMEOUT_MS = 3000
 
 function connectionLabel(accounts: readonly { readonly name: string; readonly mask?: string | null }[]): string {
   // Provider names are display text only: control characters are dropped and
@@ -236,6 +263,9 @@ function reservationBinding(subjectValue: string, continuationToken: string): st
 }
 
 export class FinanceSyncConnectControl {
+  /** Bank name per Plaid Item id. An Item never changes bank, so a name is fetched once per process. */
+  private readonly plaidInstitutionNames = new Map<string, string>()
+
   constructor(private readonly deps: ConnectControlDependencies) {}
 
   private async allConnections(): Promise<readonly RuntimeConnection[]> {
@@ -262,15 +292,31 @@ export class FinanceSyncConnectControl {
       connection.provider === 'plaid' && connection.providerConnectionId ? [connection.providerConnectionId] : []))].sort()
     if (itemIds.length === 0) return []
     const accounts = await this.deps.onboarding?.listConnectedAccounts?.(subject(rawSubject), 'plaid') ?? []
+    await Promise.all(itemIds.map(connectionId => this.loadPlaidInstitutionName(connectionId, connections)))
     return itemIds.map(connectionId => {
       const reason = this.deps.plaidItemConditions?.get(connectionId)
+      const institutionName = this.plaidInstitutionNames.get(connectionId)
       return {
         connectionId,
         label: connectionLabel(accounts.filter(account => account.providerConnectionId === connectionId)),
+        ...(institutionName === undefined ? {} : { institutionName }),
+        providerAccountIds: [...new Set(connections.flatMap(connection =>
+          connection.provider === 'plaid' && connection.providerConnectionId === connectionId ? connection.accountIds : []))].sort(),
         needsReauth: this.deps.plaidItemConditions?.has(connectionId) ?? false,
         ...(reason === undefined ? {} : { reason }),
       }
     })
+  }
+
+  /** The name is display only: a failed or slow lookup leaves it out and the next listing asks again. */
+  private async loadPlaidInstitutionName(connectionId: string, connections: readonly RuntimeConnection[]): Promise<void> {
+    if (this.plaidInstitutionNames.has(connectionId) || !this.deps.plaid?.institutionName) return
+    const connection = connections.find((item): item is PlaidRuntimeConnection => item.provider === 'plaid' && item.providerConnectionId === connectionId)
+    if (!connection) return
+    try {
+      const name = (await this.deps.plaid.institutionName(connection))?.replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ').trim()
+      if (name && [...name].length <= MAX_CONNECTION_LABEL_LENGTH) this.plaidInstitutionNames.set(connectionId, name)
+    } catch { /* the listing must not fail over a display name */ }
   }
 
   async status(rawSubject: string, rawProvider: string): Promise<ProviderConnectStatus> {
@@ -573,6 +619,51 @@ export class FinanceSyncConnectControl {
     return metadata
   }
 
+  /**
+   * The subject's connected Plaid accounts and where each is admitted. An
+   * account the last sync cycle ingested under a re-issued account id names
+   * that account too, so its admission can be moved there.
+   */
+  async plaidAdmissions(rawSubject: string): Promise<readonly PlaidAdmissionSummary[]> {
+    return (await this.subjectConnections(rawSubject)).flatMap(connection => {
+      const [providerAccountId] = connection.accountIds
+      const suffix = `:${providerAccountId}`
+      if (connection.provider !== 'plaid' || connection.accountIds.length !== 1 || !connection.connectionId.endsWith(suffix)) return []
+      const wealthfolioAccountId = connection.wealthfolioAccountIds[providerAccountId!]
+      if (!wealthfolioAccountId) return []
+      const connectionId = connection.connectionId.slice(0, -suffix.length)
+      const reissued = this.deps.plaidReissuedAccounts?.get(wealthfolioAccountId)
+      return [{
+        wealthfolioAccountId, connectionId, providerAccountId: providerAccountId!, providerGeneration: connection.providerGeneration,
+        ...(reissued?.from.connectionId === connectionId && reissued.from.providerAccountId === providerAccountId ? { reissuedAs: reissued.to } : {}),
+      }]
+    }).sort((a, b) => a.wealthfolioAccountId.localeCompare(b.wealthfolioAccountId))
+  }
+
+  /**
+   * Makes permanent what the sync cycle already does for a re-issued account:
+   * the admission moves to the connection and account id it is returned under.
+   * Only a move the last cycle observed is accepted, so an account whose
+   * identity matched more than one candidate can never be moved.
+   */
+  async moveAdmission(rawSubject: string, input: {
+    wealthfolioAccountId: string; connectionId: string; providerAccountId: string
+  }): Promise<MovedAdmission> {
+    const boundSubject = subject(rawSubject)
+    if (!this.deps.onboarding?.moveAdmission) throw new ConnectControlError(503, 'provider onboarding is unavailable')
+    for (const value of [input.wealthfolioAccountId, input.connectionId, input.providerAccountId]) {
+      if (!value || value.length > 512 || value.includes('\0')) throw new ConnectControlError(400, 'invalid admission move request')
+    }
+    const observed = this.deps.plaidReissuedAccounts?.get(input.wealthfolioAccountId)
+    const from = observed?.to.connectionId === input.connectionId && observed.to.providerAccountId === input.providerAccountId
+      ? observed.from : undefined
+    try {
+      const moved = await this.deps.onboarding.moveAdmission({ subject: boundSubject, ...input, ...(from === undefined ? {} : { from }) })
+      this.deps.plaidReissuedAccounts?.delete(input.wealthfolioAccountId)
+      return moved
+    } catch { throw new ConnectControlError(409, 'provider admission could not be moved') }
+  }
+
   async disconnect(rawSubject: string, rawProvider: string, connectionId: string): Promise<Record<string, string>> {
     const boundSubject = subject(rawSubject)
     const selected = provider(rawProvider)
@@ -615,9 +706,9 @@ export function createPlaidConnectTransport(input: { readonly env: ProviderRunti
   })
   const base = endpoint(env.FINANCE_SYNC_PLAID_URL, 'https://production.plaid.com', new Set(['production.plaid.com', 'sandbox.plaid.com', 'development.plaid.com']), 'Plaid')
   if (base.pathname !== '/') throw new Error('Plaid endpoint must be an origin URL')
-  const post = async (path: string, body: Record<string, unknown>, suppliedCredentials?: { readonly clientId: string; readonly clientSecret: string }) => {
+  const post = async (path: string, body: Record<string, unknown>, suppliedCredentials?: { readonly clientId: string; readonly clientSecret: string }, signal?: AbortSignal) => {
     const { clientId, clientSecret } = suppliedCredentials ?? await credentialBundle()
-    return responseJson(await fetchImpl(new URL(path, base), { method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json', 'plaid-version': '2020-09-14' }, body: JSON.stringify({ client_id: clientId, secret: clientSecret, ...body }) }))
+    return responseJson(await fetchImpl(new URL(path, base), { method: 'POST', redirect: 'error', signal, headers: { 'content-type': 'application/json', 'plaid-version': '2020-09-14' }, body: JSON.stringify({ client_id: clientId, secret: clientSecret, ...body }) }))
   }
   return {
     async createLinkToken(boundSubject) {
@@ -639,6 +730,12 @@ export function createPlaidConnectTransport(input: { readonly env: ProviderRunti
       }, input)
       if (typeof value.link_token !== 'string' || !value.link_token) throw new ConnectControlError(502, 'provider returned an invalid response')
       return { linkToken: value.link_token }
+    },
+    async institutionName(input) {
+      // Bounded so a slow Plaid cannot hold up the connection listing this feeds.
+      const value = await post('/item/get', { access_token: input.accessToken }, input, AbortSignal.timeout(PLAID_INSTITUTION_TIMEOUT_MS))
+      const item = value.item && typeof value.item === 'object' && !Array.isArray(value.item) ? value.item as Record<string, unknown> : {}
+      return typeof item.institution_name === 'string' && item.institution_name ? item.institution_name : undefined
     },
     async exchangePublicToken(publicToken) {
       const value = await post('/item/public_token/exchange', { public_token: publicToken })

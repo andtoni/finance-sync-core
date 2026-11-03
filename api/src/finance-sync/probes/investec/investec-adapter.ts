@@ -157,6 +157,19 @@ function investecDecimal(value: unknown): string | null {
 }
 
 /**
+ * Investec filters transactions by transactionDate, and PrimeSaver dates a
+ * transfer made on a weekend or late in the day for the next business day.
+ * Requesting only up to today hides that booked row until the date arrives,
+ * so the request runs a week past today for every account. A booked row
+ * dated ahead is a real ledger fact in any product.
+ */
+function transactionWindowEnd(toDate: string): string {
+  const end = new Date(`${toDate}T00:00:00Z`)
+  end.setUTCDate(end.getUTCDate() + 7)
+  return end.toISOString().slice(0, 10)
+}
+
+/**
  * PrimeSaver returns booked rows with postedOrder=0 and an empty uuid. Those
  * rows are valid, but unlike Private Bank transactions they have no upstream
  * identity. Keep the identity tied to the provider's stable transaction
@@ -635,7 +648,7 @@ export async function runInvestecAdapter(config: InvestecAdapterConfig, transpor
     let accountComplete = false
     for (let page = 0; page < (config.maxPages ?? 50); page++) {
       try {
-        const pageResult = await transport.getTransactionPage(account.accountId, { fromDate: config.fromDate, toDate: config.toDate }, cursor)
+        const pageResult = await transport.getTransactionPage(account.accountId, { fromDate: config.fromDate, toDate: transactionWindowEnd(config.toDate) }, cursor)
         pagesPolled++
         for (const txn of pageResult.transactions) {
           const status = (txn.status ?? '').toUpperCase()

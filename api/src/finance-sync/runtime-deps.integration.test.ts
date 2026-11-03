@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import postgres from 'postgres'
 import { resolve } from 'node:path'
 import { createRuntimeDependencies, retireUnmatchedInvestecCardAuthorizations } from './runtime-deps'
@@ -1106,6 +1106,296 @@ suite('Plaid Item with an account lacking a balance or not returned (PostgreSQL)
     const [counts] = await sql`SELECT count(*)::int AS observations FROM raw_observations
       WHERE deployment_id=${deploymentId} AND payload->>'transactionId'=${transactionId}`
     expect(counts).toEqual({ observations: 0 })
+  })
+})
+
+suite('Plaid admission moved to a re-issued account id (PostgreSQL)', () => {
+  it('keeps the source resource, history and activity ids, and syncs the account from the connection that returns it', async () => {
+    const moveDeployment = `${deploymentId}-move`
+    const deadItem = `move-dead-item-${runId}`
+    const liveItem = `move-live-item-${runId}`
+    const digest = `sha256:${'a'.repeat(64)}`
+    const repository = new PostgresOnboardingRepository(sql, moveDeployment)
+    const checking = { name: 'Everyday Checking', type: 'checking', currency: 'USD', mask: '0042', assets: [] }
+    const savings = { providerAccountId: 'acc-savings', name: 'Everyday Savings', type: 'savings', currency: 'USD', mask: '9999', assets: [] }
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: deadItem, secretReference: 'PLAID_MOVE_DEAD_SLOT',
+      accounts: [{ providerAccountId: 'acc-old', ...checking }],
+    })
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: liveItem, secretReference: 'PLAID_MOVE_LIVE_SLOT', accounts: [savings],
+    })
+    for (const pending of await repository.listPending(owner, 'plaid')) {
+      await repository.admit({
+        subject: owner, provider: 'plaid', connectionId: pending.connectionId, providerAccountId: pending.providerAccountId,
+        wealthfolioAccountId: `wf-${pending.providerAccountId}`, databaseStateDigest: digest,
+        providerGeneration: pending.providerGeneration, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+      })
+    }
+    const connectionIds = Object.fromEntries((await sql<{ item: string; id: string }[]>`
+      SELECT provider_connection_id AS item, connection_id::text AS id FROM provider_connections WHERE deployment_id = ${moveDeployment}`)
+      .map(row => [row.item, row.id]))
+    const dead = connectionIds[deadItem]!
+    const live = connectionIds[liveItem]!
+    const discovered = async (connectionId: string, providerAccountId: string) => (await sql<{ source: string }[]>`
+      SELECT source_resource_incarnation_id::text AS source FROM discovered_provider_accounts
+      WHERE deployment_id = ${moveDeployment} AND connection_id = ${connectionId}::uuid AND provider_account_id = ${providerAccountId}`)[0]?.source
+    const source = (await discovered(dead, 'acc-old'))!
+
+    let reissued = false
+    const requests: string[] = []
+    const transaction = (transaction_id: string, account_id: string, date: string, amount: number, name: string) =>
+      ({ transaction_id, account_id, amount, date, name, iso_currency_code: 'USD' })
+    const page = (added: ReturnType<typeof transaction>[], next_cursor: string, removed: { transaction_id: string }[] = []) =>
+      ({ added, modified: [], removed, next_cursor, has_more: false })
+    const unexpected = () => { throw new Error('unexpected provider use') }
+    const factories: ProviderTransportFactories = {
+      investec: unexpected, mercury: unexpected, snaptrade: unexpected,
+      plaid: () => ({
+        getAccounts: async (accessToken): Promise<readonly PlaidAccount[]> => {
+          requests.push(accessToken)
+          if (accessToken === 'token-dead') {
+            if (reissued) throw Object.assign(new Error('plaid request failed'), { code: 'NO_ACCOUNTS', errorType: 'ITEM_ERROR' })
+            return [{ account_id: 'acc-old', name: 'Everyday Checking', mask: '0042', type: 'depository', subtype: 'checking', balances: { current: 5, iso_currency_code: 'USD' } }]
+          }
+          return [
+            { account_id: 'acc-savings', name: 'Everyday Savings', mask: '9999', type: 'depository', subtype: 'savings', balances: { current: 100, iso_currency_code: 'USD' } },
+            ...(reissued ? [{ account_id: 'acc-new', name: 'Everyday Checking', mask: '0042', type: 'depository', subtype: 'checking', balances: { current: 5, iso_currency_code: 'USD' } }] : []),
+          ]
+        },
+        // Each stream is a pure function of its cursor, as Plaid's is.
+        syncTransactions: async (accessToken, cursor) => {
+          if (accessToken === 'token-dead') {
+            return cursor ? page([], 'dead-1') : page([
+              transaction('old-1', 'acc-old', '2026-08-01', 5, 'OLD'), transaction('old-2', 'acc-old', '2026-09-05', 12.5, 'COFFEE'),
+            ], 'dead-1')
+          }
+          const history = transaction('new-old-1', 'acc-new', '2026-08-01', 5, 'OLD')
+          const later = transaction('new-2', 'acc-new', '2026-09-21', 9, 'DINNER')
+          if (!cursor) {
+            return page([transaction('savings-1', 'acc-savings', '2026-07-17', 3, 'INTEREST'), ...(reissued ? [history, later] : [])], reissued ? 'cursor-3' : 'cursor-1')
+          }
+          if (cursor === 'cursor-1' && reissued) return page([history, transaction('new-1', 'acc-new', '2026-09-20', 7, 'LUNCH')], 'cursor-2')
+          if (cursor === 'cursor-2') return page([later], 'cursor-3', [{ transaction_id: 'new-1' }])
+          return page([], cursor)
+        },
+        getLiabilities: async () => ({}),
+      }),
+    }
+    const deps = createRuntimeDependencies(sql, moveDeployment, {
+      FINANCE_SYNC_BRIDGE_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_URL, FINANCE_SYNC_BRIDGE_RECEIPT_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_RECEIPT_URL,
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: runtimeEnv.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS, FINANCE_SYNC_BRIDGE_TOKEN: runtimeEnv.FINANCE_SYNC_BRIDGE_TOKEN,
+    }, factories, undefined, { resolve: async reference => ({
+      clientId: 'test-client', clientSecret: 'test-secret', accessToken: reference === 'PLAID_MOVE_DEAD_SLOT' ? 'token-dead' : 'token-live',
+    }) })
+    const checkingTransactions = async () => (await sql<{ id: string; account: string }[]>`
+      SELECT DISTINCT payload->>'transactionId' AS id, payload->>'accountId' AS account FROM raw_observations
+      WHERE deployment_id = ${moveDeployment} AND source_resource_incarnation_id = ${source}::uuid AND provider_version LIKE 'plaid:txn:%'
+      ORDER BY 1`).map(row => `${row.id}@${row.account}`)
+    const checkingOutbox = async (connectionId: string) => (await sql<{ kind: string; resource: string }[]>`
+      SELECT DISTINCT payload->>'kind' AS kind, payload->>'resourceId' AS resource FROM projection_outbox
+      WHERE deployment_id = ${moveDeployment} AND connection_id = ${connectionId} AND payload->>'accountId' = 'wf-acc-old'
+      ORDER BY 1, 2`).map(row => `${row.kind}:${row.resource.slice(`${moveDeployment}:${source}:`.length)}`)
+
+    // Persist and enqueue only: bridge delivery is covered by the suite above.
+    const controls = { providersEnabled: true, projectionEnabled: false }
+    await expect(runConfiguredSyncCycle(moveDeployment, deps, controls)).resolves.toMatchObject({ connections: 2, failures: 0, plaidReissuedAccounts: [] })
+    expect(await checkingTransactions()).toEqual(['old-1@acc-old', 'old-2@acc-old'])
+
+    // The bank re-issues the account into the other Item, and its own Item stops returning anything.
+    reissued = true
+    await repository.updateConnectionAccounts({
+      subject: owner, providerConnectionId: liveItem, secretReference: 'PLAID_MOVE_LIVE_SLOT', providerGeneration: 1,
+      accounts: [savings, { providerAccountId: 'acc-new', ...checking }],
+    })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const observed = { wealthfolioAccountId: 'wf-acc-old', from: { connectionId: dead, providerAccountId: 'acc-old' }, to: { connectionId: live, providerAccountId: 'acc-new' } }
+    try {
+      await expect(runConfiguredSyncCycle(moveDeployment, deps, controls)).resolves.toMatchObject({
+        connections: 2, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [observed],
+      })
+    } finally {
+      error.mockRestore()
+    }
+    // The repeated history is not taken again; the new transaction is held under the admitted account id.
+    expect(await checkingTransactions()).toEqual(['new-1@acc-old', 'old-1@acc-old', 'old-2@acc-old'])
+
+    const target = { subject: owner, wealthfolioAccountId: 'wf-acc-old', connectionId: live, providerAccountId: 'acc-new' }
+    // Refused while projections of the previous runtime connection are undelivered.
+    await expect(repository.moveAdmission({ ...target, from: observed.from })).rejects.toThrow(/undelivered projections/)
+    await sql`UPDATE projection_outbox SET state = 'delivered', delivered_at = now() WHERE deployment_id = ${moveDeployment}`
+    // Refused without the cycle's observation, and for an account with another identity.
+    await expect(repository.moveAdmission(target)).rejects.toThrow(/not returned under the requested provider account/)
+    await expect(repository.moveAdmission({ ...target, providerAccountId: 'acc-savings', from: observed.from })).rejects.toThrow(/not discovered/)
+
+    const moved = { wealthfolioAccountId: 'wf-acc-old', connectionId: live, providerAccountId: 'acc-new', providerGeneration: 1 }
+    await expect(repository.moveAdmission({ ...target, from: observed.from })).resolves.toEqual(moved)
+    // A repeat, with or without the observation, answers the same and changes nothing.
+    await expect(repository.moveAdmission({ ...target, from: observed.from })).resolves.toEqual(moved)
+    await expect(repository.moveAdmission(target)).resolves.toEqual(moved)
+    expect(await discovered(live, 'acc-new')).toBe(source)
+    expect(await discovered(dead, 'acc-old')).not.toBe(source)
+    expect(await sql<{ account: string; active: boolean }[]>`
+      SELECT provider_account_id AS account, revoked_at IS NULL AS active FROM provider_account_admissions
+      WHERE deployment_id = ${moveDeployment} AND wealthfolio_account_id = 'wf-acc-old' ORDER BY 1`)
+      .toEqual([{ account: 'acc-new', active: true }, { account: 'acc-old', active: false }])
+
+    // The emptied Item is no longer requested; the account syncs from the Item that returns it.
+    requests.length = 0
+    await expect(runConfiguredSyncCycle(moveDeployment, deps, controls)).resolves.toMatchObject({
+      connections: 2, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [],
+    })
+    expect(requests).toEqual(['token-live'])
+    expect(await checkingTransactions()).toEqual(['new-1@acc-old', 'new-2@acc-new', 'old-1@acc-old', 'old-2@acc-old'])
+    // The removal of a transaction taken before the move is recorded against the same source resource.
+    const [removal] = await sql<{ account: string }[]>`
+      SELECT payload->>'accountId' AS account FROM raw_observations
+      WHERE deployment_id = ${moveDeployment} AND source_resource_incarnation_id = ${source}::uuid AND provider_version = 'plaid:removed:new-1'`
+    expect(removal).toEqual({ account: 'acc-new' })
+    // Activity ids continue the same series. No snapshot yet: the previous runtime connection may have written today's.
+    expect(await checkingOutbox(`${live}:acc-new`)).toEqual(['ActivityUpsert:new-2'])
+    expect(await checkingOutbox(`${dead}:acc-old`)).toEqual(['ActivityUpsert:new-1', 'ActivityUpsert:old-1', 'ActivityUpsert:old-2', 'CurrentStateUpsert:current-state:wf-acc-old'])
+
+    // From the day after the move the new runtime connection writes the snapshot.
+    await sql`UPDATE provider_account_admissions SET revoked_at = revoked_at - interval '2 days'
+      WHERE deployment_id = ${moveDeployment} AND provider_account_id = 'acc-old'`
+    await expect(runConfiguredSyncCycle(moveDeployment, deps, controls)).resolves.toMatchObject({ failures: 0 })
+    expect(await checkingOutbox(`${live}:acc-new`)).toEqual(['ActivityUpsert:new-2', 'CurrentStateUpsert:current-state:wf-acc-old'])
+
+    // A fact derived from history taken before the move still names the earlier account id.
+    const [movedConnection] = (await deps.loadConnections(moveDeployment)).filter(item => item.accountIds[0] === 'acc-new')
+    const derived = (accountId: string): ObservationOutput => ({
+      deploymentId: moveDeployment, localOwnerId: owner, sourceResourceIncarnationId: source,
+      providerVersion: 'plaid:txn:old-2', semanticHash: accountId.padEnd(64, 'd').slice(0, 64), hashSpecificationVersion: 1, domain: 'cash_ledger',
+      payload: { transactionId: 'old-2', accountId, amount: '12.5', currency: 'USD', date: '2026-09-05', name: 'COFFEE' },
+      observedAt: '2026-09-05T00:00:00.000Z',
+    })
+    await expect(deps.persistAndEnqueue(movedConnection!, [derived('acc-old')], { skipCurrentState: true })).resolves.toBe(1)
+    await expect(deps.persistAndEnqueue(movedConnection!, [derived('acc-other')], { skipCurrentState: true })).rejects.toThrow(/outside the admitted connection scope/)
+
+    // A replay of the Item from its origin repeats the history under the new id; none of it is taken again.
+    await sql`DELETE FROM plaid_item_checkpoints WHERE deployment_id = ${moveDeployment} AND provider_connection_id = ${liveItem}`
+    await expect(runConfiguredSyncCycle(moveDeployment, deps, controls)).resolves.toMatchObject({ failures: 0 })
+    expect(await checkingTransactions()).toEqual(['new-1@acc-old', 'new-2@acc-new', 'old-1@acc-old', 'old-2@acc-new', 'old-2@acc-old'])
+  })
+})
+
+suite('Plaid admission moved onto an account an abandoned admission used (PostgreSQL)', () => {
+  it('replaces the abandoned admission and leaves what it observed with the account left behind', async () => {
+    const moveDeployment = `${deploymentId}-move-abandoned`
+    const digest = `sha256:${'a'.repeat(64)}`
+    const repository = new PostgresOnboardingRepository(sql, moveDeployment)
+    const checking = { name: 'Everyday Checking', type: 'checking', currency: 'USD', mask: '0042', assets: [] }
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: `abandoned-dead-item-${runId}`, secretReference: 'PLAID_ABANDONED_DEAD_SLOT',
+      accounts: [{ providerAccountId: 'acc-old', ...checking }],
+    })
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: `abandoned-live-item-${runId}`, secretReference: 'PLAID_ABANDONED_LIVE_SLOT',
+      accounts: [
+        { providerAccountId: 'acc-savings', name: 'Everyday Savings', type: 'savings', currency: 'USD', mask: '9999', assets: [] },
+        { providerAccountId: 'acc-new', ...checking },
+      ],
+    })
+    const rows = await sql<{ connection: string; account: string; source: string }[]>`
+      SELECT connection_id::text AS connection, provider_account_id AS account, source_resource_incarnation_id::text AS source
+      FROM discovered_provider_accounts WHERE deployment_id = ${moveDeployment}`
+    const row = (account: string) => rows.find(item => item.account === account)!
+    const admit = (account: string, wealthfolioAccountId: string) => repository.admit({
+      subject: owner, provider: 'plaid', connectionId: row(account).connection, providerAccountId: account, wealthfolioAccountId,
+      databaseStateDigest: digest, providerGeneration: 1, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+    })
+    // The re-issued account was once admitted to another Wealthfolio account, observed one fact, and was abandoned.
+    await admit('acc-new', 'wf-abandoned')
+    await sql`
+      INSERT INTO raw_observations (deployment_id, local_owner_id, observation_id, source_resource_incarnation_id,
+        provider_version, semantic_hash, hash_specification_version, payload, observed_at)
+      VALUES (${moveDeployment}, ${owner}, gen_random_uuid(), ${row('acc-new').source}::uuid,
+        'plaid:balance:acc-new', ${'e'.repeat(64)}, 1, ${sql.json({ accountId: 'acc-new', currentBalance: '5', currency: 'USD' })}, now())`
+    await sql`UPDATE provider_account_admissions SET revoked_at = now(), baseline_state = 'pending', baseline_verified_at = NULL, baseline_fingerprint = NULL
+      WHERE deployment_id = ${moveDeployment} AND provider_account_id = 'acc-new'`
+    await admit('acc-old', 'wf-checking')
+    await admit('acc-savings', 'wf-savings')
+    const live = row('acc-new').connection
+    const from = { connectionId: row('acc-old').connection, providerAccountId: 'acc-old' }
+    const target = { subject: owner, wealthfolioAccountId: 'wf-checking', connectionId: live, providerAccountId: 'acc-new', from }
+    const queue = (state: string) => sql`
+      INSERT INTO projection_outbox (deployment_id, local_owner_id, connection_id, provider_generation, idempotency_key, payload, state)
+      VALUES (${moveDeployment}, ${owner}, ${`${live}:acc-new`}, 1, ${`abandoned-${state}`}, ${sql.json({ kind: 'ActivityUpsert', accountId: 'wf-abandoned' })}, ${state})`
+
+    // Anything the abandoned admission left queued would be delivered under the new admission's authority.
+    await queue('pending')
+    await expect(repository.moveAdmission(target)).rejects.toThrow(/undelivered projections/)
+    await sql`UPDATE projection_outbox SET state = 'delivered', delivered_at = now() WHERE deployment_id = ${moveDeployment}`
+
+    await expect(repository.moveAdmission(target)).resolves.toEqual({
+      wealthfolioAccountId: 'wf-checking', connectionId: live, providerAccountId: 'acc-new', providerGeneration: 1,
+    })
+    expect(await sql<{ account: string; wealthfolio: string; active: boolean }[]>`
+      SELECT provider_account_id AS account, wealthfolio_account_id AS wealthfolio, revoked_at IS NULL AS active
+      FROM provider_account_admissions WHERE deployment_id = ${moveDeployment} ORDER BY 1`).toEqual([
+      { account: 'acc-new', wealthfolio: 'wf-checking', active: true },
+      { account: 'acc-old', wealthfolio: 'wf-checking', active: false },
+      { account: 'acc-savings', wealthfolio: 'wf-savings', active: true },
+    ])
+    // The admission keeps its own source resource; the abandoned observation went with the other one to the account left behind.
+    const after = await sql<{ account: string; source: string; observations: number }[]>`
+      SELECT dpa.provider_account_id AS account, dpa.source_resource_incarnation_id::text AS source,
+        (SELECT count(*)::int FROM raw_observations o WHERE o.deployment_id = dpa.deployment_id
+          AND o.source_resource_incarnation_id = dpa.source_resource_incarnation_id) AS observations
+      FROM discovered_provider_accounts dpa
+      WHERE dpa.deployment_id = ${moveDeployment} AND dpa.provider_account_id IN ('acc-new', 'acc-old') ORDER BY 1`
+    expect(after).toEqual([
+      { account: 'acc-new', source: row('acc-old').source, observations: 0 },
+      { account: 'acc-old', source: row('acc-new').source, observations: 1 },
+    ])
+    // The moved admission is the only authority the runtime loads for the account.
+    const unexpected = () => { throw new Error('unexpected provider use') }
+    const deps = createRuntimeDependencies(sql, moveDeployment, {
+      FINANCE_SYNC_BRIDGE_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_URL, FINANCE_SYNC_BRIDGE_RECEIPT_URL: runtimeEnv.FINANCE_SYNC_BRIDGE_RECEIPT_URL,
+      FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS: runtimeEnv.FINANCE_SYNC_BRIDGE_ALLOWED_HOSTS, FINANCE_SYNC_BRIDGE_TOKEN: runtimeEnv.FINANCE_SYNC_BRIDGE_TOKEN,
+    }, { investec: unexpected, mercury: unexpected, snaptrade: unexpected, plaid: unexpected }, undefined,
+    { resolve: async () => ({ clientId: 'test-client', clientSecret: 'test-secret', accessToken: 'test-token' }) })
+    expect((await deps.loadConnections(moveDeployment)).map(item => [item.connectionId, item.sourceResourceIncarnationId, item.wealthfolioAccountIds]))
+      .toContainEqual([`${live}:acc-new`, row('acc-old').source, { 'acc-new': 'wf-checking' }])
+  })
+
+  it('still refuses observations that no abandoned admission explains', async () => {
+    const moveDeployment = `${deploymentId}-move-unexplained`
+    const digest = `sha256:${'a'.repeat(64)}`
+    const repository = new PostgresOnboardingRepository(sql, moveDeployment)
+    const checking = { name: 'Everyday Checking', type: 'checking', currency: 'USD', mask: '0042', assets: [] }
+    await repository.recordConnection({
+      subject: owner, provider: 'plaid', providerConnectionId: `unexplained-item-${runId}`, secretReference: 'PLAID_UNEXPLAINED_SLOT',
+      accounts: [{ providerAccountId: 'acc-old', ...checking }, { providerAccountId: 'acc-new', ...checking }],
+    })
+    const rows = await sql<{ connection: string; account: string; source: string }[]>`
+      SELECT connection_id::text AS connection, provider_account_id AS account, source_resource_incarnation_id::text AS source
+      FROM discovered_provider_accounts WHERE deployment_id = ${moveDeployment}`
+    const row = (account: string) => rows.find(item => item.account === account)!
+    const admit = (account: string) => repository.admit({
+      subject: owner, provider: 'plaid', connectionId: row(account).connection, providerAccountId: account, wealthfolioAccountId: 'wf-checking',
+      databaseStateDigest: digest, providerGeneration: 1, receiverAccessGeneration: 1, baselineKind: 'empty', assetMappings: [],
+    })
+    const observe = () => sql`
+      INSERT INTO raw_observations (deployment_id, local_owner_id, observation_id, source_resource_incarnation_id,
+        provider_version, semantic_hash, hash_specification_version, payload, observed_at)
+      VALUES (${moveDeployment}, ${owner}, gen_random_uuid(), ${row('acc-new').source}::uuid,
+        'plaid:balance:acc-new', ${'f'.repeat(64)}, 1, ${sql.json({ accountId: 'acc-new', currentBalance: '5', currency: 'USD' })}, now())`
+    const target = {
+      subject: owner, wealthfolioAccountId: 'wf-checking', connectionId: row('acc-new').connection, providerAccountId: 'acc-new',
+      from: { connectionId: row('acc-old').connection, providerAccountId: 'acc-old' },
+    }
+    // Taken for this same Wealthfolio account under an earlier admission of the re-issued id.
+    await admit('acc-new')
+    await observe()
+    await sql`UPDATE provider_account_admissions SET revoked_at = now(), baseline_state = 'pending', baseline_verified_at = NULL, baseline_fingerprint = NULL
+      WHERE deployment_id = ${moveDeployment} AND provider_account_id = 'acc-new'`
+    await admit('acc-old')
+    await expect(repository.moveAdmission(target)).rejects.toThrow(/already holds observations/)
+    // With no admission row at all.
+    await sql`DELETE FROM provider_account_admissions WHERE deployment_id = ${moveDeployment} AND provider_account_id = 'acc-new'`
+    await expect(repository.moveAdmission(target)).rejects.toThrow(/already holds observations/)
   })
 })
 

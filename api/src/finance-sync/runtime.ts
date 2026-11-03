@@ -186,10 +186,22 @@ export interface PlaidItemCondition {
   readonly providerConnectionId: string
   readonly reason?: string
 }
+/**
+ * An admitted Plaid account that was ingested this cycle under the account id
+ * its institution re-issued it as, in its own connection or in another one.
+ * Connection ids are the durable connection ids, not Plaid Item ids.
+ */
+export interface PlaidReissuedAccount {
+  readonly wealthfolioAccountId: string
+  readonly from: { readonly connectionId: string; readonly providerAccountId: string }
+  readonly to: { readonly connectionId: string; readonly providerAccountId: string }
+}
 export interface SyncCycleResult {
   readonly connections: number; readonly observations: number; readonly delivered: number; readonly failures: number
   /** Plaid Items that need their owner's attention this cycle; they do not count as failures. */
   readonly plaidItemConditions: readonly PlaidItemCondition[]
+  /** Admissions the owner can move to the account id they are returned under now. Never logged. */
+  readonly plaidReissuedAccounts: readonly PlaidReissuedAccount[]
 }
 export interface SyncCycleControls { readonly providersEnabled: boolean; readonly projectionEnabled: boolean }
 
@@ -396,10 +408,11 @@ export async function runConfiguredSyncCycle(
   deps: SyncRuntimeDependencies,
   controls: SyncCycleControls = enabledByDefault,
 ): Promise<SyncCycleResult> {
-  if (!controls.providersEnabled) return { connections: 0, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [] }
+  if (!controls.providersEnabled) return { connections: 0, observations: 0, delivered: 0, failures: 0, plaidItemConditions: [], plaidReissuedAccounts: [] }
   const connections = await deps.loadConnections(deploymentId)
   let observations = 0; let delivered = 0; let failures = 0
   const plaidItemConditions: PlaidItemCondition[] = []
+  const plaidReissuedAccounts: PlaidReissuedAccount[] = []
   const runs: Array<{ connection: RuntimeConnection; cursor: string | null; run: ProviderRun }> = []
   const plaidGroups = new Map<string, PlaidRuntimeConnection[]>()
   for (const connection of connections) {
@@ -517,12 +530,18 @@ export async function runConfiguredSyncCycle(
           // connection at all, so the complete-snapshot rule is never asked to
           // accept a partial one and the receiver keeps its last full snapshot.
           const skipCurrentState = connection.accountIds.some(accountId => withoutBalance.has(accountId))
+          // An admission moved to a re-issued account id still holds its earlier
+          // history under the previous id, so a replayed stream of an account
+          // returned under its own id is filtered the same way.
+          const ownAccountId = connection.accountIds[0]
+          const replayable = returnedAccountId === undefined && ownAccountId !== undefined && deps.loadPlaidReissuedHistory !== undefined
+            && accountObservations.some(observation => observation.providerVersion.startsWith('plaid:txn:'))
           try {
-            const fresh = returnedAccountId === undefined
+            const fresh = returnedAccountId === undefined && !replayable
               ? accountObservations
               : withoutReissuedHistory(accountObservations, await runPlaidStage('persist_or_project', () => {
                 if (!deps.loadPlaidReissuedHistory) throw new Error('Plaid re-issued account history is unavailable')
-                return deps.loadPlaidReissuedHistory(connection, returnedAccountId)
+                return deps.loadPlaidReissuedHistory(connection, returnedAccountId ?? ownAccountId!)
               }))
             observations += await runPlaidStage('persist_or_project', () => skipCurrentState
               ? deps.persistAndEnqueue(connection, fresh, { skipCurrentState: true })
@@ -534,6 +553,16 @@ export async function runConfiguredSyncCycle(
               if (projection.failed > 0) { itemFailed = true; continue }
             }
             if (guests.includes(connection)) servedElsewhere.add(connection)
+            for (const accountId of connection.accountIds) {
+              const reissuedAs = run.accountsReissued?.[accountId]
+              const wealthfolioAccountId = connection.wealthfolioAccountIds[accountId]
+              if (reissuedAs === undefined || wealthfolioAccountId === undefined) continue
+              plaidReissuedAccounts.push({
+                wealthfolioAccountId,
+                from: { connectionId: connectionPrefix(connection), providerAccountId: accountId },
+                to: { connectionId: item.connectionId, providerAccountId: reissuedAs },
+              })
+            }
           } catch (error) {
             itemFailed = true
             failures += 1
@@ -656,5 +685,5 @@ export async function runConfiguredSyncCycle(
       logFailure('Finance Sync connection cycle failed', error, { stage: 'persist_or_project', provider: item.connection.provider })
     }
   }
-  return { connections: connections.length, observations, delivered, failures, plaidItemConditions }
+  return { connections: connections.length, observations, delivered, failures, plaidItemConditions, plaidReissuedAccounts }
 }

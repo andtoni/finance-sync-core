@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { observationRevisionNumber, type FinanceSyncSql } from './storage/pg'
-import type { ObservationOutput } from './probes/plaid/plaid-adapter'
+import { plaidCardRefund, plaidResourceKind, type ObservationOutput, type PlaidTransaction } from './probes/plaid/plaid-adapter'
 import { investecNarrativeValueDate, investecPrimeSaverSupersessionKey } from './probes/investec/investec-adapter'
 import {
   createProviderTransportFactories,
@@ -1758,6 +1758,84 @@ export async function linkZelleTransferPairs(
   return linked
 }
 
+/**
+ * Correct card refunds that were normalized before the Plaid adapter told them
+ * apart from card payments. The latest retained fact of each such refund is
+ * persisted once more with the adapter's refund classification under a
+ * deterministic hash; a fact that already carries an activity type is never
+ * selected, so the pass converges.
+ */
+export async function reclassifyPlaidCardRefunds(
+  sql: FinanceSyncSql,
+  deploymentId: string,
+  connections: readonly RuntimeConnection[],
+  deps: SyncRuntimeDependencies,
+): Promise<number> {
+  const plaid = connections.filter(connection => connection.provider === 'plaid')
+  if (plaid.length === 0) return 0
+  const rows = await sql<Array<{
+    payload: unknown; raw_payload: unknown; provider_version: string; semantic_hash: string;
+    hash_specification_version: number; observed_at: string; source_resource_incarnation_id: string;
+  }>>`
+    WITH latest AS (
+      SELECT DISTINCT ON (source_resource_incarnation_id, payload->>'transactionId')
+        payload, raw_payload, provider_version, semantic_hash, hash_specification_version,
+        observed_at, source_resource_incarnation_id, deployment_id, local_owner_id
+      FROM raw_observations
+      WHERE deployment_id = ${deploymentId}
+        AND local_owner_id = ${plaid[0].localOwnerId}
+        AND provider_version LIKE 'plaid:txn:%'
+      ORDER BY source_resource_incarnation_id, payload->>'transactionId', recorded_at DESC, observation_id DESC
+    )
+    SELECT payload, raw_payload, provider_version, semantic_hash, hash_specification_version,
+      observed_at, source_resource_incarnation_id::text
+    FROM latest
+    WHERE payload->>'plaidAccountType' = 'credit'
+      AND NOT payload ? 'activityType'
+      AND payload->>'isRemoved' IS DISTINCT FROM 'true'
+      AND NOT EXISTS (
+        SELECT 1 FROM observation_quarantines q
+        WHERE q.deployment_id = latest.deployment_id
+          AND q.local_owner_id = latest.local_owner_id
+          AND q.source_resource_incarnation_id = latest.source_resource_incarnation_id
+          AND q.provider_version = latest.provider_version
+          AND q.semantic_hash = latest.semantic_hash
+          AND q.hash_specification_version = latest.hash_specification_version
+      )
+  `
+  const batches = new Map<RuntimeConnection, ObservationOutput[]>()
+  for (const row of rows) {
+    const connection = plaid.find(candidate => candidate.sourceResourceIncarnationId === row.source_resource_incarnation_id)
+    const payload = recordPayload(row.payload)
+    const raw = recordPayload(row.raw_payload)
+    if (!connection || !payload || !raw) continue
+    const refund = plaidCardRefund(String(payload.plaidAccountType), raw as unknown as PlaidTransaction)
+    if (!refund) continue
+    const batch = batches.get(connection) ?? []
+    batch.push({
+      deploymentId,
+      localOwnerId: connection.localOwnerId,
+      sourceResourceIncarnationId: connection.sourceResourceIncarnationId,
+      providerVersion: row.provider_version,
+      semanticHash: createHash('sha256').update(['plaid-card-refund-v1', row.semantic_hash].join('\x00'), 'utf8').digest('hex'),
+      hashSpecificationVersion: row.hash_specification_version,
+      domain: plaidResourceKind('credit'),
+      payload: Object.freeze({ ...payload, ...refund }),
+      rawPayload: row.raw_payload,
+      observedAt: row.observed_at,
+    })
+    batches.set(connection, batch)
+  }
+  let reclassified = 0
+  for (const [connection, observations] of batches) {
+    await deps.persistAndEnqueue(connection, observations, { skipCurrentState: true })
+    const projection = await deps.projectPending(connection)
+    if (projection.failed > 0) throw new Error('Plaid card refund projection is unresolved')
+    reclassified += observations.length
+  }
+  return reclassified
+}
+
 export function assertBridgeConfiguration(env: RuntimeEnv, fixture = false): void {
   const allowedBridgeHosts = bridgeHosts(env)
   const allowedFixtureHosts = fixtureBridgeHosts(env)
@@ -1823,6 +1901,49 @@ async function observationIsQuarantined(
       AND provider_version = ${observation.providerVersion}
       AND semantic_hash = ${observation.semanticHash}
       AND hash_specification_version = ${observation.hashSpecificationVersion}
+    LIMIT 1
+  `
+  return rows.length > 0
+}
+
+async function heldUnderEarlierAccountId(
+  tx: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  accountId: string,
+): Promise<boolean> {
+  const rows = await tx<{ held: number }[]>`
+    SELECT 1 AS held
+    FROM raw_observations
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${connection.localOwnerId}
+      AND source_resource_incarnation_id = ${connection.sourceResourceIncarnationId}::uuid
+      AND payload->>'accountId' = ${accountId}
+    LIMIT 1
+  `
+  return rows.length > 0
+}
+
+/**
+ * The receiver accepts one provider connection per account and snapshot date.
+ * An admission that moved here from another provider account id may already
+ * have written the snapshot of any date on which it was still live there.
+ */
+async function snapshotDateHeldByEarlierAdmission(
+  tx: FinanceSyncSql,
+  deploymentId: string,
+  connection: RuntimeConnection,
+  wealthfolioAccountId: string,
+  asOfDate: string,
+): Promise<boolean> {
+  const rows = await tx<{ held: number }[]>`
+    SELECT 1 AS held
+    FROM provider_account_admissions
+    WHERE deployment_id = ${deploymentId}
+      AND local_owner_id = ${connection.localOwnerId}
+      AND wealthfolio_account_id = ${wealthfolioAccountId}
+      AND connection_id::text || ':' || provider_account_id <> ${connection.connectionId}
+      AND revoked_at >= ${`${asOfDate}T00:00:00.000Z`}::timestamptz
     LIMIT 1
   `
   return rows.length > 0
@@ -1917,6 +2038,12 @@ export function createRuntimeDependencies(
           }
         }
       }
+      // A moved admission keeps its source resource, so its history, and
+      // every fact derived from that history, names the provider account id
+      // the resource was admitted under before.
+      if (accountId && connection.provider === 'plaid' && connection.accountIds.length === 1
+        && !connection.accountIds.includes(accountId)
+        && await heldUnderEarlierAccountId(tx, deploymentId, connection, accountId)) accountId = connection.accountIds[0]
       if (!accountId || !connection.accountIds.includes(accountId)) throw new Error('provider account is outside the admitted connection scope')
       const wealthfolioAccountId = connection.wealthfolioAccountIds[accountId]
       if (!wealthfolioAccountId) throw new Error('provider account has no Wealthfolio mapping')
@@ -2042,6 +2169,7 @@ export function createRuntimeDependencies(
       }
     }
     for (const current of currentStates) {
+      if (await snapshotDateHeldByEarlierAdmission(tx, deploymentId, connection, current.payload.accountId, current.payload.asOfDate)) continue
       const operation = currentStateToBridge({
         deploymentId,
         localOwnerId: connection.localOwnerId,
@@ -2478,6 +2606,7 @@ export function createRuntimeDependencies(
           AND provider_version LIKE 'plaid:txn:%'
           AND payload ? 'date' AND payload ? 'amount'
           AND raw_payload->>'account_id' IS DISTINCT FROM ${returnedAccountId}
+          AND payload->>'accountId' IS DISTINCT FROM ${returnedAccountId}
         ORDER BY payload->>'transactionId', recorded_at DESC, observation_id DESC
       `
     },

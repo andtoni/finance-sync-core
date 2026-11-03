@@ -241,8 +241,8 @@ describe('Finance Sync Connect control plane', () => {
     expect(listed.find(status => status.provider === 'plaid')).toEqual({
       provider: 'plaid', status: 'configured', message: 'Provider is configured.',
       connections: [
-        { connectionId: 'item-1', label: 'Checking •••• 1111, Savings', needsReauth: false },
-        { connectionId: 'item-2', label: 'Rewards Card •••• 2222', needsReauth: true, reason: 'NO_ACCOUNTS' },
+        { connectionId: 'item-1', label: 'Checking •••• 1111, Savings', providerAccountIds: ['account-1', 'account-2'], needsReauth: false },
+        { connectionId: 'item-2', label: 'Rewards Card •••• 2222', providerAccountIds: ['account-1'], needsReauth: true, reason: 'NO_ACCOUNTS' },
       ],
     })
     expect('reason' in listed.find(status => status.provider === 'plaid')!.connections![0]!).toBe(false)
@@ -265,7 +265,7 @@ describe('Finance Sync Connect control plane', () => {
       connections: [connection('plaid')], plaidItemConditions: new Map([['item-1', undefined]]),
     }))
     const [summary] = (await unexplained.list(subjectA)).find(status => status.provider === 'plaid')!.connections!
-    expect(summary).toEqual({ connectionId: 'item-1', label: 'Plaid connection', needsReauth: true })
+    expect(summary).toEqual({ connectionId: 'item-1', label: 'Plaid connection', providerAccountIds: ['account-1'], needsReauth: true })
     expect('reason' in summary!).toBe(false)
     // Provider text cannot break the receiver's bounded, control-free label check.
     const hostile = new FinanceSyncConnectControl(dependencies({
@@ -288,6 +288,28 @@ describe('Finance Sync Connect control plane', () => {
     expect((await withoutItem.list(subjectA)).find(status => status.provider === 'plaid')).toEqual({
       provider: 'plaid', status: 'available', message: 'Provider is available to connect.',
     })
+  })
+
+  it('names the bank behind each Plaid Item, asking Plaid once per Item and never failing the list over it', async () => {
+    const first = connection('plaid') as Extract<RuntimeConnection, { provider: 'plaid' }>
+    const second = { ...first, connectionId: 'plaid-connection-2', providerConnectionId: 'item-2', accessToken: 'access-token-2', accountIds: ['account-2'] }
+    const third = { ...first, connectionId: 'plaid-connection-3', providerConnectionId: 'item-3', accessToken: 'access-token-3', accountIds: ['account-3'] }
+    const institutionName = vi.fn(async (input: { accessToken: string }) => {
+      if (input.accessToken === 'access-token-2') throw new Error('Plaid is down')
+      return input.accessToken === 'access-token-3' ? ' Bank\nB\u0000 ' : 'Bank A'
+    })
+    const base = dependencies()
+    const control = new FinanceSyncConnectControl({ ...base, connections: [first, second, third], plaid: { ...base.plaid!, institutionName } })
+    const names = async () => (await control.list(subjectA)).find(status => status.provider === 'plaid')!.connections!
+      .map(summary => [summary.connectionId, summary.institutionName, summary.providerAccountIds])
+    expect(await names()).toEqual([
+      ['item-1', 'Bank A', ['account-1']], ['item-2', undefined, ['account-2']], ['item-3', 'Bank B', ['account-3']],
+    ])
+    expect(institutionName).toHaveBeenCalledWith(expect.objectContaining({ accessToken: 'access-token' }))
+    // A name already learned is kept; only the Item Plaid failed for is asked again.
+    await names()
+    expect(institutionName.mock.calls.map(([input]) => input.accessToken).sort())
+      .toEqual(['access-token', 'access-token-2', 'access-token-2', 'access-token-3'])
   })
 
   it('clears the Item condition only when the Plaid update completes', async () => {
@@ -346,8 +368,9 @@ describe('Finance Sync Connect control plane', () => {
 
   it('requires Plaid transactions and requests liabilities and investments as additional consent', async () => {
     const requests: Record<string, unknown>[] = []
-    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      if (new URL(String(input)).pathname === '/item/get') return new Response(JSON.stringify({ item: { item_id: 'item-1', institution_name: 'Bank A' } }), { status: 200 })
       return new Response(JSON.stringify(requests.length <= 2
         ? { link_token: 'link-token' }
         : { accounts: [{ account_id: 'account-1', name: 'Checking', subtype: 'checking', mask: '1234', balances: { iso_currency_code: 'USD' } }] }), { status: 200 })
@@ -373,6 +396,9 @@ describe('Finance Sync Connect control plane', () => {
     await expect(transport!.listAccounts('access-token')).resolves.toEqual([
       { providerAccountId: 'account-1', name: 'Checking', type: 'checking', currency: 'USD', mask: '1234', assets: [] },
     ])
+    // The bank name is read with the Item's own credentials, like the update link token.
+    await expect(transport!.institutionName!({ accessToken: 'existing-access', clientId: 'existing-client', clientSecret: 'existing-secret' })).resolves.toBe('Bank A')
+    expect(requests[3]).toEqual({ access_token: 'existing-access', client_id: 'existing-client', secret: 'existing-secret' })
     expect(requests[0]?.products).toEqual(['transactions'])
     expect(requests[0]?.additional_consented_products).toEqual(['liabilities', 'investments'])
   })
@@ -539,5 +565,55 @@ describe('Finance Sync Connect control plane', () => {
     await expect(control.disconnect(subjectA, 'plaid', 'connection-1')).resolves.toMatchObject({ provider: 'plaid', status: 'disconnected' })
     expect(revoke).toHaveBeenCalledWith(subjectA, 'plaid', 'connection-1')
     await expect(control.disconnect(subjectA, 'mercury', 'connection-1')).rejects.toMatchObject({ status: 404 })
+  })
+
+  describe('an admission the last sync cycle ingested under a re-issued account id', () => {
+    const reissued = {
+      wealthfolioAccountId: 'wealthfolio-account-1',
+      from: { connectionId: 'connection-dead', providerAccountId: 'account-1' },
+      to: { connectionId: 'connection-live', providerAccountId: 'account-new' },
+    }
+    const admitted = (localOwnerId = subjectA) => ({ ...connection('plaid', localOwnerId), connectionId: 'connection-dead:account-1' })
+    const target = { wealthfolioAccountId: 'wealthfolio-account-1', connectionId: 'connection-live', providerAccountId: 'account-new' }
+    const onboarding = (moveAdmission: NonNullable<NonNullable<ConnectControlDependencies['onboarding']>['moveAdmission']>) => ({
+      listPending: vi.fn(), admit: vi.fn(), revoke: vi.fn(), reconciliationStatus: vi.fn(), moveAdmission,
+    })
+
+    it('is named only to the subject that owns it, beside where the account is admitted', async () => {
+      const settled = { ...connection('plaid'), connectionId: 'connection-live:account-2', accountIds: ['account-2'], wealthfolioAccountIds: { 'account-2': 'wealthfolio-account-0' } }
+      const control = new FinanceSyncConnectControl(dependencies({
+        connections: [admitted(), settled, { ...admitted(subjectB), wealthfolioAccountIds: { 'account-1': 'wealthfolio-account-2' } }, connection('mercury')],
+        plaidReissuedAccounts: new Map([[reissued.wealthfolioAccountId, reissued]]),
+      }))
+      await expect(control.plaidAdmissions(subjectA)).resolves.toEqual([
+        { wealthfolioAccountId: 'wealthfolio-account-0', connectionId: 'connection-live', providerAccountId: 'account-2', providerGeneration: 1 },
+        { wealthfolioAccountId: 'wealthfolio-account-1', connectionId: 'connection-dead', providerAccountId: 'account-1', providerGeneration: 1, reissuedAs: reissued.to },
+      ])
+      await expect(control.plaidAdmissions(subjectB)).resolves.toEqual([
+        { wealthfolioAccountId: 'wealthfolio-account-2', connectionId: 'connection-dead', providerAccountId: 'account-1', providerGeneration: 1 },
+      ])
+    })
+
+    it('moves to exactly the account the cycle observed, once', async () => {
+      const plaidReissuedAccounts = new Map([[reissued.wealthfolioAccountId, reissued]])
+      const moveAdmission = vi.fn(async (input: { from?: unknown }) => {
+        if (input.from === undefined) throw new Error('admission is not returned under the requested provider account')
+        return { ...target, providerGeneration: 4 }
+      })
+      const control = new FinanceSyncConnectControl(dependencies({ onboarding: onboarding(moveAdmission), plaidReissuedAccounts }))
+      await expect(control.moveAdmission(subjectA, { ...target, providerAccountId: 'account-other' })).rejects.toMatchObject({ status: 409 })
+      expect(moveAdmission).toHaveBeenLastCalledWith({ subject: subjectA, ...target, providerAccountId: 'account-other' })
+      expect(plaidReissuedAccounts.size).toBe(1)
+
+      await expect(control.moveAdmission(subjectA, target)).resolves.toEqual({ ...target, providerGeneration: 4 })
+      expect(moveAdmission).toHaveBeenLastCalledWith({ subject: subjectA, ...target, from: reissued.from })
+      expect(plaidReissuedAccounts.size).toBe(0)
+
+      // A repeat reaches the repository without an observation; only an already completed move can answer it.
+      await expect(control.moveAdmission(subjectA, target)).rejects.toMatchObject({ status: 409 })
+      expect(moveAdmission).toHaveBeenLastCalledWith({ subject: subjectA, ...target })
+      await expect(control.moveAdmission(subjectA, { ...target, connectionId: '' })).rejects.toMatchObject({ status: 400 })
+      await expect(new FinanceSyncConnectControl(dependencies()).moveAdmission(subjectA, target)).rejects.toMatchObject({ status: 503 })
+    })
   })
 })
